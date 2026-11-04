@@ -1,0 +1,26 @@
+# Python build/runtime artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Waylume private state (may be configured inside the checkout)
+.waylume/
+data/
+runtime/
+logs/
+store.json
+meta.json
+events.jsonl
+events.jsonl.migrated.bak
+store.json.migrated.bak
+records/
+sources/
+backups/
+reports/
+mcloud-bug-monitor/
+integrations/status.json
+scope-catalog.json
+source-seed.json
+.server.lock
+.store.lock
+.migration.lock

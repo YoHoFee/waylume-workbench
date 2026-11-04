@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+    <title>知途 Waylume · AI助理工作台</title>
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261104-settings-2">
+  <script src="/assets/markdown.js?v=20261028-cancelled-terminal-1" defer></script>
+  <script src="/assets/dashboard-model.js?v=20261028-cancelled-terminal-1" defer></script>
+  <script src="/assets/dashboard.js?v=20261105-inspection-partial-1" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <img class="brand-mark brand-mark-color" src="/assets/waylume-mark-color.svg?v=20261104-exact" alt="知途标志" width="42" height="42">
+      <img class="brand-mark brand-mark-mono-dark" src="/assets/waylume-mark-mono-dark.svg?v=20261104-exact" alt="" aria-hidden="true" width="42" height="42">
+      <img class="brand-mark brand-mark-mono-light" src="/assets/waylume-mark-mono-light.svg?v=20261104-exact" alt="" aria-hidden="true" width="42" height="42">
+      <div class="brand-copy"><div class="brand-name-line"><h1>知途</h1><span class="brand-english">WAYLUME</span></div><p class="brand-tagline">AI 助理工作台</p></div>
+      <div class="topbar-right">
+        <button type="button" id="settings-open" class="source-open-button" aria-haspopup="dialog">设置</button>
+        <button type="button" id="scopes-open" class="source-open-button" aria-haspopup="dialog">我的职责</button>
+        <button type="button" id="worktime-open" class="worktime-button" aria-label="设置每日工作时间" title="每日工作时间：08:30–17:30（北京时间）">
+          <span class="worktime-label">工作</span><span class="worktime-track" aria-hidden="true"><span id="worktime-fill"></span></span><span id="worktime-percent">0%</span>
+        </button>
+        <button type="button" id="theme-toggle" class="theme-toggle" aria-label="当前风格：拟物风。切换到简洁风">风格·拟物</button>
+        <div class="freshness" id="freshness" aria-live="polite"><span class="fresh-dot"></span><span>正在读取</span></div>
+      </div>
+    </header>
+
+    <section class="toolbar" aria-label="工作项筛选">
+      <label class="search"><span class="visually-hidden">搜索工作项</span><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索标题、编号、备注" autocomplete="off"></label>
+      <label class="archive-toggle"><input id="show-archived" type="checkbox"><span>显示归档</span></label>
+    </section>
+
+    <div class="inspection-tools global-inspection" id="inspection-tools">
+      <span class="inspection-plan" id="inspection-plan" role="timer" aria-live="off">巡检时间未同步</span>
+      <button type="button" class="inspection-run" id="inspection-run" aria-describedby="inspection-run-status">立即巡检</button>
+      <span class="inspection-run-status" id="inspection-run-status" role="status" aria-live="polite">正在读取巡检状态…</span>
+    </div>
+
+    <div class="state-banner" id="state-banner" hidden></div>
+
+    <div class="work-areas">
+      <section class="work-area area-work" aria-labelledby="work-title">
+        <header class="area-heading">
+          <div class="area-heading-copy"><span class="area-kicker">优先工作</span><h2 id="work-title">工作需求</h2><button type="button" id="sources-open" class="source-open-button" aria-haspopup="dialog">需求来源</button><p>公司分工与明确交办的工作进展</p></div>
+          <span class="area-count" id="work-count">— 项</span>
+        </header>
+        <div class="record-list" id="work-records"></div>
+        <div class="empty-state" id="work-empty" hidden><strong>今天很棒，所有工作都完成了，安心摸鱼吧。</strong><span>已完成的事项收在下面，随时可以回看。</span></div>
+        <details class="completed-fold" id="work-completed" hidden>
+          <summary><span>已完成工作</span><span class="fold-count" id="work-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div class="record-list completed-list" id="work-completed-list"></div>
+        </details>
+      </section>
+
+      <section class="work-area area-bug" aria-labelledby="bug-title">
+        <header class="area-heading">
+          <div class="area-heading-copy"><span class="area-kicker">缺陷跟进</span><h2 id="bug-title">BUG</h2><button type="button" id="bug-sources-open" class="source-open-button" aria-haspopup="dialog">缺陷来源</button><p>平台状态与我方处理阶段分开展示</p></div>
+          <span class="area-count" id="bug-count">— 项</span>
+        </header>
+        <div class="record-list" id="bug-records"></div>
+        <div class="empty-state" id="bug-empty" hidden><strong>今天没有需要处理的 BUG，做得漂亮。</strong><span>继续保持，等平台反馈的事项会留在这里。</span></div>
+        <details class="completed-fold" id="bug-completed" hidden>
+          <summary><span>已完成 BUG</span><span class="fold-count" id="bug-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div class="record-list completed-list" id="bug-completed-list"></div>
+        </details>
+      </section>
+
+      <section class="work-area area-task" aria-labelledby="task-title">
+        <header class="area-heading">
+          <div class="area-heading-copy"><span class="area-kicker">Agent 协作</span><h2 id="task-title">委托任务</h2><p>主动交办给 agent 的执行与验收任务</p></div>
+          <span class="area-count" id="task-count">— 项</span>
+        </header>
+        <section class="task-batch-section" id="task-current-section" aria-labelledby="task-current-title" hidden>
+          <header class="task-batch-heading"><h3 id="task-current-title">本批</h3><span id="task-current-state"></span></header>
+          <div class="record-list" id="task-current-records"></div>
+        </section>
+        <section class="task-legacy-section" id="task-legacy-section" aria-labelledby="task-legacy-title" hidden>
+          <header class="task-batch-heading"><h3 id="task-legacy-title">以前任务 · 待续</h3></header>
+          <div class="record-list" id="task-legacy-records"></div>
+        </section>
+        <div class="empty-state" id="task-empty" hidden><strong>谢谢每一位认真协作的 agent，今天暂时没有新任务。</strong><span>继续稳步推进，遇到阻塞就及时记下来。</span></div>
+        <details class="completed-fold task-past-fold" id="task-past-batches" hidden>
+          <summary><span>历史批次</span><span class="fold-count" id="task-past-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div id="task-past-batch-list" class="task-past-batch-list"></div>
+        </details>
+        <details class="completed-fold task-legacy-fold" id="task-legacy-completed" hidden>
+          <summary><span>以前已完成的任务</span><span class="fold-count" id="task-legacy-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div class="record-list completed-list" id="task-legacy-completed-list"></div>
+        </details>
+      </section>
+    </div>
+
+    <footer class="footer"><span>数据来自本地结构化记录</span><button type="button" id="refresh">刷新</button><span class="footer-revision" id="revision"></span></footer>
+  </main>
+
+  <dialog class="record-dialog" id="record-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-shell">
+      <div class="dialog-top"><span class="dialog-kicker">工作项详情</span><button type="button" class="dialog-close" id="dialog-close" aria-label="关闭详情">×</button></div>
+      <article id="detail" class="detail-card"></article>
+    </div>
+  </dialog>
+  <dialog class="sources-dialog scopes-dialog" id="scopes-dialog" aria-labelledby="scopes-title">
+    <div class="sources-shell">
+      <div class="dialog-top"><div><span class="dialog-kicker">已确认职责与边界</span><h2 id="scopes-title">我的职责</h2></div><button type="button" class="dialog-close" id="scopes-close" aria-label="关闭职责目录">×</button></div>
+      <div id="scopes-list" class="scope-catalog-list" aria-live="polite"><p>正在读取职责目录…</p></div>
+    </div>
+  </dialog>
+  <dialog class="followup-dialog" id="followup-dialog" aria-labelledby="followup-dialog-title">
+    <form class="followup-dialog-form" id="followup-dialog-form">
+      <div class="dialog-top"><div><span class="dialog-kicker">新增跟进</span><h2 id="followup-dialog-title"></h2></div><button type="button" class="dialog-close" id="followup-close" aria-label="关闭跟进">×</button></div>
+      <label class="followup-input-label" for="followup-input">跟进提示词</label>
+      <textarea id="followup-input" name="prompt" rows="6" maxlength="8000" placeholder="写下需要继续处理的内容，可分行输入"></textarea>
+      <p class="draft-note">关闭弹窗会保留草稿；按 Enter 换行，使用按钮提交。</p>
+      <div class="followup-dialog-actions"><button type="button" class="quiet-button" id="followup-cancel">取消</button><button type="submit" class="followup-submit">提交跟进</button></div>
+    </form>
+  </dialog>
+  <dialog class="work-hours-dialog" id="work-hours-dialog" aria-labelledby="work-hours-title">
+    <form id="work-hours-form" class="work-hours-form">
+      <div class="dialog-top"><div><span class="dialog-kicker">工作节奏</span><h2 id="work-hours-title">每日工作时间</h2></div><button type="button" class="dialog-close" id="work-hours-close" aria-label="关闭工作时间设置">×</button></div>
+      <p class="work-hours-help">进度按北京时间计算，不包含午休假设。</p>
+      <div class="work-hours-fields"><label for="work-hours-start">开始<input id="work-hours-start" name="start" type="time" required></label><span aria-hidden="true">至</span><label for="work-hours-end">结束<input id="work-hours-end" name="end" type="time" required></label></div>
+      <p id="work-hours-feedback" class="work-hours-feedback" role="status" aria-live="polite"></p>
+      <div class="followup-dialog-actions"><button type="button" class="quiet-button" id="work-hours-cancel">取消</button><button type="submit" class="followup-submit">保存时间</button></div>
+    </form>
+  </dialog>
+  <dialog class="sources-dialog settings-dialog" id="settings-dialog" aria-labelledby="settings-title">
+    <div class="sources-shell">
+      <div class="dialog-top"><div><span class="dialog-kicker">知途偏好与连接</span><h2 id="settings-title">设置</h2></div><button type="button" class="dialog-close" id="settings-close" aria-label="关闭设置">×</button></div>
+      <section class="settings-section" aria-labelledby="settings-data-title">
+        <div class="settings-section-heading"><div><h3 id="settings-data-title">个人数据位置</h3><p>数据保存在你的用户目录中。迁移会先校验副本，成功后保留原目录备份。</p></div><span class="settings-state" id="data-location-state" data-state="unknown">读取中</span></div>
+        <dl class="data-location-details"><div><dt>当前目录</dt><dd id="data-location-current">正在读取…</dd></div><div><dt>默认目录</dt><dd id="data-location-default">—</dd></div><div id="data-location-legacy-row" hidden><dt>原数据目录</dt><dd id="data-location-legacy">—</dd></div><div id="data-location-backup-row" hidden><dt>旧目录备份</dt><dd id="data-location-backup">—</dd></div></dl>
+        <form id="data-location-form" class="settings-form"><label for="data-location-target">新的保存目录</label><div class="settings-path-row"><input id="data-location-target" name="target_path" type="text" placeholder="默认：~/.waylume（可填写其他目录）" autocomplete="off"><button type="submit" class="source-action primary" id="data-location-preview">检查目录</button></div></form>
+        <div id="data-location-preview-result" class="settings-feedback" role="status" aria-live="polite"></div>
+        <div class="settings-actions"><button type="button" class="source-action primary" id="data-location-migrate" disabled>迁移并验证</button></div>
+      </section>
+      <section class="settings-section" aria-labelledby="settings-hours-title">
+        <div class="settings-section-heading"><div><h3 id="settings-hours-title">工作时间</h3><p>工作时间进度按北京时间计算。</p></div><button type="button" class="source-action" id="settings-work-hours-open">调整时间</button></div>
+        <p class="settings-current-value" id="settings-work-hours-value">08:30–17:30</p>
+      </section>
+      <section class="settings-section" aria-labelledby="settings-appearance-title">
+        <div class="settings-section-heading"><div><h3 id="settings-appearance-title">外观</h3><p>选择适合当前工作区的显示风格。</p></div><label class="settings-select-label" for="settings-theme"><span class="visually-hidden">工作台风格</span><select id="settings-theme"><option value="wood">拟物风</option><option value="minimal">简洁风</option><option value="dark">深色简洁</option></select></label></div>
+      </section>
+      <section class="settings-section" aria-labelledby="settings-integrations-title">
+        <div class="settings-section-heading"><div><h3 id="settings-integrations-title">文档工具状态</h3><p>绿灯只表示最近一次真实检查成功；未知或失败不会显示为已连接。</p></div><button type="button" class="source-action" id="integrations-refresh">检查全部</button></div>
+        <ul class="integration-list" id="integration-list" aria-live="polite"><li class="integration-empty">正在读取工具状态…</li></ul>
+      </section>
+    </div>
+  </dialog>
+  <dialog class="sources-dialog" id="sources-dialog" aria-labelledby="sources-title">
+    <div class="sources-shell">
+      <div class="dialog-top"><div><span class="dialog-kicker">工作需求参考资料</span><h2 id="sources-title">需求来源</h2></div><button type="button" class="dialog-close" id="sources-close" aria-label="关闭需求来源">×</button></div>
+      <div class="sources-actions">
+        <button type="button" class="source-action" id="source-add-file">添加文件</button>
+        <button type="button" class="source-action" id="source-toggle-link" aria-expanded="false">添加链接</button>
+        <input id="source-file-input" type="file" hidden>
+      </div>
+      <form id="source-link-form" class="source-link-form" hidden>
+        <label>名称<input id="source-link-name" name="name" type="text" maxlength="200" placeholder="例如：需求说明文档" required></label>
+        <label>类别<select id="source-link-category" name="category"><option value="cloud_document">云文档</option><option value="web_link">网页链接</option></select></label>
+        <label class="source-url-label">链接<input id="source-link-url" name="url" type="url" maxlength="4096" placeholder="https://…" required></label>
+        <div class="source-form-actions"><button type="button" class="quiet-button" id="source-link-cancel">取消</button><button type="submit" id="source-link-submit" class="source-action primary">保存链接</button></div>
+      </form>
+      <p id="source-feedback" class="source-feedback" role="status" aria-live="polite">正在读取来源清单…</p>
+      <section class="source-section" aria-labelledby="sources-active-title"><div class="source-section-heading"><h3 id="sources-active-title">当前来源</h3><span id="source-count">0</span></div><ul id="source-active-list" class="source-list"></ul><p id="source-active-empty" class="source-empty" hidden>还没有加入需求资料。</p></section>
+      <section class="source-section removed-sources" id="removed-sources-section" aria-labelledby="sources-removed-title" hidden><div class="source-section-heading"><h3 id="sources-removed-title">已移出清单，可恢复</h3><span id="removed-source-count">0</span></div><ul id="source-removed-list" class="source-list"></ul></section>
+    </div>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

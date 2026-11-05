@@ -36,6 +36,24 @@ class BackendTests(unittest.TestCase):
         for p in reversed(self.patchers): p.stop()
         self.temp.cleanup()
 
+    def test_upsert_generates_ids_for_new_tasks_and_work_but_preserves_source_id(self):
+        from argparse import Namespace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        input_path = self.root / "new-record.json"
+        results = []
+        for payload in ({"type": "task", "title": "new task", "status": "pending"},
+                        {"type": "work", "title": "new work", "status": "pending"},
+                        {"id": "JIRA-123", "type": "work", "title": "source", "status": "pending"}):
+            input_path.write_text(json.dumps(payload), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output): dashboardctl.cmd_upsert(Namespace(input=str(input_path)))
+            results.append(json.loads(output.getvalue())["record"]["id"])
+        self.assertRegex(results[0], r"^ZT-T-[A-F0-9]{12}$")
+        self.assertRegex(results[1], r"^ZT-W-[A-F0-9]{12}$")
+        self.assertEqual(results[2], "JIRA-123")
+        self.assertEqual(len(set(results)), 3)
+
     def test_separate_files_recoverable_layout_and_context_path(self):
         self.assertTrue((self.root / "records/task/T-1/record.json").is_file())
         self.assertTrue((self.root / "records/task/T-1/context.md").is_file())

@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
     <title>知途 Waylume · AI助理工作台</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261104-settings-2">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261105-iphone-use-1">
   <script src="/assets/markdown.js?v=20261028-cancelled-terminal-1" defer></script>
   <script src="/assets/dashboard-model.js?v=20261028-cancelled-terminal-1" defer></script>
-  <script src="/assets/dashboard.js?v=20261105-inspection-partial-1" defer></script>
+  <script src="/assets/dashboard.js?v=20261105-iphone-use-1" defer></script>
 </head>
-<body>
+<body data-theme="minimal">
   <main class="shell">
     <header class="topbar">
       <img class="brand-mark brand-mark-color" src="/assets/waylume-mark-color.svg?v=20261104-exact" alt="知途标志" width="42" height="42">
@@ -23,7 +23,7 @@
         <button type="button" id="worktime-open" class="worktime-button" aria-label="设置每日工作时间" title="每日工作时间：08:30–17:30（北京时间）">
           <span class="worktime-label">工作</span><span class="worktime-track" aria-hidden="true"><span id="worktime-fill"></span></span><span id="worktime-percent">0%</span>
         </button>
-        <button type="button" id="theme-toggle" class="theme-toggle" aria-label="当前风格：拟物风。切换到简洁风">风格·拟物</button>
+        <button type="button" id="theme-toggle" class="theme-toggle" aria-label="当前风格：简洁风。切换到深色简洁">风格·简洁风</button>
         <div class="freshness" id="freshness" aria-live="polite"><span class="fresh-dot"></span><span>正在读取</span></div>
       </div>
     </header>
@@ -141,10 +141,10 @@
         <p class="settings-current-value" id="settings-work-hours-value">08:30–17:30</p>
       </section>
       <section class="settings-section" aria-labelledby="settings-appearance-title">
-        <div class="settings-section-heading"><div><h3 id="settings-appearance-title">外观</h3><p>选择适合当前工作区的显示风格。</p></div><label class="settings-select-label" for="settings-theme"><span class="visually-hidden">工作台风格</span><select id="settings-theme"><option value="wood">拟物风</option><option value="minimal">简洁风</option><option value="dark">深色简洁</option></select></label></div>
+        <div class="settings-section-heading"><div><h3 id="settings-appearance-title">外观</h3><p>选择适合当前工作区的显示风格。</p></div><label class="settings-select-label" for="settings-theme"><span class="visually-hidden">工作台风格</span><select id="settings-theme"><option value="minimal">简洁风</option><option value="dark">深色简洁</option></select></label></div>
       </section>
       <section class="settings-section" aria-labelledby="settings-integrations-title">
-        <div class="settings-section-heading"><div><h3 id="settings-integrations-title">文档工具状态</h3><p>绿灯只表示最近一次真实检查成功；未知或失败不会显示为已连接。</p></div><button type="button" class="source-action" id="integrations-refresh">检查全部</button></div>
+        <div class="settings-section-heading"><div><h3 id="settings-integrations-title">工具状态</h3><p>绿色表示最近一次真实检查成功；宿主工具需由对应 Agent 核验。</p></div><button type="button" class="source-action" id="integrations-refresh">检查全部</button></div>
         <ul class="integration-list" id="integration-list" aria-live="polite"><li class="integration-empty">正在读取工具状态…</li></ul>
       </section>
     </div>

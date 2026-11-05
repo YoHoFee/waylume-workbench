@@ -64,3 +64,12 @@ python3 scripts/install_waylume.py --check --home /tmp/waylume-home --data-dir /
 - [Codex、Gemini/Antigravity、DSH 接入](skills/waylume-assistant/references/host-integration.md)
 
 Skill 只说明如何协作，不替代当前用户授权、项目内规则、真实工具状态或公司的原始需求来源。工作台数据/API/界面另由产品代码维护；不要把业务记录写进 Skill 文档。
+
+### 工具只读检查
+
+```sh
+python3 scripts/check_integrations.py
+python3 scripts/check_integrations.py feishu tencent_docs kdocs
+```
+
+脚本会对飞书、腾讯文档、金山和 Git 工具运行本机只读探针，并保存结果；输出只含状态和检查时间，不包含凭据或文档内容。Figma 等宿主 Agent 工具无法由本地服务进程直接调用，脚本会标记 `host_agent_required` 并保留已有宿主检查记录；需由具备相应工具的 Agent 完成真实只读检查并上报。Git 检查仅验证本机程序可运行，不检查任何仓库或连接远端；文档检查成功不代表某个具体文件的权限已验证。面板显示最近一次验证结果，未知状态不是未安装的证明。

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import base64
 import binascii
 import json
@@ -273,6 +274,7 @@ def build_payload() -> dict:
     else:
         db = {"sources": []}
         records, sync, revision = [], {}, 0
+    records = [{**item, "display_id": (item["id"] if re.fullmatch(r"ZT-T-[A-F0-9]{12}", item.get("id", "")) else "ZT-L-" + hashlib.sha256(item["id"].encode()).hexdigest()[:12].upper())} if item.get("type") == "task" and isinstance(item.get("id"), str) else item for item in records]
     grouped = {
         "requirements": [item for item in records if item.get("type") == "work"],
         "bugs": [item for item in records if item.get("type") == "bug"],

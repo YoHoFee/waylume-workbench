@@ -46,6 +46,107 @@ class PortabilityTests(unittest.TestCase):
             patcher.stop()
         self.temp.cleanup()
 
+    def test_new_integrations_require_readonly_evidence_and_can_be_reported(self):
+        for provider in ("jira", "linear"):
+            self.assertNotEqual(integrations.status()["providers"][provider]["status"], "passed")
+            payload = {"status": "passed", "tool": "fixture", "agent": "fixture", "read_only": True, "evidence_summary": "read-only check passed"}
+            result = integrations.report_agent_check(provider, payload)["provider"]
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(result["checked_at"])
+            self.assertEqual(integrations.status()["providers"][provider]["status"], "passed")
+
+    def test_iphone_use_probe_reports_bundle_not_phone_readiness(self):
+        home = Path(self.temp.name) / "codex"
+        root = home / "plugins/cache/iphone-use-local/iphone-use/0.3.10"
+        with patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            self.assertEqual(integrations._probe_iphone_use()[0], "unknown")
+            for name in (".codex-plugin/plugin.json", ".mcp.json", "server/iphone_use.py", "skills/iphone-use-setup/SKILL.md"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"name": "iphone-use"}) if name.endswith("plugin.json") else "{}")
+            status, reason, missing, detail = integrations._probe_iphone_use()
+            self.assertEqual((status, reason), ("passed", "plugin_files_present"))
+            self.assertIn("宿主实际加载未验证", missing[0])
+            self.assertIn("宿主", detail)
+
+    def test_git_probe_checks_only_executable_without_accessing_repository(self):
+        from types import SimpleNamespace
+        ok = SimpleNamespace(returncode=0, stdout="git version 2.50.0\n")
+        with patch.object(integrations, "_find_cli", return_value="/usr/bin/git"):
+            with patch.object(integrations.subprocess, "run", return_value=ok) as run:
+                status, reason, gaps, detail = integrations._probe_git()
+                self.assertEqual((status, reason), ("passed", "readonly_probe_passed"))
+                self.assertIn("仓库访问及远端权限未验证", detail)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], ["/usr/bin/git", "--version"])
+        with patch.object(integrations, "_find_cli", return_value=None):
+            self.assertEqual(integrations._probe_git()[0], "unknown")
+
+    def test_cli_probes_resolve_user_bin_and_pass_runtime_path(self):
+        from types import SimpleNamespace
+        fake_home = Path(self.temp.name) / "home"
+        bin_dir = fake_home / ".local/bin"
+        bin_dir.mkdir(parents=True)
+        for command in ("lark-cli", "kdocs-cli"):
+            (bin_dir / command).touch(mode=0o755)
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "checks": [{"name": "network", "status": "pass"}]}))
+        with patch.object(integrations.Path, "home", return_value=fake_home), patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            self.assertEqual(integrations._find_cli("lark-cli"), str(bin_dir / "lark-cli"))
+            self.assertEqual(integrations._find_cli("kdocs-cli"), str(bin_dir / "kdocs-cli"))
+            with patch.object(integrations.subprocess, "run", return_value=result) as run:
+                self.assertEqual(integrations._probe_feishu()[0], "passed")
+                path = run.call_args.kwargs["env"]["PATH"]
+                self.assertIn(str(bin_dir), path.split(os.pathsep))
+                self.assertIn("/usr/local/bin", path.split(os.pathsep))
+                self.assertEqual(integrations._probe_kdocs()[0], "passed")
+
+    def test_legacy_unprobeable_host_result_is_unknown(self):
+        path = integrations._status_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"tencent_docs": {"status": "not_configured", "checked_at": "2026-11-05T00:00:00+08:00", "verification_method": "local_readonly_probe", "reason_code": "host_connector_not_probeable"}}))
+        result = integrations.status()["providers"]["tencent_docs"]
+        self.assertEqual(result["status"], "unknown")
+        self.assertIsNone(result["checked_at"])
+
+    def test_tencent_probe_requires_account_check_and_redacts_raw_output(self):
+        from types import SimpleNamespace
+        plugin = self.root_for_tencent_probe()
+        with patch.dict(os.environ, {"CODEX_HOME": str(plugin)}), patch.object(integrations.shutil, "which", return_value="node"):
+            for output, expected in (("Connection OK. Tools discovered: 227; account checked.\n", "passed"),
+                                     ("Connection OK. Tools discovered: 227; discovery only.\n", "unknown"),
+                                     ("unexpected token=secret", "unknown")):
+                with patch.object(integrations.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=output)):
+                    result = integrations._probe_tencent_docs()
+                    self.assertEqual(result[0], expected)
+                    self.assertNotIn("secret", str(result))
+
+    def test_tencent_probe_uses_pinned_node_when_service_path_is_empty(self):
+        from types import SimpleNamespace
+        plugin = self.root_for_tencent_probe()
+        runtime = Path(self.temp.name) / "node"
+        runtime.touch(mode=0o755)
+        config = plugin / "plugins/cache/akashmahedy-plugins/tencent-docs/1.2.2/.mcp.json"
+        config.write_text(json.dumps({"mcpServers": {"tencent_docs": {"command": str(runtime)}}}))
+        with patch.dict(os.environ, {"CODEX_HOME": str(plugin)}), patch.object(integrations.shutil, "which", return_value=None):
+            with patch.object(integrations.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="Connection OK. Tools discovered: 227; account checked.")) as run:
+                self.assertEqual(integrations._probe_tencent_docs()[0], "passed")
+                self.assertEqual(run.call_args.args[0][0], str(runtime))
+
+    def root_for_tencent_probe(self):
+        root = Path(self.temp.name) / "codex"
+        script = root / "plugins/cache/akashmahedy-plugins/tencent-docs/1.2.2/scripts/setup.mjs"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.touch()
+        return root
+
+    def test_local_check_preserves_host_verified_connection(self):
+        for provider in ("figma",):
+            reported = integrations.report_agent_check(provider, {"status": "passed", "tool": "fixture", "agent": "fixture", "read_only": True, "evidence_summary": "read-only check passed"})["provider"]
+            checked = integrations.check(provider)
+            self.assertEqual(checked["check_outcome"], "host_agent_required")
+            self.assertEqual(checked["provider"], reported)
+            self.assertEqual(integrations.status()["providers"][provider], reported)
+
     def test_migration_requires_preview_token_and_preserves_source(self):
         revision = data_location.location()["revision"]
         preflight = data_location.preview(str(self.target), revision)

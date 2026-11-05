@@ -1009,6 +1009,8 @@ def with_lock(fn):
 def cmd_upsert(args: argparse.Namespace) -> None:
     raw = json.load(sys.stdin) if args.input == "-" else json.loads(Path(args.input).read_text(encoding="utf-8"))
     supplied_fields = set(raw) if isinstance(raw, dict) else set()
+    if isinstance(raw, dict) and not raw.get("id") and raw.get("type") in {"task", "work"}:
+        raw["id"] = f"ZT-T-{uuid.uuid4().hex[:12].upper()}" if raw["type"] == "task" else f"ZT-W-{uuid.uuid4().hex[:12].upper()}"
     normalized = normalize_record(raw)
 
     def update() -> dict[str, Any]:

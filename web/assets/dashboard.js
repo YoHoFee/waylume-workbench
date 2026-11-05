@@ -9,7 +9,7 @@
     try { savedTheme = themeStorage.getItem("mcloud-dashboard-theme"); } catch (_) {}
   }
   try { delete window.__GEMINI_INITIAL_THEME__; } catch (_) {}
-  if (["minimal", "wood", "dark"].includes(savedTheme)) document.body.dataset.theme = savedTheme;
+  document.body.dataset.theme = savedTheme === "dark" ? "dark" : "minimal";
   const groups = [
     { key: "work", field: "requirements", list: "#work-records", empty: "#work-empty", done: "#work-completed", doneCount: "#work-completed-count", doneList: "#work-completed-list", count: "#work-count" },
     { key: "bug", field: "bugs", list: "#bug-records", empty: "#bug-empty", done: "#bug-completed", doneCount: "#bug-completed-count", doneList: "#bug-completed-list", count: "#bug-count" },
@@ -24,7 +24,9 @@
   const model = window.dashboardModel;
   let workHours = { start: "08:30", end: "17:30", timezone: "Asia/Shanghai" };
   const integrationProviders = [
-    ["feishu", "飞书"], ["tencent_docs", "腾讯文档"], ["kdocs", "金山文档"], ["figma", "Figma"]
+    ["feishu", "飞书", "文档", "飞"], ["tencent_docs", "腾讯文档", "文档", "腾"], ["kdocs", "金山文档", "文档", "金"],
+    ["jira", "Jira", "需求平台", "J"], ["figma", "Figma", "UI 平台", "F"],
+    ["linear", "Linear", "缺陷管理平台", "L"], ["git", "Git", "代码管理平台", "G"], ["iphone_use", "iPhone Use", "开发工具", "i"]
   ];
   let dataLocationPreview = null;
   let dataLocationRevision = null;
@@ -66,7 +68,7 @@
   function matchesSearch(record) {
     const query = state.query.trim().toLocaleLowerCase("zh-CN");
     if (!query) return true;
-    return [record.id, record.title, record.status, record.source_status, record.status_detail, record.owner, record.assignee,
+    return [record.id, record.display_id, record.title, record.status, record.source_status, record.status_detail, record.owner, record.assignee,
       record.notes, record.evidence, record.source, record.our_status, record.triage, record.latest_brief,
       record.progress?.map(item => typeof item === "string" ? item : JSON.stringify(item)), record.followups?.map(item => item.prompt)]
       .map(txt).join(" ").toLocaleLowerCase("zh-CN").includes(query);
@@ -180,39 +182,25 @@
   function renderIntegrationStatuses(payload) {
     const list = $("#integration-list"); list.replaceChildren();
     const statuses = payload?.providers || payload?.integrations || {};
-    for (const [key, name] of integrationProviders) {
+    let currentGroup = "", groupList;
+    for (const [key, name, group, logo] of integrationProviders) {
+      if (group !== currentGroup) {
+        currentGroup = group;
+        const section = document.createElement("li"); section.className = "integration-group";
+        const heading = document.createElement("h4"); heading.textContent = group;
+        groupList = document.createElement("ul"); section.append(heading, groupList); list.append(section);
+      }
       const item = statuses[key] || {};
-      const candidate = ["passed", "failed", "unknown", "checking", "not_configured"].includes(item.status) ? item.status : "unknown";
-      const status = candidate === "passed" && !item.checked_at ? "unknown" : candidate;
-      const li = document.createElement("li"); li.className = "integration-row"; li.dataset.state = status;
-      const head = document.createElement("div"); head.className = "integration-row-head";
-      const title = document.createElement("strong"); title.textContent = name;
-      const badge = document.createElement("span"); badge.className = "integration-state"; badge.textContent = integrationStatusLabel(status);
-      head.append(title, badge);
-      const checked = document.createElement("p"); checked.className = "integration-checked";
-      const checkedByAgent = item.verification_method === "host_agent_readonly_report";
-      const verificationLabel = checkedByAgent ? "Agent 只读实测" : item.verification_method === "local_readonly_probe" ? "本地服务只读检查" : "服务检查";
-      checked.textContent = item.checked_at ? `最近${verificationLabel}：${dateLabel(item.checked_at)}` : "最近检查：暂无记录";
-      li.append(head, checked);
-      const evidenceSummary = item.evidence?.summary;
-      if (checkedByAgent && evidenceSummary) {
-        const evidence = document.createElement("p"); evidence.className = "integration-detail";
-        evidence.textContent = `Agent 实测记录：${safeText(evidenceSummary, 220)}`; li.append(evidence);
-      }
-      const detail = safeText(item.safe_next_step || item.reason || item.reason_code || "", 360);
-      if (detail) { const p = document.createElement("p"); p.className = "integration-detail"; p.textContent = detail; li.append(p); }
-      const gaps = Array.isArray(item.missing_capabilities) ? item.missing_capabilities.map(v => safeText(v, 100)).filter(Boolean) : [];
-      if (gaps.length) { const p = document.createElement("p"); p.className = "integration-detail"; p.textContent = `待补能力：${gaps.join("、")}`; li.append(p); }
-      if (status !== "passed") {
-        const actions = document.createElement("div"); actions.className = "integration-actions";
-        if (status !== "not_configured") {
-          const check = document.createElement("button"); check.type = "button"; check.className = "source-text-action"; check.dataset.integrationCheck = key; check.textContent = "重新检查";
-          actions.append(check);
-        }
-        const copy = document.createElement("button"); copy.type = "button"; copy.className = "source-text-action"; copy.dataset.integrationPrompt = key; copy.textContent = "复制接入提示";
-        actions.append(copy); li.append(actions);
-      }
-      list.append(li);
+      const passed = item.status === "passed" && !!item.checked_at;
+      const li = document.createElement("li"); li.className = "integration-row"; li.dataset.state = passed ? "passed" : "unknown";
+      const identity = document.createElement("div"); identity.className = "integration-identity";
+      const mark = document.createElement("span"); mark.className = `integration-logo integration-logo-${key}`; mark.textContent = logo; mark.setAttribute("aria-hidden", "true");
+      const title = document.createElement("strong"); title.textContent = name; identity.append(mark, title);
+      const action = document.createElement("button"); action.type = "button"; action.className = "integration-state";
+      action.textContent = passed ? (key === "iphone_use" && item.reason_code === "plugin_files_present" ? "已安装" : "已集成") : item.status === "not_configured" ? "去集成" : "待检查";
+      if (passed) { action.disabled = true; action.title = `最近检查：${dateLabel(item.checked_at)}${item.safe_next_step ? ` · ${safeText(item.safe_next_step, 240)}` : ""}`; }
+      else { action.dataset.integrationPrompt = key; action.title = item.safe_next_step || "点击复制检查与接入提示"; }
+      li.append(identity, action); groupList.append(li);
     }
   }
   async function loadIntegrationStatuses() {
@@ -251,7 +239,8 @@
     const name = integrationProviders.find(([key]) => key === provider)?.[1] || provider;
     const gaps = (item.missing_capabilities || []).map(value => safeText(value, 100)).filter(Boolean);
     const details = [item.reason_code && `检查结果：${safeText(item.reason_code, 120)}`, gaps.length && `缺少能力：${gaps.join("、")}`, item.safe_next_step && `建议：${safeText(item.safe_next_step, 240)}`].filter(Boolean).join("\n");
-    const prompt = `请检查知途工作台与${name}的文档工具集成，并修复实际缺口。先核对本地配置和接口，不要输出、复制或提交任何凭据；完成后用真实调用验证并记录结果。${details ? `\n\n当前检测信息：\n${details}` : "\n当前没有可用的具体失败信息，请先运行集成检查并根据实际结果处理。"}`;
+    const purposes = { feishu: "飞书文档的搜索与读取", tencent_docs: "腾讯文档和表格的只读访问", kdocs: "金山文档的搜索与读取", jira: "Jira 需求和项目事项读取", figma: "Figma 文件与设计节点读取", linear: "Linear 缺陷和事项读取", git: "Git 仓库及版本状态读取", iphone_use: "通过 USB 在授权的真实 iPhone 上进行开发和自动化测试" };
+    const prompt = provider === "iphone_use" ? (item.prompt_context || "请帮助安装和配置 iPhone Use。先检查当前宿主的 iphone-use-setup Skill 和 PUA 工具，调用 pua_setup(status) 并复用现有配置；若插件缺失，阅读 https://github.com/zhongerxin/iPhone-use 的 README 按安装说明操作。安装后重新打开宿主会话，确认 iphone-use-setup Skill 和 PUA 工具入口可用；不启动或检查手机服务，不操作设备，不要索取或记录凭据。") : `请为知途工作台检查并配置${name}集成，用于${purposes[provider]}。先检查当前宿主可用的官方工具、连接方式和授权状态，复用已有配置；缺少账号授权或目标资源时向用户说明。不要输出、复制、保存或提交凭据，不要修改远端数据。完成后使用用户授权的目标进行真实只读验证，准确记录验证范围和结果；未验证不得标记已集成。验证后通过知途 /api/integrations/${provider}/report 记录状态、工具、Agent、read_only 和简短脱敏证据；检查失败或缺少工具时如实报告。${details ? `\n\n当前检测信息：\n${details}` : ""}`;
     try { await navigator.clipboard.writeText(prompt); showToast("接入提示已复制"); }
     catch (_) { window.prompt("复制以下接入提示", prompt); }
   }
@@ -321,7 +310,7 @@
   function openSettings() {
     $("#settings-dialog").showModal(); loadDataLocation(); loadIntegrationStatuses();
     $("#settings-work-hours-value").textContent = `${workHours.start}–${workHours.end}`;
-    $("#settings-theme").value = document.body.dataset.theme || "wood";
+    $("#settings-theme").value = document.body.dataset.theme || "minimal";
   }
   function openWorkHours() {
     $("#work-hours-start").value = workHours.start;
@@ -628,13 +617,13 @@
     finally { setSourcesBusy(false); }
   }
   function updateThemeButton() {
-    const theme = document.body.dataset.theme || "wood";
+    const theme = document.body.dataset.theme || "minimal";
     const labels = { minimal: "简洁风", wood: "拟物风", dark: "深色简洁" };
-    const next = theme === "wood" ? "简洁风" : theme === "minimal" ? "深色简洁" : "拟物风";
+    const next = theme === "minimal" ? "深色简洁" : "简洁风";
     const button = $("#theme-toggle");
     button.textContent = `风格·${theme === "dark" ? "深色" : labels[theme]}`;
     button.setAttribute("aria-label", `当前风格：${labels[theme]}。点击切换到${next}`);
-    button.setAttribute("aria-pressed", String(theme !== "wood"));
+    button.setAttribute("aria-pressed", String(theme === "dark"));
   }
 
   function makeFollowupPreview(record) {
@@ -688,6 +677,7 @@
     const done = isCompleted(record), cancelled = isCancelled(record), terminal = done || cancelled, busy = state.busy.has(record.id);
     article.className = `record-card${terminal ? " record-completed record-terminal" : ""}${cancelled ? " record-cancelled" : ""}${record.transfer_disposition === "transfer_pending" ? " transfer-pending" : ""}${busy ? " is-busy" : ""}`;
     const head = document.createElement("div"); head.className = "record-head";
+    const idLabel = document.createElement("span"); idLabel.className = "record-id"; idLabel.textContent = record.display_id || record.id; idLabel.title = record.display_id && record.display_id !== record.id ? `原始编号：${record.id}` : record.id; head.append(idLabel);
     const status = document.createElement("span"); status.className = `status-pill ${record.transfer_disposition === "transfer_pending" ? "transfer-pending" : escClass(record.type === "bug" ? (record.platform_status || record.status) : effectiveStatus(record))}`;
     const statusCode = effectiveStatus(record);
     status.textContent = record.transfer_disposition === "transfer_pending" ? "待转交" : record.transfer_disposition === "transferred" ? "已转交" : cancelled ? "已取消" : done ? "已完成" : statusLabel(statusCode === "in_progress" || statusCode === "on_hold" || record.type === "task" ? statusCode : sourceStatus(record)); head.append(status);
@@ -1067,7 +1057,9 @@
     const title = document.createElement("h2"); title.id = "dialog-title"; title.textContent = record.title;
     if (isCancelled(record)) title.classList.add("record-cancelled-title");
     const pill = document.createElement("span"); pill.className = `status-pill ${escClass(effectiveStatus(record))}`; pill.textContent = statusLabel(effectiveStatus(record));
-    head.append(title, pill); detail.append(head);
+    const idButton = document.createElement("button"); idButton.type = "button"; idButton.className = "detail-id-copy"; idButton.textContent = record.display_id || record.id; idButton.title = "点击复制事项 ID";
+    idButton.addEventListener("click", async () => { try { await navigator.clipboard.writeText(record.display_id || record.id); showToast("ID 已复制"); } catch (_) { showToast("复制失败，请手动复制", "error"); } });
+    head.append(title, pill); detail.append(idButton, head);
     const statusLine = document.createElement("p"); statusLine.className = "detail-status-line";
     statusLine.textContent = record.type === "bug" && record.platform_status
       ? `平台上次读取：${statusLabel(record.platform_status)} · ${dateLabel(record.observed_at, "读取时间未记录")}`
@@ -1320,7 +1312,7 @@
   $("#integrations-refresh").addEventListener("click", async event => {
     const button = event.currentTarget; button.disabled = true; button.textContent = "检查中…";
     try {
-      for (const [provider] of integrationProviders) {
+      for (const [provider] of integrationProviders.filter(([key]) => ["feishu", "tencent_docs", "kdocs", "figma", "git", "iphone_use"].includes(key))) {
         try { await postAction(`/api/integrations/${encodeURIComponent(provider)}/check`, {}); }
         catch (_) { /* Keep checking the remaining independent integrations. */ }
       }
@@ -1346,8 +1338,8 @@
   $("#work-hours-form").addEventListener("submit", saveWorkHours);
   updateThemeButton();
   $("#theme-toggle").addEventListener("click", () => {
-    const current = document.body.dataset.theme || "wood";
-    const next = current === "wood" ? "minimal" : current === "minimal" ? "dark" : "wood";
+    const current = document.body.dataset.theme || "minimal";
+    const next = current === "minimal" ? "dark" : "minimal";
     document.body.dataset.theme = next;
     try { themeStorage.setItem("mcloud-dashboard-theme", next); } catch (_) {}
     $("#settings-theme").value = next;
@@ -1393,6 +1385,7 @@
   $("#record-dialog").addEventListener("click", event => { if (event.target === $("#record-dialog")) $("#record-dialog").close(); });
   document.addEventListener("click", event => {
     const open = event.target.closest("[data-open-record]"); if (open) openDetail(open.dataset.openRecord);
+    if (!event.target.closest("button,a,input,select,textarea,summary")) { const card = event.target.closest(".record-card"); if (card) openDetail(card.dataset.recordId); }
     const transfer = event.target.closest("[data-transfer-id]"); if (transfer) submitTransfer(transfer);
     const complete = event.target.closest("[data-complete-id]"); if (complete) submitCompletion(complete);
     const followup = event.target.closest("[data-followup-id]"); if (followup) openFollowup(followup.dataset.followupId);

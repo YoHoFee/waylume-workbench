@@ -343,7 +343,7 @@ class BackendTests(unittest.TestCase):
             heartbeat = dashboardctl.agent_heartbeat("T-1", active["revision"], now=start + timedelta(minutes=2))
             self.assertEqual(heartbeat["record"]["last_agent_activity_at"], (start + timedelta(minutes=2)).isoformat(timespec="seconds"))
             with self.assertRaisesRegex(ValueError, "agent_expired"):
-                dashboardctl.agent_heartbeat("T-1", heartbeat["record"]["revision"], now=start + timedelta(minutes=12))
+                dashboardctl.agent_heartbeat("T-1", heartbeat["record"]["revision"], now=start + timedelta(minutes=122))
             expired = dashboardctl.load_store()["records"][0]
             self.assertIsNone(expired["current_agent_session_id"])
             self.assertIsNone(expired["current_agent_name"])
@@ -351,13 +351,33 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(expired["agent_state"], "paused")
             reclaimed = dashboardctl.agent_claim("T-1", expired["revision"])
             self.assertEqual(reclaimed["record"]["current_agent_session_id"], "thread-owner-1")
-            dashboardctl.agent_sweep(datetime.now().astimezone() + timedelta(minutes=10))
+            dashboardctl.agent_sweep(datetime.now().astimezone() + timedelta(hours=2))
             expired_again = dashboardctl.load_store()["records"][0]
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-owner-2"}):
             replacement = dashboardctl.agent_claim("T-1", expired_again["revision"])
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-owner-1"}):
             with self.assertRaisesRegex(ValueError, "agent_owner_conflict"):
                 dashboardctl.agent_report("T-1", replacement["record"]["revision"], "old owner write")
+
+    def test_agent_status_choices_and_two_hour_inactivity(self):
+        start = datetime.fromisoformat("2026-11-06T10:00:00+08:00")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-stage-owner"}):
+            with patch.object(dashboardctl, "timestamp", return_value=start.isoformat()):
+                state = dashboardctl.agent_update("T-1", 1, "开发中", status="developing")
+            self.assertEqual(dashboardctl.effective_work_status(state["record"], start + timedelta(minutes=119))[0], "developing")
+            self.assertEqual(dashboardctl.effective_work_status(state["record"], start + timedelta(hours=2))[0], "on_hold")
+            with patch.object(dashboardctl, "timestamp", return_value=(start + timedelta(minutes=1)).isoformat()):
+                state = dashboardctl.agent_update("T-1", state["revision"], "测试中", status="testing")
+            self.assertEqual(state["record"]["progress"][-1]["status"], "testing")
+            self.assertEqual(dashboardctl.effective_work_status(state["record"], start + timedelta(minutes=3))[0], "testing")
+            with patch.object(dashboardctl, "timestamp", return_value=(start + timedelta(minutes=2)).isoformat()):
+                state = dashboardctl.agent_update("T-1", state["revision"], "返回开发", status="developing")
+                state = dashboardctl.agent_update("T-1", state["revision"], "暂停", status="on_hold")
+            self.assertIsNone(state["record"]["current_agent_session_id"])
+            self.assertEqual(state["record"]["agent_state"], "paused")
+            self.assertEqual(dashboardctl.effective_work_status(state["record"], start + timedelta(minutes=3))[0], "on_hold")
+            reclaimed = dashboardctl.agent_claim("T-1", state["revision"])
+            self.assertEqual(reclaimed["record"]["agent_work_status"], "in_progress")
 
     def test_work_hours_preferences_persist_and_reject_invalid_ranges(self):
         saved = dashboardctl.set_work_hours("09:15", "18:00")
@@ -384,7 +404,7 @@ class BackendTests(unittest.TestCase):
         dashboardctl.add_followup("T-1", "用户批注")
         after = dashboardctl.load_store()["records"][0]
         self.assertEqual(after["last_agent_activity_at"], start.isoformat())
-        swept = dashboardctl.agent_sweep(start + timedelta(minutes=10))
+        swept = dashboardctl.agent_sweep(start + timedelta(hours=2))
         self.assertEqual(swept["paused"], ["T-1"])
         held = dashboardctl.load_store()["records"][0]
         self.assertIsNone(held["current_agent_session_id"])
@@ -464,6 +484,23 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(dashboardctl.effective_work_status(row)[0], "completed")
         self.assertIn("完整成功", row["history"][-1]["note"])
+
+    def test_sync_accepts_complete_owned_list_when_requirements_are_partial(self):
+        dashboardctl.atomic_write({"schema_version": 1, "revision": 1, "records": [
+            {"id": "BUG-PARTIAL-RUN", "type": "bug", "title": "x", "status": "in_progress"}]})
+        state_path = self.root / "state.json"
+        state = {"last_successful_snapshot_at": "2026-10-22T10:00:00+08:00", "stale": False, "bugs": [],
+            "last_attempt": {"result": "partial", "bug_list_result": "succeeded", "stale": False,
+                "captured_at": "2026-10-22T10:00:00+08:00", "pages_read": 1, "reported_total": 0,
+                "unique_ids": 0, "filter": "我负责的",
+                "verification": "matched self owner current-user; complete=true; uniqueIds=0; all pages returned"}}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with patch("sys.stdout", new_callable=__import__("io").StringIO):
+            dashboardctl.cmd_sync_bugs(type("Args", (), {"state": str(state_path)})())
+        store = dashboardctl.load_store()
+        self.assertFalse(store["sync"]["bugs"]["stale"])
+        self.assertIsNone(store["sync"]["bugs"]["error"])
+        self.assertEqual(store["records"][0]["status"], "archived")
 
 
 if __name__ == "__main__": unittest.main()

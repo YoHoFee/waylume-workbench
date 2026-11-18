@@ -13,18 +13,25 @@ Use the workbench as the shared task router and durable context for the user and
 
 When the user asks to create, initialize, or configure a work assistant, follow [create-work-assistant](skills/create-work-assistant/SKILL.md) to establish its role, guidance and supported durable memory.
 
+## Workflow
+
+If the item has a workflow (or the user asks to start, advance, audit, accept or deliver one), read [workflow contract](references/workflow.md) before acting. The workbench owns the six-stage state machine, required outputs, locks, role bindings and dispatch card. The host owns concrete agent identities and transport; do not put host-specific dispatch policy into the workbench record.
+
+Always read `dashboardctl.py dispatch-card <ITEM_ID>` (or `GET /api/items/<ITEM_ID>/dispatch-card`) immediately before dispatching a role. Follow its `next.action` and `next.role`; do not infer the next step from chat memory. Delivery is manual: never close, push or release on the user's behalf.
+
 ## Start and act
 
 1. Follow the host's current user instructions and repository instructions. Resolve the exact workbench item before resuming; do not create a duplicate when an item already exists.
 2. Read the item's latest context, pending user follow-ups, and applicable user profile/responsibility scope from the configured personal data directory (`~/.waylume` by default). If the workbench API/CLI is unavailable, say so and use only a documented, safe fallback; do not edit its storage behind a running service.
 3. Before choosing or using an external tool, consult the workbench tool list and follow [tool discovery and usage](references/tool-discovery.md); verify the current host’s actual tools and their instructions.
 4. Determine responsibility before changing code or external records. Make only the requested work and the smallest necessary integration. Preserve another owner's logic; record and report adjacent risks instead of opportunistically fixing them.
-5. Keep status factual. “In progress” requires an active agent owner; otherwise use the workbench's paused/queued state. Never fabricate session IDs, verification, approvals, completion, or external updates.
+5. Keep status factual. The working agent must choose the appropriate non-linear status (`in_progress`, `developing`, `testing`, `on_hold`, or `completed`) and report changes using the workbench agent update/report interface; testing is not a passed test. Sub-agents must follow the same rule. Active states require an active agent owner; the owner becomes stale after two hours without agent activity, after which use the workbench’s on-hold state. Never fabricate session IDs, verification, approvals, completion, or external updates.
 6. Report meaningful milestones to the original item. Preserve earlier evidence and decisions; append or revise the current summary without deleting useful history. Apply user follow-ups to that item, mark each as handled after acting on it, and report outcome even if blocked.
 7. Before closing, distinguish implementation, review, test/acceptance, Git delivery, and external platform status. State what is verified and what remains unknown.
 
 ## References
 
+- Read [workflow contract](references/workflow.md) before starting, advancing, auditing, accepting or delivering a workbench item.
 - Read [role and responsibility boundaries](references/role-and-boundaries.md) when establishing scope or coordinating parallel work.
 - Read [BUG workflow](references/bug-workflow.md) for BUG intake, confidence, reproduction, repair, and acceptance.
 - Read [troubleshooting](references/troubleshooting.md) only for matching prior failures; add an experience only when the cause and remedy have evidence.

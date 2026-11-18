@@ -5,12 +5,43 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
     <title>知途 Waylume · AI助理工作台</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261105-iphone-use-1">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261117-unslop-2">
   <script src="/assets/markdown.js?v=20261028-cancelled-terminal-1" defer></script>
-  <script src="/assets/dashboard-model.js?v=20261028-cancelled-terminal-1" defer></script>
-  <script src="/assets/dashboard.js?v=20261105-iphone-use-1" defer></script>
+  <script src="/assets/dashboard-model.js?v=20261113-library-1" defer></script>
+  <script src="/assets/dashboard.js?v=20261117-unslop-2" defer></script>
 </head>
 <body data-theme="minimal">
+  <svg class="library-logo-sprite" aria-hidden="true" focusable="false" width="0" height="0">
+    <defs>
+      <symbol id="library-logo-requirement_doc" viewBox="0 0 24 24">
+        <path d="M7 3.5h6.5L18 8v12.5H7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="M13.5 3.5V8H18M9.5 12h5M9.5 15.5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="library-logo-figma" viewBox="0 0 24 24">
+        <path d="M9 3.5h3v5H9a2.5 2.5 0 0 1 0-5Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M12 3.5h3a2.5 2.5 0 0 1 0 5h-3Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M9 8.5h3v5H9a2.5 2.5 0 0 1 0-5Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <circle cx="14.5" cy="11" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M9 13.5h3v5H9a2.5 2.5 0 0 1 0-5Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      </symbol>
+      <symbol id="library-logo-codesign" viewBox="0 0 24 24">
+        <rect x="3.5" y="3.5" width="10" height="10" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <rect x="10.5" y="10.5" width="10" height="10" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </symbol>
+      <symbol id="library-logo-api_doc" viewBox="0 0 24 24">
+        <path d="M7 3.5h6.5L18 8v12.5H7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="M13.5 3.5V8H18M10.6 12.4l-1.7 1.8 1.7 1.8M14.4 12.4l1.7 1.8-1.7 1.8M13 11.7l-1.4 5" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="library-logo-file" viewBox="0 0 24 24">
+        <path d="M7 3.5h6.5L18 8v12.5H7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="M13.5 3.5V8H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="library-logo-link" viewBox="0 0 24 24">
+        <path d="M10.2 13.8a3.2 3.2 0 0 0 4.5 0l2.1-2.1a3.2 3.2 0 0 0-4.5-4.5l-1.2 1.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M13.8 10.2a3.2 3.2 0 0 0-4.5 0l-2.1 2.1a3.2 3.2 0 0 0 4.5 4.5l1.2-1.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </symbol>
+    </defs>
+  </svg>
   <main class="shell">
     <header class="topbar">
       <img class="brand-mark brand-mark-color" src="/assets/waylume-mark-color.svg?v=20261104-exact" alt="知途标志" width="42" height="42">
@@ -44,11 +75,11 @@
     <div class="work-areas">
       <section class="work-area area-work" aria-labelledby="work-title">
         <header class="area-heading">
-          <div class="area-heading-copy"><span class="area-kicker">优先工作</span><h2 id="work-title">工作需求</h2><button type="button" id="sources-open" class="source-open-button" aria-haspopup="dialog">需求来源</button><p>公司分工与明确交办的工作进展</p></div>
+          <div class="area-heading-copy"><span class="area-kicker">优先工作</span><h2 id="work-title">工作需求</h2><button type="button" id="sources-open" class="source-open-button" aria-haspopup="dialog">资料库</button><p>公司分工与明确交办的工作进展</p></div>
           <span class="area-count" id="work-count">— 项</span>
         </header>
         <div class="record-list" id="work-records"></div>
-        <div class="empty-state" id="work-empty" hidden><strong>今天很棒，所有工作都完成了，安心摸鱼吧。</strong><span>已完成的事项收在下面，随时可以回看。</span></div>
+        <div class="empty-state" id="work-empty" hidden><strong>这里暂时没有待处理的工作</strong><span>已完成的事项会收在下面，可随时回看。</span></div>
         <details class="completed-fold" id="work-completed" hidden>
           <summary><span>已完成工作</span><span class="fold-count" id="work-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
           <div class="record-list completed-list" id="work-completed-list"></div>
@@ -61,7 +92,7 @@
           <span class="area-count" id="bug-count">— 项</span>
         </header>
         <div class="record-list" id="bug-records"></div>
-        <div class="empty-state" id="bug-empty" hidden><strong>今天没有需要处理的 BUG，做得漂亮。</strong><span>继续保持，等平台反馈的事项会留在这里。</span></div>
+        <div class="empty-state" id="bug-empty" hidden><strong>当前没有待处理的 BUG</strong><span>平台反馈的事项会留在这里。</span></div>
         <details class="completed-fold" id="bug-completed" hidden>
           <summary><span>已完成 BUG</span><span class="fold-count" id="bug-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
           <div class="record-list completed-list" id="bug-completed-list"></div>
@@ -81,7 +112,7 @@
           <header class="task-batch-heading"><h3 id="task-legacy-title">以前任务 · 待续</h3></header>
           <div class="record-list" id="task-legacy-records"></div>
         </section>
-        <div class="empty-state" id="task-empty" hidden><strong>谢谢每一位认真协作的 agent，今天暂时没有新任务。</strong><span>继续稳步推进，遇到阻塞就及时记下来。</span></div>
+        <div class="empty-state" id="task-empty" hidden><strong>当前没有新的委托任务</strong><span>交办给 Agent 的任务会出现在这里。</span></div>
         <details class="completed-fold task-past-fold" id="task-past-batches" hidden>
           <summary><span>历史批次</span><span class="fold-count" id="task-past-count">0</span><span class="summary-hint">展开查看</span></summary>
           <div id="task-past-batch-list" class="task-past-batch-list"></div>
@@ -149,23 +180,56 @@
       </section>
     </div>
   </dialog>
-  <dialog class="sources-dialog" id="sources-dialog" aria-labelledby="sources-title">
-    <div class="sources-shell">
-      <div class="dialog-top"><div><span class="dialog-kicker">工作需求参考资料</span><h2 id="sources-title">需求来源</h2></div><button type="button" class="dialog-close" id="sources-close" aria-label="关闭需求来源">×</button></div>
-      <div class="sources-actions">
-        <button type="button" class="source-action" id="source-add-file">添加文件</button>
-        <button type="button" class="source-action" id="source-toggle-link" aria-expanded="false">添加链接</button>
-        <input id="source-file-input" type="file" hidden>
+  <dialog class="sources-dialog library-dialog" id="sources-dialog" aria-labelledby="sources-title">
+    <div class="sources-shell library-shell">
+      <div class="dialog-top library-top">
+        <div><span class="dialog-kicker">需求来源与参考资料</span><h2 id="sources-title">资料库</h2></div>
+        <button type="button" class="dialog-close" id="sources-close" aria-label="关闭资料库">×</button>
       </div>
-      <form id="source-link-form" class="source-link-form" hidden>
-        <label>名称<input id="source-link-name" name="name" type="text" maxlength="200" placeholder="例如：需求说明文档" required></label>
-        <label>类别<select id="source-link-category" name="category"><option value="cloud_document">云文档</option><option value="web_link">网页链接</option></select></label>
-        <label class="source-url-label">链接<input id="source-link-url" name="url" type="url" maxlength="4096" placeholder="https://…" required></label>
-        <div class="source-form-actions"><button type="button" class="quiet-button" id="source-link-cancel">取消</button><button type="submit" id="source-link-submit" class="source-action primary">保存链接</button></div>
-      </form>
-      <p id="source-feedback" class="source-feedback" role="status" aria-live="polite">正在读取来源清单…</p>
-      <section class="source-section" aria-labelledby="sources-active-title"><div class="source-section-heading"><h3 id="sources-active-title">当前来源</h3><span id="source-count">0</span></div><ul id="source-active-list" class="source-list"></ul><p id="source-active-empty" class="source-empty" hidden>还没有加入需求资料。</p></section>
-      <section class="source-section removed-sources" id="removed-sources-section" aria-labelledby="sources-removed-title" hidden><div class="source-section-heading"><h3 id="sources-removed-title">已移出清单，可恢复</h3><span id="removed-source-count">0</span></div><ul id="source-removed-list" class="source-list"></ul></section>
+      <p id="source-feedback" class="source-feedback library-feedback" role="status" aria-live="polite">正在读取资料库…</p>
+      <section class="library-fixed" aria-labelledby="library-fixed-title">
+        <div class="library-section-head">
+          <div><h3 id="library-fixed-title">固定资料</h3><p>需求文档、设计稿与接口契约，每个位置只展示最新版本。</p></div>
+          <span class="library-count" id="source-count" aria-label="资料总数">0</span>
+        </div>
+        <div class="library-slot-grid" id="library-slot-grid"></div>
+      </section>
+      <section class="library-others" aria-labelledby="library-others-title">
+        <details class="library-fold" id="library-others-fold" open>
+          <summary><span id="library-others-title">其他来源</span><span class="library-count" id="other-source-count">0</span><span class="library-summary-hint">全部保留，可加入巡检或设为固定资料</span></summary>
+          <ul id="library-other-list" class="library-list"></ul>
+          <p id="library-others-empty" class="library-empty" hidden>暂无其他来源。</p>
+        </details>
+      </section>
+      <section class="library-removed removed-sources" id="removed-sources-section" aria-labelledby="sources-removed-title" hidden>
+        <details class="library-fold">
+          <summary><span id="sources-removed-title">已移出</span><span class="library-count" id="removed-source-count">0</span><span class="library-summary-hint">数据仍保留，可随时恢复</span></summary>
+          <ul id="source-removed-list" class="library-list"></ul>
+        </details>
+      </section>
+      <section class="library-add" aria-labelledby="library-add-title">
+        <details class="library-fold library-add-fold" id="library-add-fold">
+          <summary><span id="library-add-title">添加资料或新版本</span><span class="library-summary-hint">链接 / 文件</span></summary>
+          <p id="library-add-context" class="library-add-context" hidden></p>
+          <form id="source-link-form" class="library-add-form">
+            <label>名称<input id="source-link-name" name="name" type="text" maxlength="200" placeholder="例如：需求说明文档" autocomplete="off"></label>
+            <label>链接<input id="source-link-url" name="url" type="url" maxlength="4096" placeholder="https://…（选择文件时可留空）" autocomplete="off"></label>
+            <label>资料类型<select id="library-add-slot" name="slot"><option value="">其他来源</option><option value="requirement_doc">需求文档</option><option value="figma">Figma</option><option value="codesign">CoDesign</option><option value="api_doc">接口文档</option></select></label>
+            <label>版本说明<input id="library-add-version" name="version_label" type="text" maxlength="80" placeholder="例如：v3、2026-11-13、终版" autocomplete="off"></label>
+            <div class="library-file-picker">
+              <input id="source-file-input" type="file" hidden>
+              <button type="button" class="library-file-button" id="source-add-file">选择文件</button>
+              <span class="library-file-name" id="library-file-name">未选择文件</span>
+              <button type="button" class="library-text-button" id="library-file-clear" hidden>移除文件</button>
+            </div>
+            <p class="library-add-note">文件最大 15 MiB；需求文档会自动加入巡检，其他资料默认手动加入。</p>
+            <div class="library-add-actions">
+              <button type="button" class="library-text-button" id="library-add-cancel">清空</button>
+              <button type="submit" class="library-submit" id="source-link-submit">添加资料</button>
+            </div>
+          </form>
+        </details>
+      </section>
     </div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

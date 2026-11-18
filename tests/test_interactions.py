@@ -133,7 +133,7 @@ class FollowupStoreTests(unittest.TestCase):
         dashboardctl.set_manual_completion("BUG-1", True)
         followup = dashboardctl.add_followup("BUG-1", "复核来源变化")["followup"]
         db = self.read_db()
-        db["records"][0].update({"current_agent_session_id": "thread-sync-owner", "last_agent_session_id": "thread-previous-owner", "last_agent_activity_at": "2026-10-21T09:00:00+08:00", "agent_state": "active"})
+        db["records"][0].update({"current_agent_session_id": "thread-sync-owner", "last_agent_session_id": "thread-previous-owner", "last_agent_activity_at": "2026-10-21T09:00:00+08:00", "agent_state": "active", "current_agent_name": "fixture-agent", "agent_work_status": "testing"})
         dashboardctl.atomic_write(db)
         state_path = Path(self.temp.name) / "bug-state.json"
         snapshot = {
@@ -149,6 +149,8 @@ class FollowupStoreTests(unittest.TestCase):
         self.assertEqual(row["platform_status"], "处理中")
         self.assertEqual(row["current_agent_session_id"], "thread-sync-owner")
         self.assertEqual(row["last_agent_activity_at"], "2026-10-21T09:00:00+08:00")
+        self.assertEqual(row["current_agent_name"], "fixture-agent")
+        self.assertEqual(row["agent_work_status"], "testing")
         self.assertIn("返修周期", row["manual_status_conflict"]["reason"])
         self.assertEqual(self.read_db()["sources"][0]["id"], "SRC-PRESERVE")
 

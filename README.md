@@ -57,6 +57,7 @@ python3 scripts/install_waylume.py --check --home /tmp/waylume-home --data-dir /
 
 ## Skill 内容索引
 
+- [工作台 workflow 契约（平台无关）](skills/waylume-assistant/references/workflow.md)
 - [工作助理职责与边界](skills/waylume-assistant/references/role-and-boundaries.md)
 - [BUG 分析与处理流程](skills/waylume-assistant/references/bug-workflow.md)
 - [失败经验与问题指引](skills/waylume-assistant/references/troubleshooting.md)

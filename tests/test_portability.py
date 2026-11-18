@@ -595,7 +595,8 @@ class PortabilityTests(unittest.TestCase):
             'status = "ACTIVE"\n'
             'rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8,9,20;BYMINUTE=30"\n'
             'prompt = "Read /home/example/.codex/automations/bug-2 first; timezone Asia/Shanghai"\n', encoding="utf-8")
-        with patch.object(server, "INSPECTION_CONFIG", config):
+        with patch.object(server, "INSPECTION_CONFIG", config), \
+                patch.object(server, "DSH_SCHEDULE_STORE", self.config / "absent-dsh-schedule.json"):
             schedule = server.inspection_schedule()
         self.assertTrue(schedule["available"])
         self.assertEqual(schedule["timezone"], "Asia/Shanghai")
@@ -609,10 +610,47 @@ class PortabilityTests(unittest.TestCase):
             'status = "ACTIVE"\n'
             'rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8,9,20;BYMINUTE=30"\n'
             'prompt = "Read /home/example/.codex/automations/bug-2 first"\n', encoding="utf-8")
-        with patch.object(server, "INSPECTION_CONFIG", config):
+        with patch.object(server, "INSPECTION_CONFIG", config), \
+                patch.object(server, "DSH_SCHEDULE_STORE", self.config / "absent-dsh-schedule.json"):
             schedule = server.inspection_schedule()
         self.assertTrue(schedule["available"])
         self.assertEqual(schedule["timezone"], server.INSPECTION_ZONE)
+
+    def test_dsh_schedule_store_is_preferred_over_legacy_codex_config(self):
+        store = self.config / "dsh-schedule.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({"tables": {"tasks": {"schedule-fixture": {"record": {
+            "id": "schedule-fixture", "kind": "rrule", "title": "姚鸿飞 BUG + 需求统一巡检",
+            "rrule": "DTSTART;TZID=Asia/Shanghai:20261106T093000\n"
+                     "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8,9,20;BYMINUTE=30",
+        }}}}}, ensure_ascii=False), encoding="utf-8")
+        legacy = self.config / "paused-codex.toml"
+        legacy.write_text(
+            'status = "PAUSED"\n'
+            'rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=30"\n', encoding="utf-8")
+        with patch.object(server, "INSPECTION_CONFIG", legacy), \
+                patch.object(server, "DSH_SCHEDULE_STORE", store):
+            schedule = server.inspection_schedule()
+        self.assertTrue(schedule["available"])
+        self.assertTrue(schedule["enabled"])
+        self.assertEqual(schedule["state"], "active")
+        self.assertEqual(schedule["weekdays"], ["MO", "TU", "WE", "TH", "FR"])
+        self.assertEqual(schedule["times"], ["08:30", "09:30", "20:30"])
+
+    def test_dsh_schedule_paused_state_is_reported(self):
+        store = self.config / "dsh-schedule-paused.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({"tables": {"tasks": {"schedule-fixture": {"record": {
+            "id": "schedule-fixture", "kind": "rrule", "title": "姚鸿飞 BUG + 需求统一巡检",
+            "status": "paused",
+            "rrule": "DTSTART;TZID=Asia/Shanghai:20261106T093000\n"
+                     "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8,9,20;BYMINUTE=30",
+        }}}}}, ensure_ascii=False), encoding="utf-8")
+        with patch.object(server, "DSH_SCHEDULE_STORE", store):
+            schedule = server.inspection_schedule()
+        self.assertTrue(schedule["available"])
+        self.assertFalse(schedule["enabled"])
+        self.assertEqual(schedule["state"], "paused")
 
     def test_manager_refuses_second_service_when_legacy_is_loaded(self):
         result = type("Result", (), {"returncode": 0})()

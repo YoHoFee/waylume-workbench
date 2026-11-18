@@ -20,6 +20,7 @@ import hashlib
 import mimetypes
 import backend
 import waylume_paths
+import workflow
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,8 +46,9 @@ def refresh_data_paths() -> None:
     UPLOADS = ROOT / "sources" / "uploads"
 VALID_TYPES = {"work", "bug", "task"}
 VALID_STATUSES = {
-    "in_progress", "awaiting_acceptance", "blocked", "completed", "partial",
-    "pending", "unknown", "archived", "cancelled", "platform_testing", "submitted_for_testing",
+    "in_progress", "developing", "testing", "on_hold", "awaiting_acceptance", "blocked", "completed", "partial",
+    "pending", "unknown", "archived", "cancelled", "platform_testing", "submitted_for_testing", "pending_release",
+    "owner_changed",
 }
 ALLOWED_FIELDS = {
     "id", "type", "title", "status", "status_detail", "notes", "evidence",
@@ -59,12 +61,25 @@ ALLOWED_FIELDS = {
     "completed_at",
     "created_at",
     "transfer_disposition", "transfer_target", "transfer_requested_at", "transfer_confirmed_at", "transfer_confirmation", "completion_kind",
-    "latest_brief", "initial_brief", "phase", "progress", "final_result", "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name", "last_agent_activity_at", "agent_state", "revision", "handoff",
+    "latest_brief", "initial_brief", "phase", "progress", "final_result", "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name", "last_agent_activity_at", "agent_state", "agent_work_status", "revision", "handoff",
+    "workflow", "workflow_template_id", "workflow_stage", "workflow_stage_status", "agent_bindings",
 }
 MAX_PROMPT_CHARS = 4000
 MAX_RESULT_CHARS = 2000
 MAX_SOURCE_FILE_BYTES = 15 * 1024 * 1024
 ALLOWED_SOURCE_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt", ".md", ".markdown", ".png", ".jpg", ".jpeg"}
+# Library fixed slots. Anything else is an "other source"; the slot value is
+# persisted so agents can also use it outside the dashboard.
+SOURCE_SLOTS = ("requirement_doc", "figma", "codesign", "api_doc")
+SOURCE_SLOT_LABELS = {
+    "requirement_doc": "需求文档",
+    "figma": "Figma",
+    "codesign": "CoDesign",
+    "api_doc": "接口文档",
+}
+SOURCE_INSPECTION_MODES = {"auto", "manual"}
+MAX_SOURCE_GROUP_ID = 100
+MAX_SOURCE_VERSION_LABEL = 80
 MAX_RECORD_ATTACHMENT_BYTES = 10 * 1024 * 1024
 RECORD_IMAGE_MIMES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 SOURCE_ATTACHMENT_MIMES = {**RECORD_IMAGE_MIMES, ".heic": "image/heic", ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/x-m4v", ".zip": "application/zip", ".pdf": "application/pdf", ".txt": "text/plain", ".log": "text/plain", ".json": "application/json", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
@@ -115,7 +130,7 @@ def has_fresh_agent_owner(record: dict[str, Any], now=None) -> bool:
     if not activity: return False
     now = now or datetime.now().astimezone()
     if now.tzinfo is None: now = now.astimezone()
-    return activity > now - timedelta(minutes=10)
+    return activity > now - timedelta(hours=2)
 
 
 def effective_work_status(record: dict[str, Any], now=None) -> tuple[str, str]:
@@ -123,8 +138,25 @@ def effective_work_status(record: dict[str, Any], now=None) -> tuple[str, str]:
     if record.get("manual_status") == "completed": return "completed", "manual"
     if record.get("type") == "bug" and bug_has_our_delivery(record): return "completed", "our_status"
     status = str(record.get("status", "unknown"))
-    if status in BATCH_TERMINAL_STATUSES: return status, "source_status"
-    if has_fresh_agent_owner(record, now): return "in_progress", "agent_owner"
+    # 待发布/责任人变更是人工设定的终态，不能被"无在线 Agent"覆盖成搁置。
+    if status in BATCH_TERMINAL_STATUSES or status in {"pending_release", "owner_changed"}: return status, "source_status"
+    workflow_state = record.get("workflow") if isinstance(record.get("workflow"), dict) else {}
+    workflow_stage = str(workflow_state.get("stage") or record.get("workflow_stage") or "")
+    workflow_stage_status = str(workflow_state.get("stage_status") or record.get("workflow_stage_status") or "")
+    lock = workflow.active_lock(record, now)
+    if lock is not None:
+        try:
+            return workflow.status_for_stage(workflow_stage, record.get("type"), status), "workflow_lock"
+        except workflow.WorkflowError:
+            pass
+    try:
+        if workflow_stage and workflow_stage_status in {"active", "rework"}:
+            return workflow.status_for_stage(workflow_stage, record.get("type"), status), "workflow_stage"
+    except workflow.WorkflowError:
+        pass
+    if has_fresh_agent_owner(record, now):
+        agent_status = record.get("agent_work_status")
+        return (agent_status if agent_status in {"in_progress", "developing", "testing"} else "in_progress"), "agent_owner"
     return "on_hold", "no_fresh_owner"
 
 
@@ -189,6 +221,23 @@ def normalize_record(raw: Any) -> dict[str, Any]:
     for key in ("notes", "evidence", "related_ids", "history"):
         if key in record and not isinstance(record[key], list):
             raise ValueError(f"{key} must be a JSON array")
+    if "agent_bindings" in record:
+        bindings = record["agent_bindings"]
+        if not isinstance(bindings, dict) or set(bindings) - {"dev", "auditor", "pm"}:
+            raise ValueError("agent_bindings must be an object keyed by dev/auditor/pm")
+        for role, binding in bindings.items():
+            if not isinstance(binding, dict):
+                raise ValueError("agent_binding must be an object")
+            if set(binding) - {"actor", "session_id", "channel", "bound_at"}:
+                raise ValueError("agent_binding has unsupported fields")
+            if not isinstance(binding.get("actor"), str) or not binding["actor"].strip() or len(binding["actor"]) > 100:
+                raise ValueError("agent_binding actor is required")
+            if binding.get("session_id") is not None and (not isinstance(binding["session_id"], str) or len(binding["session_id"]) > 200):
+                raise ValueError("agent_binding session_id is invalid")
+            if binding.get("channel") is not None and (not isinstance(binding["channel"], str) or not binding["channel"].strip() or len(binding["channel"]) > 50):
+                raise ValueError("agent_binding channel is invalid")
+            if binding.get("bound_at") is not None and not _parse_iso_datetime(binding["bound_at"]):
+                raise ValueError("agent_binding bound_at must be a timezone-aware ISO datetime")
     if "source_row_keys" in record and (not isinstance(record["source_row_keys"], list) or any(not isinstance(value, str) for value in record["source_row_keys"])):
         raise ValueError("source_row_keys must be an array of strings")
     if "source_row_fingerprints" in record and (not isinstance(record["source_row_fingerprints"], dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in record["source_row_fingerprints"].items())):
@@ -213,6 +262,7 @@ def normalize_record(raw: Any) -> dict[str, Any]:
     record.setdefault("evidence", [])
     record.setdefault("related_ids", [])
     record.setdefault("history", [])
+    workflow.normalize_record_fields(record)
     record["updated_at"] = timestamp()
     return record
 
@@ -402,6 +452,7 @@ def agent_claim(record_id: str, expected_revision: int, session_id: str | None =
             record["current_agent_name"] = None
             record["agent_state"] = "paused"
         at = timestamp()
+        if record.get("agent_work_status") == "on_hold": record["agent_work_status"] = "in_progress"
         record.update({"current_agent_session_id": session,
                        "current_agent_name": display_name or record.get("current_agent_name"),
                        "last_agent_activity_at": at, "agent_state": "active"})
@@ -466,7 +517,15 @@ def agent_report(record_id: str, expected_revision: int, message: str, session_i
         record.setdefault("initial_brief", record.get("status_detail") or record.get("title", ""))
         record.setdefault("progress", []).append(entry); record["latest_brief"] = clean
         if phase is not None: record["phase"] = phase
-        if status is not None: record["status"] = status
+        if status is not None:
+            entry["status"] = status
+            if status in {"in_progress", "developing", "testing", "on_hold"}:
+                record["agent_work_status"] = status
+            else:
+                record["status"] = status
+        if status == "on_hold":
+            record["last_agent_session_id"] = session; record["last_agent_name"] = record.get("current_agent_name")
+            record["current_agent_session_id"] = None; record["current_agent_name"] = None; record["agent_state"] = "paused"
         if status in BATCH_TERMINAL_STATUSES:
             if status in {"completed", "cancelled"}: record["completed_at"] = at
             if record.get("current_agent_session_id"):
@@ -519,9 +578,19 @@ def agent_update(record_id: str, expected_revision: int, message: str, session_i
         record.setdefault("progress", []).append(entry)
         record["latest_brief"] = clean
         if phase is not None: record["phase"] = phase
-        if status is not None: record["status"] = status
+        if status is not None:
+            entry["status"] = status
+            if status in {"in_progress", "developing", "testing", "on_hold"}:
+                record["agent_work_status"] = status
+            else:
+                record["status"] = status
+        elif record.get("agent_work_status") == "on_hold":
+            record["agent_work_status"] = "in_progress"
         record["last_agent_activity_at"] = at; record["updated_at"] = at
-        if status in BATCH_TERMINAL_STATUSES:
+        if status == "on_hold":
+            record["last_agent_session_id"] = session; record["last_agent_name"] = active_name
+            record["current_agent_session_id"] = None; record["current_agent_name"] = None; record["agent_state"] = "paused"
+        elif status in BATCH_TERMINAL_STATUSES:
             if status in {"completed", "cancelled"}: record["completed_at"] = at
             record["last_agent_session_id"] = session; record["last_agent_name"] = active_name
             record["current_agent_session_id"] = None; record["current_agent_name"] = None
@@ -1044,6 +1113,7 @@ def cmd_upsert(args: argparse.Namespace) -> None:
                 })
             if merged.get("type") == "task" and was_terminal and not _is_batch_terminal(merged):
                 _assign_task_to_current_batch(db, merged, merged["updated_at"])
+            workflow.normalize_record_fields(merged)
             normalized_local = merged
             records[records.index(old)] = normalized_local
             action = "upsert"
@@ -1084,6 +1154,321 @@ def update_handoff(record_id: str, expected_revision: int, patch: Any) -> dict[s
 def cmd_handoff_update(args: argparse.Namespace) -> None:
     patch = json.load(sys.stdin) if args.input == "-" else json.loads(Path(args.input).read_text(encoding="utf-8"))
     print(json.dumps(update_handoff(args.id, args.expected_revision, patch), ensure_ascii=False, indent=2))
+
+# ---------------------------------------------------------------------------
+# six-stage workflow pipeline (contract: docs/product/workflow-pipeline.md)
+
+
+def workflow_templates() -> dict[str, Any]:
+    return {"templates": workflow.templates()}
+
+
+def workflow_show(record_id: str) -> dict[str, Any]:
+    """Read-only workflow detail; old records without a pipeline stay valid."""
+    db = load_store()
+    record = _find_record(db, record_id)
+    current = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+    template = None
+    if current:
+        try:
+            template = workflow.get_template(current.get("template_id"))
+        except workflow.WorkflowError:
+            template = None
+    return {"record_revision": int(record.get("revision", 0)), "store_revision": int(db.get("revision", 0)),
+            "workflow": current, "template": template}
+
+
+DISPATCH_INSTRUCTION = (
+    "派发前先读本卡，并加载知途工作台自带的 workflow 契约（waylume-assistant skill）。"
+    " 按 card.next 的 action/role 派发；具体 Agent 身份、通讯通道和工具权限由宿主平台决定，工作台不硬编码宿主调度方式。"
+    " 审计报告只回原开发 Agent，仅供开发参考；是否返工由开发判断。"
+    " 交付阶段只能由用户手动交付，Lead 不得 close/push/release。"
+    " 宿主通道失败时停止并报告，不得改用绕过工作台流程的人工入口。"
+)
+
+
+def _valid_dispatch_role(role: Any) -> str:
+    if not isinstance(role, str) or role not in {"dev", "auditor", "pm"}:
+        raise ValueError("invalid_agent_role")
+    return role
+
+
+def bind_agent(record_id: str, role: Any, actor: Any, *, session_id: Any = None,
+               channel: Any = None, expected_revision: int | None = None) -> dict[str, Any]:
+    """Bind one task role to its fixed agent session. This is task metadata, not a workflow gate."""
+    role = _valid_dispatch_role(role)
+    if not isinstance(actor, str) or not actor.strip() or len(actor) > 100:
+        raise ValueError("invalid_agent_actor")
+    if session_id is not None and (not isinstance(session_id, str) or len(session_id) > 200):
+        raise ValueError("invalid_agent_session_id")
+    if channel is not None and (not isinstance(channel, str) or not channel.strip() or len(channel) > 50):
+        raise ValueError("invalid_agent_channel")
+    def update() -> dict[str, Any]:
+        db = load_store()
+        record = _find_record(db, record_id)
+        current = int(record.get("revision", 0))
+        expected = current if expected_revision is None else expected_revision
+        if expected != current:
+            raise ValueError("revision_conflict")
+        bindings = dict(record.get("agent_bindings") or {})
+        bindings[role] = {"actor": actor.strip(), "session_id": session_id,
+                          "channel": channel, "bound_at": timestamp()}
+        record["agent_bindings"] = bindings
+        record["updated_at"] = timestamp()
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        event("agent_binding_updated", record, db["revision"])
+        return {"revision": int(record.get("revision", 0)), "store_revision": db["revision"],
+                "record": record, "binding": bindings[role]}
+    return with_lock(update)
+
+
+def dispatch_card(record_id: str) -> dict[str, Any]:
+    """Build the pre-dispatch card the Lead must read before delegating any role."""
+    db = load_store()
+    record = _find_record(db, record_id)
+    current = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+    bindings = record.get("agent_bindings") if isinstance(record.get("agent_bindings"), dict) else {}
+    card: dict[str, Any] = {
+        "record_id": record.get("id"), "record_title": record.get("title"),
+        "record_type": record.get("type"), "record_status": record.get("status"),
+        "status_detail": record.get("status_detail", ""),
+        "workflow_started": bool(current),
+        "stage": None, "stage_status": None, "substage": None,
+        "stage_label": None, "stage_short": None,
+        "required_outputs": [], "missing_outputs": [],
+        "next": None, "lock": None, "bindings": bindings,
+        "delivery_manual": True,
+        "instruction": DISPATCH_INSTRUCTION,
+        "workflow_contract": "waylume-assistant/references/workflow.md",
+        "host_adapter_required": True,
+    }
+    notices: list[str] = []
+    if not current:
+        card["next"] = {"action": "start", "role": None, "roles": ["lead"], "reason": "事项尚未启动流水线"}
+        card["entry_note"] = "旧事项/未启动：入口阶段由 Lead 按当前状态判断，不得凭记忆；建议先记录入口依据。"
+        notices.append("未启动流水线，先确认入口阶段，再 start。")
+        for role in ("dev", "auditor", "pm"):
+            if role not in bindings:
+                notices.append(f"未绑定 {role} 固定会话；派发前需 bind-agent 或明确报告。")
+        card["notices"] = notices
+        return card
+    template = workflow.get_template(current.get("template_id"))
+    stage, _ = workflow.stage_definition(template, current.get("stage"))
+    gate = (current.get("gates") or {}).get(stage.get("id"), {})
+    outputs = gate.get("outputs") if isinstance(gate.get("outputs"), dict) else {}
+    substage = current.get("substage")
+    stage_required = list(stage.get("required_outputs") or [])
+    substeps = stage.get("substeps") or []
+    pending_substep = None
+    for item in substeps:
+        required = list(item.get("outputs") or ([item.get("output")] if item.get("output") else []))
+        if any(key not in outputs for key in required):
+            pending_substep = item
+            break
+    missing = [key for key in stage_required if key not in outputs]
+    card.update({
+        "stage": stage.get("id"), "stage_status": current.get("stage_status"),
+        "substage": substage, "stage_label": stage.get("label"), "stage_short": stage.get("short"),
+        "required_outputs": stage_required, "missing_outputs": missing,
+        "template_id": current.get("template_id"), "template_version": current.get("template_version"),
+        "workflow": {"started_at": current.get("started_at"), "updated_at": current.get("updated_at"),
+                     "rework_count": current.get("rework_count", 0)},
+    })
+    lock = current.get("lock") if isinstance(current.get("lock"), dict) else None
+    card["lock"] = lock
+    def role_channel(role: str | None) -> str | None:
+        if not role:
+            return None
+        binding = bindings.get(role) if isinstance(bindings.get(role), dict) else None
+        return (binding or {}).get("channel")
+    if current.get("stage_status") == "blocked":
+        card["next"] = {"action": "unblock", "role": "lead", "roles": ["lead"],
+                        "reason": "流水线处于阻塞状态，先处理阻塞/授权后再继续"}
+        notices.append("当前 stage_status=blocked，不得跳过。")
+    elif lock:
+        card["next"] = {"action": "wait_lock", "role": lock.get("role"), "actor": lock.get("actor"),
+                        "roles": [lock.get("role")] if lock.get("role") else [],
+                        "reason": "当前阶段已有锁，等待/续租或释放后再派发"}
+        notices.append("阶段锁存在，禁止另开写者抢写。")
+    elif stage.get("id") == "delivery":
+        card["next"] = {"action": "manual_delivery", "role": None, "roles": ["lead"],
+                        "reason": "已到交付阶段，交付/发布由用户手动执行；Lead 只能收证据"}
+        notices.append("禁止 close/push/release；等待用户手动交付。")
+    elif pending_substep is not None:
+        role = pending_substep.get("role")
+        card["next"] = {"action": "dispatch", "role": role,
+                        "roles": [role] if role else [],
+                        "substage": pending_substep.get("id"),
+                        "substage_label": pending_substep.get("label"),
+                        "required_outputs": list(pending_substep.get("outputs") or ([pending_substep.get("output")] if pending_substep.get("output") else [])),
+                        "missing_outputs": [key for key in (pending_substep.get("outputs") or ([pending_substep.get("output")] if pending_substep.get("output") else [])) if key not in outputs],
+                        "channel": role_channel(role),
+                        "reason": f"当前子步骤 {pending_substep.get('id')} 未完成"}
+    elif missing:
+        role = (stage.get("submit_roles") or [None])[0]
+        card["next"] = {"action": "dispatch", "role": role,
+                        "roles": list(stage.get("submit_roles") or []),
+                        "channel": role_channel(role),
+                        "missing_outputs": missing,
+                        "reason": f"当前阶段缺少 {', '.join(missing)}"}
+    else:
+        card["next"] = {"action": "advance", "role": (stage.get("advance_roles") or [None])[0],
+                        "roles": list(stage.get("advance_roles") or []),
+                        "channel": role_channel((stage.get("advance_roles") or [None])[0]),
+                        "reason": "当前阶段 required outputs 已完成"}
+    for role in ("dev", "auditor", "pm"):
+        if role not in bindings:
+            notices.append(f"未绑定 {role} 固定会话；派发前需 bind-agent 或明确报告。")
+    if bindings:
+        notices.append("派发通道由宿主平台解释；绑定里的 channel 只是宿主自定的不透明标签。")
+    if stage.get("id") == "audit_response" and pending_substep and pending_substep.get("id") == "audit":
+        notices.append("先派独立审计 Agent，不得先让开发走 dev_response。")
+    card["notices"] = notices
+    return card
+
+
+def _workflow_write(record_id: str, action: str, expected_revision: int | None, operation) -> dict[str, Any]:
+    def update() -> dict[str, Any]:
+        db = load_store()
+        record = _find_record(db, record_id)
+        current = int(record.get("revision", 0))
+        expected = current if expected_revision is None else expected_revision
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise ValueError("invalid_expected_revision")
+        if expected != current:
+            raise workflow.WorkflowError("revision_conflict", f"revision 冲突：期望 {expected}，当前 {current}")
+        operation(record)
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        event("workflow_" + action, record, db["revision"])
+        current = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+        template = None
+        if current:
+            try:
+                template = workflow.get_template(current.get("template_id"))
+            except workflow.WorkflowError:
+                template = None
+        return {"revision": int(record.get("revision", 0)), "store_revision": int(db.get("revision", 0)),
+                "record": record, "workflow": current, "template": template}
+    return with_lock(update)
+
+
+def workflow_start(record_id: str, *, template_id: str | None = None, stage: str | None = None,
+                   actor_role: str, actor: str, note: str = "", evidence: list[str] | None = None,
+                   expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "start", expected_revision, lambda record: workflow.start(
+        record, template_id=template_id, stage=stage, actor_role=actor_role, actor=actor,
+        note=note, evidence=evidence))
+
+
+def workflow_submit(record_id: str, outputs: dict[str, Any], *, actor_role: str, actor: str,
+                    note: str = "", evidence: list[str] | None = None,
+                    expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "submit", expected_revision, lambda record: workflow.submit(
+        record, outputs, actor_role=actor_role, actor=actor, note=note, evidence=evidence))
+
+
+def workflow_advance(record_id: str, *, actor_role: str, actor: str, note: str = "",
+                     evidence: list[str] | None = None, to: str | None = None,
+                     expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "advance", expected_revision, lambda record: workflow.advance(
+        record, actor_role=actor_role, actor=actor, note=note, evidence=evidence, to=to))
+
+
+def workflow_rework(record_id: str, to: str, *, actor_role: str, actor: str, note: str = "",
+                    evidence: list[str] | None = None,
+                    expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "rework", expected_revision, lambda record: workflow.rework(
+        record, to, actor_role=actor_role, actor=actor, note=note, evidence=evidence))
+
+
+def workflow_block(record_id: str, *, actor_role: str, actor: str, note: str = "",
+                   evidence: list[str] | None = None,
+                   expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "block", expected_revision, lambda record: workflow.block(
+        record, actor_role=actor_role, actor=actor, note=note))
+
+
+def workflow_unblock(record_id: str, *, actor_role: str, actor: str, note: str = "",
+                     evidence: list[str] | None = None,
+                     expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "unblock", expected_revision, lambda record: workflow.unblock(
+        record, actor_role=actor_role, actor=actor, note=note))
+
+
+def workflow_close(record_id: str, *, actor_role: str, actor: str, note: str = "",
+                   evidence: list[str] | None = None,
+                   expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "close", expected_revision, lambda record: workflow.close(
+        record, actor_role=actor_role, actor=actor, note=note, evidence=evidence))
+
+
+def workflow_claim(record_id: str, *, actor_role: str, actor: str, session_id: str | None = None,
+                   ttl_seconds: int = workflow.LOCK_TTL_SECONDS,
+                   expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "claim", expected_revision, lambda record: workflow.claim(
+        record, actor_role=actor_role, actor=actor, session_id=session_id, ttl_seconds=ttl_seconds))
+
+
+def workflow_heartbeat(record_id: str, *, actor_role: str, actor: str, session_id: str | None = None,
+                       ttl_seconds: int = workflow.LOCK_TTL_SECONDS,
+                       expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "heartbeat", expected_revision, lambda record: workflow.heartbeat(
+        record, actor_role=actor_role, actor=actor, session_id=session_id, ttl_seconds=ttl_seconds))
+
+
+def workflow_release(record_id: str, *, actor_role: str, actor: str, session_id: str | None = None,
+                     expected_revision: int | None = None) -> dict[str, Any]:
+    return _workflow_write(record_id, "release", expected_revision, lambda record: workflow.release(
+        record, actor_role=actor_role, actor=actor, session_id=session_id))
+
+
+def cmd_workflow(args: argparse.Namespace) -> None:
+    command = args.workflow_command
+    if command == "templates":
+        print(json.dumps(workflow_templates(), ensure_ascii=False, indent=2))
+        return
+    if command == "show":
+        print(json.dumps(workflow_show(args.id), ensure_ascii=False, indent=2))
+        return
+    outputs: dict[str, str] = {}
+    for item in getattr(args, "output", None) or []:
+        if "=" not in item:
+            raise ValueError("invalid_outputs: --output 需要 key=value 格式（例如 --output branch=local/xxx）")
+        key, _, value = item.partition("=")
+        if not key.strip():
+            raise ValueError("invalid_outputs: --output 的 key 不能为空")
+        outputs[key.strip()] = value
+    evidence = getattr(args, "evidence", None) or []
+    common = dict(actor_role=args.actor_role, actor=args.actor, note=getattr(args, "note", None) or "",
+                  evidence=evidence, expected_revision=args.expected_revision)
+    if command == "start":
+        result = workflow_start(args.id, template_id=args.template, stage=args.stage, **common)
+    elif command == "submit":
+        result = workflow_submit(args.id, outputs, **common)
+    elif command == "advance":
+        result = workflow_advance(args.id, to=args.to, **common)
+    elif command == "rework":
+        result = workflow_rework(args.id, args.to, **common)
+    elif command == "block":
+        result = workflow_block(args.id, **common)
+    elif command == "unblock":
+        result = workflow_unblock(args.id, **common)
+    elif command == "close":
+        result = workflow_close(args.id, **common)
+    elif command == "claim":
+        result = workflow_claim(args.id, actor_role=args.actor_role, actor=args.actor,
+                                session_id=os.environ.get("CODEX_THREAD_ID"), expected_revision=args.expected_revision)
+    elif command == "heartbeat":
+        result = workflow_heartbeat(args.id, actor_role=args.actor_role, actor=args.actor,
+                                    session_id=os.environ.get("CODEX_THREAD_ID"), expected_revision=args.expected_revision)
+    elif command == "release":
+        result = workflow_release(args.id, actor_role=args.actor_role, actor=args.actor,
+                                  session_id=os.environ.get("CODEX_THREAD_ID"), expected_revision=args.expected_revision)
+    else:
+        raise ValueError("invalid_workflow_command")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 SCOPE_STATUSES = {"confirmed", "candidate", "not_ours"}
@@ -1362,7 +1747,7 @@ def cmd_sync_bugs(args: argparse.Namespace) -> None:
     captured_at = _parse_iso_datetime(attempt.get("captured_at"))
     snapshot_dt = _parse_iso_datetime(snapshot_at)
     same_round = bool(captured_at and snapshot_dt and abs((captured_at - snapshot_dt).total_seconds()) <= 5)
-    successful = bool(snapshot_at) and same_round and isinstance(bugs, list) and not stale and attempt.get("result") == "succeeded" and attempt.get("stale") is False and attempt.get("filter") == "我负责的" and "matched self owner" in verification and "complete=true" in verification and "all pages returned" in verification and isinstance(total, int) and not isinstance(total, bool) and isinstance(unique_count, int) and not isinstance(unique_count, bool) and total == len(bugs) == len(set(ids)) == unique_count and isinstance(attempt.get("pages_read"), int) and not isinstance(attempt.get("pages_read"), bool) and attempt["pages_read"] > 0 and all(ids)
+    successful = bool(snapshot_at) and same_round and isinstance(bugs, list) and not stale and (attempt.get("result") == "succeeded" or attempt.get("bug_list_result") == "succeeded") and attempt.get("stale") is False and attempt.get("filter") == "我负责的" and "matched self owner" in verification and "complete=true" in verification and "all pages returned" in verification and isinstance(total, int) and not isinstance(total, bool) and isinstance(unique_count, int) and not isinstance(unique_count, bool) and total == len(bugs) == len(set(ids)) == unique_count and isinstance(attempt.get("pages_read"), int) and not isinstance(attempt.get("pages_read"), bool) and attempt["pages_read"] > 0 and all(ids)
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -1457,7 +1842,7 @@ def cmd_sync_bugs(args: argparse.Namespace) -> None:
                 # GUI-owned fields are user input and survive every source refresh.
                 gui_fields = {key: old[key] for key in (
                     "manual_status", "manual_completed_at", "manual_completed_by", "manual_status_conflict", "followups",
-                    "current_agent_session_id", "last_agent_session_id", "last_agent_activity_at", "agent_state",
+                    "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name", "last_agent_activity_at", "agent_state", "agent_work_status",
                     "completed_at", "initial_brief", "latest_brief", "progress", "final_result", "phase", "attachments", "revision",
                     "transfer_disposition", "transfer_target", "transfer_requested_at", "transfer_confirmed_at", "transfer_confirmation", "completion_kind",
                 ) if key in old}
@@ -1494,7 +1879,7 @@ def cmd_sync_bugs(args: argparse.Namespace) -> None:
             elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") == "transfer_pending":
                 # A complete but pre-request snapshot cannot confirm this handoff.
                 continue
-            elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") != "transferred" and old.get("status") != "archived":
+            elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") != "transferred" and old.get("status") not in {"archived", "owner_changed"}:
                 old.setdefault("history", []).append({"at": timestamp(), "status": old.get("status"), "note": f"不在成功快照 {snapshot_at}，转为已归档历史"})
                 old["status"] = "archived"
                 old["updated_at"] = timestamp()
@@ -1567,6 +1952,9 @@ def set_manual_completion(record_id: str, completed: bool) -> dict[str, Any]:
 
 
 def error_code(exc: ValueError) -> str:
+    contract_code = getattr(exc, "code", None)
+    if isinstance(contract_code, str) and contract_code:
+        return contract_code
     mapping = {
         "agent_expired": "agent_expired",
         "agent_owner_conflict": "agent_owner_conflict",
@@ -1605,6 +1993,12 @@ def error_code(exc: ValueError) -> str:
         "invalid_agent_session": "invalid_agent_session",
         "invalid_source_override": "invalid_source_override",
         "invalid_source_lifecycle": "invalid_source_lifecycle",
+        "invalid_source_slot": "invalid_source_slot",
+        "invalid_source_group": "invalid_source_group",
+        "invalid_source_version": "invalid_source_version",
+        "invalid_source_inspection": "invalid_source_inspection",
+        "source_group_not_found": "source_group_not_found",
+        "source_group_slot_conflict": "source_group_slot_conflict",
     }
     return mapping.get(str(exc), "invalid_request")
 
@@ -1742,7 +2136,209 @@ def _source_event(action: str, source: dict[str, Any], revision: int) -> None:
     event(action, {"id": source["id"], "type": source["type"]}, revision)
 
 
-def add_source_link(url: str, name: str | None = None, category: str = "需求资料", origin: str = "dashboard", *, source_id: str | None = None, purpose: str | None = None, primary: bool | None = None, verification_state: str | None = None) -> dict[str, Any]:
+def _source_effective_slot(source: dict[str, Any]) -> str | None:
+    slot = source.get("slot")
+    return slot if slot in SOURCE_SLOTS else None
+
+
+def _source_group_id(source: dict[str, Any]) -> str:
+    value = source.get("group_id")
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+        return value
+    return str(source.get("id") or "")
+
+
+def _source_is_active(source: dict[str, Any]) -> bool:
+    return bool(source.get("active")) and source.get("status") != "removed"
+
+
+def _source_stored_version_no(source: dict[str, Any]) -> int | None:
+    value = source.get("version_no")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _source_version_label(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > MAX_SOURCE_VERSION_LABEL or any(ord(ch) < 32 for ch in value):
+        raise ValueError("invalid_source_version")
+    value = value.strip()
+    return value or None
+
+
+def _source_group_key(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+        raise ValueError("invalid_source_group")
+    return value
+
+
+def _source_slot_value(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or value not in SOURCE_SLOTS:
+        raise ValueError("invalid_source_slot")
+    return value
+
+
+def _source_file_extension(source: dict[str, Any]) -> str | None:
+    stored = source.get("file_ext")
+    if isinstance(stored, str) and re.fullmatch(r"[A-Za-z0-9]{1,12}", stored):
+        return stored.lower()
+    filename = source.get("filename") or source.get("name") or ""
+    if not isinstance(filename, str):
+        filename = ""
+    extension = Path(filename).suffix.lower().lstrip(".")
+    if extension and re.fullmatch(r"[a-z0-9]{1,12}", extension):
+        return extension
+    if source.get("type") == "link":
+        try:
+            extension = Path(urlsplit(str(source.get("url") or "")).path).suffix.lower().lstrip(".")
+        except ValueError:
+            extension = ""
+        if extension and re.fullmatch(r"[a-z0-9]{1,12}", extension):
+            return extension
+    return None
+
+
+def _source_mime(source: dict[str, Any]) -> str | None:
+    stored = source.get("mime") or source.get("mime_type")
+    if isinstance(stored, str) and stored:
+        return stored
+    filename = source.get("filename") or source.get("name")
+    if isinstance(filename, str) and filename:
+        guessed = mimetypes.guess_type(filename)[0]
+        if guessed:
+            return guessed
+    return None
+
+
+def _source_logo_kind(source: dict[str, Any]) -> str:
+    slot = _source_effective_slot(source)
+    if slot:
+        return slot
+    return "file" if source.get("type") == "file" else "link"
+
+
+def _source_version_maps(all_sources: list[dict[str, Any]]) -> tuple[dict[int, int], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    """Compute effective version numbers and group ordering without mutating stored data."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for source in all_sources:
+        groups.setdefault(_source_group_id(source), []).append(source)
+    numbers: dict[int, int] = {}
+    for members in groups.values():
+        ordered = sorted(members, key=lambda item: (str(item.get("added_at") or ""), str(item.get("id") or "")))
+        stored = [_source_stored_version_no(item) for item in ordered]
+        if all(value is not None for value in stored) and len(set(stored)) == len(stored):
+            assigned = list(stored)
+        else:
+            # Legacy or hand-edited groups may lack version numbers. Their
+            # added_at order is authoritative and all numbers are re-derived.
+            assigned = list(range(1, len(ordered) + 1))
+        for item, number in zip(ordered, assigned):
+            numbers[id(item)] = number
+    active_by_group: dict[str, list[dict[str, Any]]] = {}
+    for group_id, members in groups.items():
+        active = [item for item in members if _source_is_active(item)]
+        active.sort(key=lambda item: (numbers.get(id(item), 1), str(item.get("added_at") or ""), str(item.get("id") or "")), reverse=True)
+        active_by_group[group_id] = active
+    return numbers, groups, active_by_group
+
+
+def enrich_source_records(records: list[dict[str, Any]], all_sources: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Add library/version/inspection fields to copies of source records.
+
+    Stored versions are never removed. `is_latest` and `version_count` are
+    derived from the currently active members of each group so a removed newer
+    version does not hide an older active one.
+    """
+    universe = list(all_sources) if all_sources is not None else list(records)
+    numbers, groups, active_by_group = _source_version_maps(universe)
+    active_latest: dict[str, str | None] = {}
+    for group_id, active in active_by_group.items():
+        active_latest[group_id] = str(active[0].get("id")) if active else None
+    enriched: list[dict[str, Any]] = []
+    for record in records:
+        copy = dict(record)
+        group_id = _source_group_id(record)
+        members = groups.get(group_id, [record])
+        active = active_by_group.get(group_id, [])
+        slot = _source_effective_slot(record)
+        version_no = numbers.get(id(record), _source_stored_version_no(record) or 1)
+        label = record.get("version_label")
+        if not isinstance(label, str) or not label.strip():
+            label = f"v{version_no}"
+        else:
+            label = label.strip()[:MAX_SOURCE_VERSION_LABEL]
+        enabled_value = record.get("inspection_enabled")
+        inspection_enabled = bool(enabled_value) if isinstance(enabled_value, bool) else slot == "requirement_doc"
+        mode = record.get("inspection_mode")
+        inspection_mode = mode if mode in SOURCE_INSPECTION_MODES else ("auto" if slot == "requirement_doc" else "manual")
+        active_ids = [str(item.get("id")) for item in active]
+        rank = active_ids.index(str(record.get("id"))) if str(record.get("id")) in active_ids else None
+        inspection_active = bool(_source_is_active(record) and inspection_enabled)
+        if slot == "requirement_doc" and rank is not None and rank > 1:
+            inspection_active = False
+        copy.update({
+            "slot": slot,
+            "group_id": group_id,
+            "version_no": version_no,
+            "version_label": label,
+            "version_count": len(active) if active else len(members),
+            "latest": bool(_source_is_active(record) and active_latest.get(group_id) == str(record.get("id"))),
+            "is_latest": bool(_source_is_active(record) and active_latest.get(group_id) == str(record.get("id"))),
+            "inspection_enabled": inspection_enabled,
+            "inspection_mode": inspection_mode,
+            "inspection_active": inspection_active,
+            "inspection_rank": rank,
+            "last_inspection_attempt_at": record.get("last_inspection_attempt_at") or record.get("latest_read_attempt_at") or record.get("last_read_at"),
+            "last_inspection_success_at": record.get("last_inspection_success_at") or record.get("last_successful_read_at"),
+            "last_inspection_status": record.get("last_inspection_status") or record.get("read_state") or record.get("read_status"),
+            "file_ext": _source_file_extension(record),
+            "mime": _source_mime(record),
+            "logo_kind": _source_logo_kind(record),
+        })
+        enriched.append(copy)
+    return enriched
+
+
+def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *, slot: Any, group_id: Any, version_label: Any) -> dict[str, Any]:
+    """Validate and derive library fields for a newly created source/version."""
+    slot = _source_slot_value(slot)
+    group_id = _source_group_key(group_id)
+    label = _source_version_label(version_label)
+    numbers, groups, _ = _source_version_maps(sources)
+    members: list[dict[str, Any]] = []
+    if group_id is not None:
+        members = [item for item in sources if _source_group_id(item) == group_id]
+        if not members:
+            raise ValueError("source_group_not_found")
+    else:
+        group_id = source_id
+    existing_slots = {_source_effective_slot(item) for item in members} - {None}
+    if len(existing_slots) > 1:
+        raise ValueError("source_group_slot_conflict")
+    inherited_slot = next(iter(existing_slots), None)
+    if slot is None:
+        slot = inherited_slot
+    elif inherited_slot is not None and slot != inherited_slot:
+        raise ValueError("source_group_slot_conflict")
+    version_no = max((numbers.get(id(item), 0) for item in members), default=0) + 1
+    return {
+        "slot": slot,
+        "group_id": group_id,
+        "version_no": version_no,
+        "version_label": label or f"v{version_no}",
+        "promote_group_slot": bool(members and slot is not None and not existing_slots),
+        "inspection_enabled": slot == "requirement_doc",
+        "inspection_mode": "auto" if slot == "requirement_doc" else "manual",
+    }
+
+
+def add_source_link(url: str, name: str | None = None, category: str = "需求资料", origin: str = "dashboard", *, source_id: str | None = None, purpose: str | None = None, primary: bool | None = None, verification_state: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None) -> dict[str, Any]:
     original, normalized_url = normalize_source_url(url)
     if not isinstance(category, str) or not category.strip() or len(category) > 80:
         raise ValueError("invalid_source_category")
@@ -1776,11 +2372,22 @@ def add_source_link(url: str, name: str | None = None, category: str = "需求�
     def update() -> dict[str, Any]:
         db = load_store()
         sources = _source_store_list(db)
-        existing = next((item for item in sources if item.get("id") == source["id"] or item.get("normalized_url") == normalized_url), None)
-        if existing:
-            if existing.get("id") != source["id"]:
-                raise ValueError("source_duplicate")
+        if any(item.get("id") == source["id"] for item in sources):
             raise ValueError("source_duplicate")
+        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label)
+        duplicate = next((item for item in sources if item.get("normalized_url") == normalized_url), None)
+        if duplicate and not (library["group_id"] != source["id"] and _source_group_id(duplicate) == library["group_id"]):
+            raise ValueError("source_duplicate")
+        source.update({key: value for key, value in library.items() if key != "promote_group_slot"})
+        source["file_ext"] = _source_file_extension(source)
+        source["mime"] = _source_mime(source)
+        source["logo_kind"] = _source_logo_kind(source)
+        at = timestamp()
+        if library["promote_group_slot"]:
+            for member in sources:
+                if _source_group_id(member) == library["group_id"]:
+                    member["slot"] = library["slot"]
+                    member["updated_at"] = at
         sources.append(source)
         db["sources"] = sources
         db["revision"] = int(db.get("revision", 0)) + 1
@@ -1838,16 +2445,19 @@ def validate_source_file(filename: str, data: bytes) -> tuple[str, str]:
     return extension, mime
 
 
-def add_source_file(filename: str, data: bytes, category: str = "需求资料", origin: str = "dashboard") -> dict[str, Any]:
+def add_source_file(filename: str, data: bytes, category: str = "需求资料", origin: str = "dashboard", *, name: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None) -> dict[str, Any]:
     extension, mime = validate_source_file(filename, data)
     if not isinstance(category, str) or not category.strip() or len(category) > 80:
         raise ValueError("invalid_source_category")
     if origin not in {"dashboard", "user_chat_attachment", "agent_import"}:
         raise ValueError("invalid_source_origin")
+    if name is not None and (not isinstance(name, str) or len(name) > 200 or any(ord(ch) < 32 for ch in name)):
+        raise ValueError("invalid_source_name")
+    display_name = (name or "").strip() or Path(filename).name
     managed_file_id = f"{uuid.uuid4()}{extension}"
     stored_path = UPLOADS / managed_file_id
     source = {
-        "id": str(uuid.uuid4()), "type": "file", "name": Path(filename).name,
+        "id": str(uuid.uuid4()), "type": "file", "name": display_name,
         "filename": Path(filename).name, "managed_file_id": managed_file_id,
         "category": category.strip(), "mime_type": mime, "size_bytes": len(data),
         "active": True, "status": "registered", "read_status": "not_read",
@@ -1856,6 +2466,19 @@ def add_source_file(filename: str, data: bytes, category: str = "需求资料", 
         "added_at": timestamp(), "updated_at": timestamp(), "origin": origin,
     }
     def update() -> dict[str, Any]:
+        db = load_store()
+        sources = _source_store_list(db)
+        if any(item.get("id") == source["id"] for item in sources):
+            raise ValueError("source_duplicate")
+        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label)
+        source.update({key: value for key, value in library.items() if key != "promote_group_slot"})
+        source.update({"file_ext": extension.lstrip("."), "mime": mime, "logo_kind": _source_logo_kind(source)})
+        at = timestamp()
+        if library["promote_group_slot"]:
+            for member in sources:
+                if _source_group_id(member) == library["group_id"]:
+                    member["slot"] = library["slot"]
+                    member["updated_at"] = at
         UPLOADS.mkdir(parents=True, exist_ok=True)
         # A random UUID filename prevents path traversal and collisions.
         with stored_path.open("xb") as handle:
@@ -1864,8 +2487,6 @@ def add_source_file(filename: str, data: bytes, category: str = "需求资料", 
             os.fsync(handle.fileno())
         committed = False
         try:
-            db = load_store()
-            sources = _source_store_list(db)
             sources.append(source)
             db["sources"] = sources
             db["revision"] = int(db.get("revision", 0)) + 1
@@ -1903,12 +2524,133 @@ def change_source_state(source_id: str, active: bool) -> dict[str, Any]:
     return with_lock(update)
 
 
-def source_manifest(include_removed: bool = False) -> dict[str, Any]:
+def source_manifest(include_removed: bool = False, all_versions: bool = True) -> dict[str, Any]:
     db = load_store()
     sources = _source_store_list(db)
-    if not include_removed:
-        sources = [item for item in sources if item.get("active")]
-    return {"revision": db.get("revision", 0), "sources": sources}
+    selected = sources if include_removed else [item for item in sources if item.get("active")]
+    enriched = enrich_source_records(selected, sources)
+    if not all_versions:
+        # The default remains "all versions" so the UI can expand history.
+        # Agents that explicitly ask for only the current material can opt in.
+        enriched = [item for item in enriched if item.get("is_latest") or not item.get("active")]
+    return {"revision": db.get("revision", 0), "sources": enriched, "all_versions": bool(all_versions)}
+
+
+def set_source_inspection(source_id: str, enabled: bool) -> dict[str, Any]:
+    if not isinstance(enabled, bool):
+        raise ValueError("invalid_source_inspection")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", source_id):
+        raise ValueError("source_not_found")
+    def update() -> dict[str, Any]:
+        db = load_store()
+        sources = _source_store_list(db)
+        source = next((item for item in sources if item.get("id") == source_id), None)
+        if source is None:
+            raise ValueError("source_not_found")
+        slot = _source_effective_slot(source)
+        source["inspection_enabled"] = enabled
+        source["inspection_mode"] = "auto" if slot == "requirement_doc" else "manual"
+        source["updated_at"] = timestamp()
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        _source_event("source_inspection_updated", source, db["revision"])
+        return {"revision": db["revision"], "source": source}
+    return with_lock(update)
+
+
+def set_source_slot(source_id: str, slot: Any) -> dict[str, Any]:
+    slot = _source_slot_value(slot)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", source_id):
+        raise ValueError("source_not_found")
+    def update() -> dict[str, Any]:
+        db = load_store()
+        sources = _source_store_list(db)
+        source = next((item for item in sources if item.get("id") == source_id), None)
+        if source is None:
+            raise ValueError("source_not_found")
+        group_id = _source_group_id(source)
+        members = [item for item in sources if _source_group_id(item) == group_id]
+        at = timestamp()
+        for member in members:
+            previous_slot = _source_effective_slot(member)
+            member["group_id"] = group_id
+            member["slot"] = slot
+            if slot == "requirement_doc":
+                # Assigning a material to the requirement slot auto-includes it.
+                # A version that was already a requirement doc keeps any explicit
+                # removal made by the user.
+                if previous_slot != "requirement_doc" or "inspection_enabled" not in member:
+                    member["inspection_enabled"] = True
+                member["inspection_mode"] = "auto"
+            else:
+                if member.get("inspection_mode") == "auto" and "inspection_enabled" in member:
+                    member["inspection_enabled"] = False
+                member["inspection_mode"] = "manual"
+            member["updated_at"] = at
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        _source_event("source_slot_updated", source, db["revision"])
+        return {"revision": db["revision"], "source": source}
+    return with_lock(update)
+
+
+def set_source_group(source_id: str, group_id: Any, version_label: Any = None) -> dict[str, Any]:
+    group_id = _source_group_key(group_id)
+    version_label = _source_version_label(version_label)
+    if not group_id:
+        raise ValueError("invalid_source_group")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", source_id):
+        raise ValueError("source_not_found")
+    def update() -> dict[str, Any]:
+        db = load_store()
+        sources = _source_store_list(db)
+        source = next((item for item in sources if item.get("id") == source_id), None)
+        if source is None:
+            raise ValueError("source_not_found")
+        source["group_id"] = group_id
+        source["updated_at"] = timestamp()
+        if version_label is not None:
+            source["version_label"] = version_label
+        members = [item for item in sources if _source_group_id(item) == group_id]
+        ordered = sorted(members, key=lambda item: (str(item.get("added_at") or ""), str(item.get("id") or "")))
+        for index, member in enumerate(ordered, 1):
+            member["version_no"] = index
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        _source_event("source_group_updated", source, db["revision"])
+        return {"revision": db["revision"], "source": source}
+    return with_lock(update)
+
+
+def source_inspection_selection() -> list[dict[str, Any]]:
+    """Return the source material that a patrol/inspection run may read.
+
+    Requirement documents contribute only their latest and previous active
+    versions. Every other source participates only when explicitly enabled.
+    Removed sources never participate.
+    """
+    all_sources = _source_store_list(load_store())
+    _, _, active_by_group = _source_version_maps(all_sources)
+    selected_ids: set[int] = set()
+    for active in active_by_group.values():
+        for rank, source in enumerate(active):
+            slot = _source_effective_slot(source)
+            stored = source.get("inspection_enabled")
+            enabled = bool(stored) if isinstance(stored, bool) else slot == "requirement_doc"
+            if not enabled:
+                continue
+            if slot == "requirement_doc" and rank > 1:
+                continue
+            selected_ids.add(id(source))
+    selected = [item for item in all_sources if id(item) in selected_ids]
+    enriched = enrich_source_records(selected, all_sources)
+    slot_order = {slot: index for index, slot in enumerate(SOURCE_SLOTS)}
+    enriched.sort(key=lambda item: (slot_order.get(item.get("slot"), len(SOURCE_SLOTS)), item.get("group_id", ""), -int(item.get("version_no", 0))))
+    return enriched
+
+
+# Explicit aliases keep the "selection point" easy to find for patrol adapters.
+inspection_sources = source_inspection_selection
 
 
 def import_source_seed(path: Path) -> dict[str, Any]:
@@ -1931,13 +2673,32 @@ def import_source_seed(path: Path) -> dict[str, Any]:
         verification_state = raw.get("verification_state", "not_checked")
         if not isinstance(purpose, str) or len(purpose) > 4000 or not isinstance(verification_state, str) or len(verification_state) > 100:
             raise ValueError("invalid_source_seed")
+        slot = _source_slot_value(raw.get("slot"))
+        group_id = _source_group_key(raw.get("group_id")) or source_id
+        version_label = _source_version_label(raw.get("version_label"))
+        version_no = raw.get("version_no")
+        if version_no is not None and (not isinstance(version_no, int) or isinstance(version_no, bool) or version_no < 1):
+            raise ValueError("invalid_source_seed")
+        inspection_enabled = raw.get("inspection_enabled")
+        if inspection_enabled is not None and not isinstance(inspection_enabled, bool):
+            raise ValueError("invalid_source_seed")
+        inspection_mode = raw.get("inspection_mode")
+        if inspection_mode is not None and inspection_mode not in SOURCE_INSPECTION_MODES:
+            raise ValueError("invalid_source_seed")
         original, normalized = normalize_source_url(url)
-        prepared.append({
+        incoming = {
             "id": source_id, "type": "link", "name": name[:200], "url": original,
             "normalized_url": normalized, "category": category[:80], "purpose": purpose,
             "primary": raw.get("primary", False), "verification_state": verification_state,
-            "active": raw.get("active", True),
-        })
+            "active": raw.get("active", True), "slot": slot, "group_id": group_id,
+            "inspection_enabled": inspection_enabled if inspection_enabled is not None else slot == "requirement_doc",
+            "inspection_mode": inspection_mode or ("auto" if slot == "requirement_doc" else "manual"),
+        }
+        if version_label is not None:
+            incoming["version_label"] = version_label
+        if version_no is not None:
+            incoming["version_no"] = version_no
+        prepared.append(incoming)
     def update() -> dict[str, Any]:
         db = load_store()
         sources = _source_store_list(db)
@@ -1959,6 +2720,12 @@ def import_source_seed(path: Path) -> dict[str, Any]:
                     if lifecycle_key in old: refreshed[lifecycle_key] = old[lifecycle_key]
                 for read_key in ("last_read_at", "read_state", "read_scope", "content_updated_at", "read_gap", "snapshot_revision", "content_hash", "unchanged_since", "last_successful_read_at", "last_recheck_at"):
                     if read_key in old: refreshed[read_key] = old[read_key]
+                # Preserve user-assigned library metadata and version identity
+                # across seed reimports; the seed only refreshes basic metadata.
+                for library_key in ("slot", "group_id", "version_no", "version_label", "inspection_enabled", "inspection_mode",
+                                    "last_inspection_attempt_at", "last_inspection_success_at", "last_inspection_status",
+                                    "file_ext", "mime", "logo_kind"):
+                    if library_key in old: refreshed[library_key] = old[library_key]
                 if old.get("overrides"):
                     refreshed["overrides"] = old["overrides"]
                     refreshed.update(refreshed["overrides"])
@@ -2001,7 +2768,9 @@ def cmd_sources_list(args: argparse.Namespace) -> None:
 
 
 def cmd_source_add_link(args: argparse.Namespace) -> None:
-    print(json.dumps(add_source_link(args.url, args.name, args.category, args.origin, purpose=args.purpose, primary=args.primary), ensure_ascii=False, indent=2))
+    print(json.dumps(add_source_link(args.url, args.name, args.category, args.origin, purpose=args.purpose, primary=args.primary,
+                                     slot=getattr(args, "slot", None), group_id=getattr(args, "group_id", None),
+                                     version_label=getattr(args, "version_label", None)), ensure_ascii=False, indent=2))
 
 
 def cmd_source_add_file(args: argparse.Namespace) -> None:
@@ -2009,7 +2778,17 @@ def cmd_source_add_file(args: argparse.Namespace) -> None:
     if not path.is_file() or path.stat().st_size > MAX_SOURCE_FILE_BYTES:
         raise ValueError("source_file_size_invalid")
     data = path.read_bytes()
-    print(json.dumps(add_source_file(path.name, data, args.category, args.origin), ensure_ascii=False, indent=2))
+    print(json.dumps(add_source_file(path.name, data, args.category, args.origin, name=getattr(args, "name", None),
+                                     slot=getattr(args, "slot", None), group_id=getattr(args, "group_id", None),
+                                     version_label=getattr(args, "version_label", None)), ensure_ascii=False, indent=2))
+
+
+def cmd_sources_inspection(args: argparse.Namespace) -> None:
+    print(json.dumps({"sources": source_inspection_selection()}, ensure_ascii=False, indent=2))
+
+
+def cmd_source_group(args: argparse.Namespace) -> None:
+    print(json.dumps(set_source_group(args.id, args.group_id, args.version_label), ensure_ascii=False, indent=2))
 
 
 def cmd_source_remove(args: argparse.Namespace) -> None:
@@ -2056,6 +2835,16 @@ def cmd_recover(args: argparse.Namespace) -> None:
             atomic_write(db)
         return {"revision": db.get("revision", 0), "recovered": reset}
     print(json.dumps(with_lock(update), ensure_ascii=False, indent=2))
+
+
+def cmd_dispatch_card(args: argparse.Namespace) -> None:
+    print(json.dumps(dispatch_card(args.id), ensure_ascii=False, indent=2))
+
+
+def cmd_bind_agent(args: argparse.Namespace) -> None:
+    print(json.dumps(bind_agent(args.id, args.role, args.actor, session_id=args.session_id,
+                                channel=args.channel, expected_revision=args.expected_revision),
+                     ensure_ascii=False, indent=2))
 
 
 def cmd_agent(args: argparse.Namespace) -> None:
@@ -2150,6 +2939,51 @@ def main() -> None:
     handoff_cmd.add_argument("id"); handoff_cmd.add_argument("--expected-revision", type=int, required=True)
     handoff_cmd.add_argument("--input", default="-", help="JSON object or - for stdin")
     handoff_cmd.set_defaults(func=cmd_handoff_update)
+    workflow_cmd = sub.add_parser("workflow", help="inspect and drive the six-stage workflow pipeline")
+    workflow_sub = workflow_cmd.add_subparsers(dest="workflow_command", required=True)
+    workflow_templates_cmd = workflow_sub.add_parser("templates", help="list built-in workflow templates")
+    workflow_templates_cmd.set_defaults(func=cmd_workflow)
+    workflow_show_cmd = workflow_sub.add_parser("show", help="show one record's workflow detail and template")
+    workflow_show_cmd.add_argument("id")
+    workflow_show_cmd.set_defaults(func=cmd_workflow)
+
+    def add_workflow_write(name: str, help_text: str):
+        command = workflow_sub.add_parser(name, help=help_text)
+        command.add_argument("id")
+        command.add_argument("--actor-role", required=True, choices=sorted(workflow.ROLES))
+        command.add_argument("--actor", required=True)
+        command.add_argument("--note")
+        command.add_argument("--evidence", action="append", help="evidence reference; repeat as needed")
+        command.add_argument("--expected-revision", type=int)
+        command.set_defaults(func=cmd_workflow)
+        return command
+
+    workflow_start_cmd = add_workflow_write("start", "start the pipeline template on one record")
+    workflow_start_cmd.add_argument("--template", help="template id; defaults by record type (task/work: dev-standard, bug: bug-standard)")
+    workflow_start_cmd.add_argument("--stage", help="explicit starting stage for legacy records; defaults from the current status")
+    workflow_submit_cmd = add_workflow_write("submit", "record the current stage outputs, note and evidence")
+    workflow_submit_cmd.add_argument("--output", action="append", help="key=value output for the current stage; repeat as needed")
+    workflow_advance_cmd = add_workflow_write("advance", "advance to the next stage once required outputs are complete")
+    workflow_advance_cmd.add_argument("--to", help="optional target stage; must equal the current stage's next stage")
+    workflow_rework_cmd = add_workflow_write("rework", "send the record back to one allowed rework stage")
+    workflow_rework_cmd.add_argument("--to", required=True, help="target rework stage")
+    add_workflow_write("block", "mark the pipeline blocked while keeping the current stage")
+    add_workflow_write("unblock", "clear a pipeline block and restore the mapped status")
+    add_workflow_write("close", "close a delivery-stage pipeline and complete the record")
+    add_workflow_write("claim", "lock the current stage for this actor to prevent concurrent work")
+    add_workflow_write("heartbeat", "renew the current stage lock")
+    add_workflow_write("release", "release the current stage lock")
+    dispatch_card_cmd = sub.add_parser("dispatch-card", help="read the mandatory pre-dispatch card for one task")
+    dispatch_card_cmd.add_argument("id")
+    dispatch_card_cmd.set_defaults(func=cmd_dispatch_card)
+    bind_agent_cmd = sub.add_parser("bind-agent", help="bind a task role to its fixed agent session")
+    bind_agent_cmd.add_argument("id")
+    bind_agent_cmd.add_argument("--role", required=True, choices=("dev", "auditor", "pm"))
+    bind_agent_cmd.add_argument("--actor", required=True)
+    bind_agent_cmd.add_argument("--session-id")
+    bind_agent_cmd.add_argument("--channel", help="host-defined opaque transport label")
+    bind_agent_cmd.add_argument("--expected-revision", type=int)
+    bind_agent_cmd.set_defaults(func=cmd_bind_agent)
     scope_upsert = sub.add_parser("scope-upsert", help="CAS-upsert one scope in the local responsibility catalog")
     scope_upsert.add_argument("--input", default="-", help="one scope JSON object, file path, or - for stdin")
     scope_upsert.add_argument("--expected-catalog-revision", type=int, required=True)
@@ -2222,6 +3056,8 @@ def main() -> None:
     sources = sub.add_parser("sources-list", help="list registered requirement reference sources")
     sources.add_argument("--include-removed", action="store_true")
     sources.set_defaults(func=cmd_sources_list)
+    sources_inspection = sub.add_parser("sources-inspection", help="list only sources eligible for automatic inspection")
+    sources_inspection.set_defaults(func=cmd_sources_inspection)
     source_link = sub.add_parser("source-add-link", help="register a user-provided reference URL")
     source_link.add_argument("--url", required=True)
     source_link.add_argument("--name")
@@ -2229,11 +3065,18 @@ def main() -> None:
     source_link.add_argument("--purpose")
     source_link.add_argument("--primary", action=argparse.BooleanOptionalAction, default=None)
     source_link.add_argument("--origin", choices=("dashboard", "user_chat_link", "agent_import"), default="agent_import")
+    source_link.add_argument("--slot", choices=SOURCE_SLOTS)
+    source_link.add_argument("--group-id")
+    source_link.add_argument("--version-label")
     source_link.set_defaults(func=cmd_source_add_link)
     source_file = sub.add_parser("source-add-file", help="copy a permitted file into managed source storage")
     source_file.add_argument("path")
+    source_file.add_argument("--name")
     source_file.add_argument("--category", default="需求资料")
     source_file.add_argument("--origin", choices=("dashboard", "user_chat_attachment", "agent_import"), default="agent_import")
+    source_file.add_argument("--slot", choices=SOURCE_SLOTS)
+    source_file.add_argument("--group-id")
+    source_file.add_argument("--version-label")
     source_file.set_defaults(func=cmd_source_add_file)
     source_remove = sub.add_parser("source-remove", help="soft-remove one reference source")
     source_remove.add_argument("id")
@@ -2241,6 +3084,11 @@ def main() -> None:
     source_restore = sub.add_parser("source-restore", help="restore a soft-removed reference source")
     source_restore.add_argument("id")
     source_restore.set_defaults(func=cmd_source_restore)
+    source_group = sub.add_parser("source-group", help="assign a source to a version group")
+    source_group.add_argument("id")
+    source_group.add_argument("--group-id", required=True)
+    source_group.add_argument("--version-label")
+    source_group.set_defaults(func=cmd_source_group)
     source_lifecycle = sub.add_parser("source-lifecycle", help="update a source verification lifecycle")
     source_lifecycle.add_argument("id")
     source_lifecycle.add_argument("--status", choices=("registered", "suspected_deprecated", "deprecated"))
@@ -2256,7 +3104,11 @@ def main() -> None:
     try:
         args.func(args)
     except (ValueError, json.JSONDecodeError, OSError) as exc:
-        raise SystemExit(f"dashboardctl: {exc}")
+        code = getattr(exc, "code", None)
+        message = str(exc)
+        if isinstance(code, str) and code and message != code:
+            message = f"{code}: {message}"
+        raise SystemExit(f"dashboardctl: {message}")
 
 
 if __name__ == "__main__":

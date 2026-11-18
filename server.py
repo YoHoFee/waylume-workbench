@@ -26,6 +26,7 @@ import dashboardctl
 import data_location
 import integrations
 import waylume_paths
+import workflow
 from handoff_view import handoff_view
 
 
@@ -53,6 +54,10 @@ INSPECTION_CONFIG = _PATROL_PATHS.schedule_config if _PATROL_PATHS else CODEX_HO
 INSPECTION_SLOTS = _PATROL_PATHS.slots if _PATROL_PATHS else None
 INSPECTION_DISPATCHER = _PATROL_PATHS.dispatcher if _PATROL_PATHS else None
 INSPECTION_ZONE = "Asia/Shanghai"
+# The DSH scheduler store is the live schedule source while the patrol runs on
+# DSH; the Codex automation file above stays as the legacy fallback.
+DSH_SCHEDULE_STORE = Path(os.environ.get("DSH_SCHEDULE_STORE", str(Path.home() / ".dsh/storages/schedule.json"))).expanduser()
+INSPECTION_TITLE_HINT = "统一巡检"
 _instance_lock = None
 
 
@@ -65,18 +70,77 @@ def refresh_data_paths() -> None:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str):
+    def __init__(self, status: int, code: str, detail: dict | None = None):
         super().__init__(code)
         self.status = status
         self.code = code
+        self.detail = detail or {}
 
 
 def now_local() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def inspection_schedule() -> dict:
-    """Expose a tiny, sanitized view of the one allowlisted bug-2 schedule."""
+def _parse_rrule_schedule(status: str, rule: str, prompt: str = "") -> dict:
+    """Parse the small inspection RRULE subset shared by the Codex and DSH hosts."""
+    match = re.search(
+        r"(?:RRULE:)?FREQ=(DAILY|WEEKLY);"
+        r"(?:BYDAY=([A-Z,]+);)?BYHOUR=([0-9,]+);BYMINUTE=([0-9]{1,2})",
+        rule,
+    )
+    if not match:
+        return {"available": False, "state": "unknown"}
+    frequency, raw_days, raw_hours, raw_minute = match.groups()
+    if frequency == "WEEKLY" and not raw_days:
+        return {"available": False, "state": "unknown"}
+    days = raw_days.split(",") if raw_days else ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+    valid_days = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+    if not days or any(day not in valid_days for day in days) or len(set(days)) != len(days):
+        return {"available": False, "state": "unknown"}
+    hours = [int(hour) for hour in raw_hours.split(",")]
+    minute = int(raw_minute)
+    # Prefer the explicit DTSTART timezone, then a prompt token, then the host default.
+    timezone = None
+    dtstart = re.search(r"DTSTART;TZID=([^:\s]+)", rule)
+    if dtstart:
+        candidate = dtstart.group(1)
+        try:
+            ZoneInfo(candidate)
+            timezone = candidate
+        except (KeyError, ValueError):
+            timezone = None
+    # Prompts often begin with absolute paths such as `/Users/...`;
+    # select a slash-delimited token only if it is a real IANA timezone.
+    if timezone is None:
+        for zone_match in re.finditer(r"\b([A-Za-z_]+/[A-Za-z_]+)\b", prompt):
+            candidate = zone_match.group(1)
+            try:
+                ZoneInfo(candidate)
+            except (KeyError, ValueError):
+                continue
+            timezone = candidate
+            break
+    if timezone is None:
+        # The Codex automation format stores no timezone field; keep the
+        # established workbench fallback until the host supplies an explicit zone.
+        timezone = INSPECTION_ZONE
+    if not hours or any(hour < 0 or hour > 23 for hour in hours) or minute > 59:
+        return {"available": False, "state": "unknown"}
+    if timezone != INSPECTION_ZONE:
+        return {"available": False, "state": "unknown"}
+    return {
+        "available": True,
+        "enabled": status == "ACTIVE",
+        "state": "active" if status == "ACTIVE" else "paused" if status == "PAUSED" else "unknown",
+        "timezone": timezone,
+        "times": [f"{hour:02d}:{minute:02d}" for hour in hours],
+        "weekdays": days,
+        "server_time": datetime.now(ZoneInfo(timezone)).isoformat(timespec="seconds"),
+    }
+
+
+def _codex_inspection_schedule() -> dict:
+    """Read the legacy Codex automation config when DSH scheduling is absent."""
     try:
         raw = INSPECTION_CONFIG.read_text(encoding="utf-8")
         try:
@@ -92,53 +156,58 @@ def inspection_schedule() -> dict:
             prompt = prompt_match.group(1) if prompt_match else ""
         if not isinstance(status, str) or not isinstance(rule, str):
             return {"available": False, "state": "unknown"}
-        match = re.fullmatch(
-            r"(?:RRULE:)?FREQ=(DAILY|WEEKLY);"
-            r"(?:BYDAY=([A-Z,]+);)?BYHOUR=([0-9,]+);BYMINUTE=([0-9]{1,2})",
-            rule,
-        )
-        if not match:
-            return {"available": False, "state": "unknown"}
-        frequency, raw_days, raw_hours, raw_minute = match.groups()
-        if frequency == "WEEKLY" and not raw_days:
-            return {"available": False, "state": "unknown"}
-        days = raw_days.split(",") if raw_days else ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-        valid_days = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
-        if not days or any(day not in valid_days for day in days) or len(set(days)) != len(days):
-            return {"available": False, "state": "unknown"}
-        hours = [int(hour) for hour in raw_hours.split(",")]
-        minute = int(raw_minute)
-        # Prompts often begin with absolute paths such as `/Users/...`;
-        # select a slash-delimited token only if it is a real IANA timezone.
-        timezone = None
-        for zone_match in re.finditer(r"\b([A-Za-z_]+/[A-Za-z_]+)\b", prompt):
-            candidate = zone_match.group(1)
-            try:
-                ZoneInfo(candidate)
-            except (KeyError, ValueError):
-                continue
-            timezone = candidate
-            break
-        if timezone is None:
-            # The Codex automation format currently stores status and RRULE,
-            # but no timezone field. Keep the established workbench fallback
-            # until the host supplies an explicit zone.
-            timezone = INSPECTION_ZONE
-        if not hours or any(hour < 0 or hour > 23 for hour in hours) or minute > 59:
-            return {"available": False, "state": "unknown"}
-        if not timezone or timezone != INSPECTION_ZONE:
-            return {"available": False, "state": "unknown"}
-        return {
-            "available": True,
-            "enabled": status == "ACTIVE",
-            "state": "active" if status == "ACTIVE" else "paused" if status == "PAUSED" else "unknown",
-            "timezone": timezone,
-            "times": [f"{hour:02d}:{minute:02d}" for hour in hours],
-            "weekdays": days,
-            "server_time": datetime.now(ZoneInfo(timezone)).isoformat(timespec="seconds"),
-        }
+        return _parse_rrule_schedule(status, rule, prompt)
     except (OSError, ValueError, TypeError):
         return {"available": False, "state": "unknown"}
+
+
+def _dsh_inspection_schedule() -> dict:
+    """Read the live DSH scheduler store, the active host for this patrol.
+
+    Returns None when the DSH store is absent, unreadable, or has no patrol task
+    so callers can fall back to the legacy Codex automation config.
+    """
+    try:
+        payload = json.loads(DSH_SCHEDULE_STORE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    tables = payload.get("tables") if isinstance(payload, dict) else None
+    tasks = tables.get("tasks") if isinstance(tables, dict) else None
+    if not isinstance(tasks, dict):
+        return None
+    records = []
+    for row in tasks.values():
+        record = row.get("record") if isinstance(row, dict) else None
+        if not isinstance(record, dict) or record.get("kind") not in (None, "rrule"):
+            continue
+        if INSPECTION_TITLE_HINT not in str(record.get("title") or ""):
+            continue
+        records.append(record)
+    if not records:
+        return None
+    # The most specific title wins, then a deterministic id ordering.
+    records.sort(key=lambda item: (len(str(item.get("title") or "")), str(item.get("id") or "")))
+    record = records[0]
+    status = "ACTIVE"
+    raw_status = record.get("status")
+    if isinstance(raw_status, str) and raw_status.strip():
+        status = raw_status.strip().upper()
+    elif record.get("paused") is True or record.get("enabled") is False:
+        status = "PAUSED"
+    parsed = _parse_rrule_schedule(status, record.get("rrule") or "", "")
+    return parsed if parsed.get("available") else None
+
+
+def inspection_schedule() -> dict:
+    """Expose a tiny, sanitized view of the one allowlisted patrol schedule.
+
+    The DSH scheduler store is authoritative while the patrol runs on DSH; the
+    legacy Codex automation file remains the fallback for Codex hosts.
+    """
+    dsh = _dsh_inspection_schedule()
+    if dsh is not None:
+        return dsh
+    return _codex_inspection_schedule()
 
 
 def bug_inspection_status() -> dict:
@@ -209,6 +278,14 @@ def bug_inspection_status() -> dict:
 
 def effective_status(record: dict) -> tuple[str, str]:
     return dashboardctl.effective_work_status(record)
+
+
+def public_enriched_source(source: dict) -> dict:
+    """Expose one source with server-derived library/version fields."""
+    all_sources = dashboardctl._source_store_list(dashboardctl.load_store())
+    current = next((item for item in all_sources if item.get("id") == source.get("id")), source)
+    enriched = dashboardctl.enrich_source_records([current], all_sources)
+    return public_source(enriched[0] if enriched else current)
 
 
 def public_source(source: dict) -> dict:
@@ -316,11 +393,22 @@ def build_payload() -> dict:
             pending = [entry for entry in followups if entry.get("status") == "pending"]
             claimed = [entry for entry in followups if entry.get("status") == "claimed"]
             item["followup_preview"] = pending[-1] if pending else claimed[-1] if claimed else followups[-1] if followups else None
+            # Pipeline summary stays on the list payload; the full gate/history
+            # detail is only served by /api/items/<ID>/workflow.
+            item.update(workflow.summary(item))
+            current_workflow = item.get("workflow")
+            if isinstance(current_workflow, dict):
+                slim = {key: value for key, value in current_workflow.items() if key != "history"}
+                slim["history_count"] = len(current_workflow.get("history") or [])
+                item["workflow"] = slim
         items.sort(key=lambda item: (item.get("status") != "blocked", item.get("updated_at", "")), reverse=False)
     batches = db.get("batches", [])
     if not isinstance(batches, list):
         batches = []
     legacy_task_ids = [item.get("id") for item in grouped["delegated"] if not item.get("batch_id")]
+    all_sources = dashboardctl._source_store_list(db)
+    active_sources = [item for item in all_sources if item.get("active")]
+    library_sources = dashboardctl.enrich_source_records(active_sources, all_sources)
     return {
         "generated_at": now_local(),
         "data_state": "ready" if records else "empty",
@@ -333,7 +421,7 @@ def build_payload() -> dict:
         "preferences": db.get("preferences", {}),
         **grouped,
         "sync": sync,
-        "sources": [public_source(item) for item in dashboardctl._source_store_list(db) if item.get("active")],
+        "sources": [public_source(item) for item in library_sources],
         "scope_catalog": load_scope_catalog(),
     }
 
@@ -421,9 +509,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "source_not_found"}, status=404)
             return
         if route == "/api/sources":
-            include_removed = parse_qs(urlsplit(self.path).query).get("include_removed") == ["1"]
-            manifest = dashboardctl.source_manifest(include_removed)
-            self._send_json({"revision": manifest["revision"], "sources": [public_source(item) for item in manifest["sources"]]})
+            query = parse_qs(urlsplit(self.path).query)
+            include_removed = query.get("include_removed") == ["1"]
+            all_versions = query.get("all_versions", ["1"])[0] not in {"0", "false", "no"}
+            manifest = dashboardctl.source_manifest(include_removed, all_versions)
+            self._send_json({
+                "revision": manifest["revision"],
+                "sources": [public_source(item) for item in manifest["sources"]],
+                "all_versions": manifest["all_versions"],
+            })
             return
         source_file = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/file", route)
         if source_file:
@@ -452,12 +546,40 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/dashboard":
             self._send_json(build_payload())
             return
+        if route == "/api/workflow/templates":
+            self._send_json({"templates": workflow.templates()})
+            return
+        workflow_template = re.fullmatch(r"/api/workflow/templates/([A-Za-z0-9_-]{1,60})", route)
+        if workflow_template:
+            try:
+                self._send_json(workflow.get_template(workflow_template.group(1)))
+            except workflow.WorkflowError as exc:
+                self._send_api_error(ApiError(404, exc.code, exc.detail))
+            return
+        workflow_detail = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/workflow", route)
+        if workflow_detail:
+            try:
+                self._send_json(dashboardctl.workflow_show(workflow_detail.group(1)))
+            except ValueError as exc:
+                code = dashboardctl.error_code(exc)
+                detail = getattr(exc, "detail", None)
+                self._send_api_error(ApiError(404 if code == "record_not_found" else 400, code,
+                                              detail if isinstance(detail, dict) else None))
+            return
         if route == "/api/scopes":
             try:
                 self._send_json(load_scope_catalog())
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=503)
             return
+        dispatch_card = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/dispatch-card", route)
+        if dispatch_card:
+            try:
+                self._send_json(dashboardctl.dispatch_card(dispatch_card.group(1)))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=404)
+            return
+
         context = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/context", route)
         if context:
             def read_consistent_snapshot():
@@ -548,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
                 try: self._send_json(dashboardctl.update_preferences(payload))
                 except ValueError as exc: raise ApiError(400, str(exc))
                 return
-            max_bytes = MAX_SOURCE_REQUEST_BYTES if route == "/api/sources/file" else MAX_RECORD_IMAGE_REQUEST_BYTES if re.fullmatch(r"/api/items/[A-Za-z0-9_.:-]{1,120}/attachments", route) else MAX_AGENT_REPORT_REQUEST_BYTES if route in {"/api/agents/report", "/api/agents/update"} or re.fullmatch(r"/api/sources/[A-Za-z0-9_-]{1,100}/read-state", route) else 8192
+            max_bytes = MAX_SOURCE_REQUEST_BYTES if route == "/api/sources/file" else MAX_RECORD_IMAGE_REQUEST_BYTES if re.fullmatch(r"/api/items/[A-Za-z0-9_.:-]{1,120}/attachments", route) else MAX_AGENT_REPORT_REQUEST_BYTES if route in {"/api/agents/report", "/api/agents/update"} or re.fullmatch(r"/api/sources/[A-Za-z0-9_-]{1,100}/read-state", route) or re.fullmatch(r"/api/items/[A-Za-z0-9_.:-]{1,120}/workflow/(?:start|submit|advance|rework|block|unblock|close|claim|heartbeat|release)", route) else 8192
             payload = self._read_json(max_bytes)
             attachment = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/attachments", route)
             if attachment:
@@ -561,6 +683,66 @@ class Handler(BaseHTTPRequestHandler):
                 result = dashboardctl.add_record_image(attachment.group(1), filename, raw)
                 result["attachment"]["download_url"] = f"/api/items/{attachment.group(1)}/attachments/{filename}"
                 self._send_json(result, status=201); return
+            workflow_action = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/workflow/(start|submit|advance|rework|block|unblock|close|claim|heartbeat|release)", route)
+            if workflow_action:
+                record_id, action = workflow_action.group(1), workflow_action.group(2)
+                self._only_keys(payload, {"expected_revision", "actor_role", "actor", "note", "evidence",
+                                          "outputs", "to", "template_id", "stage"})
+                expected = payload.get("expected_revision")
+                actor_role, actor = payload.get("actor_role"), payload.get("actor")
+                note, evidence = payload.get("note", ""), payload.get("evidence", [])
+                outputs = payload.get("outputs", {})
+                to, template_id, stage = payload.get("to"), payload.get("template_id"), payload.get("stage")
+                if (not isinstance(expected, int) or isinstance(expected, bool)
+                        or not isinstance(actor_role, str) or not isinstance(actor, str)
+                        or not isinstance(note, str) or not isinstance(evidence, list)
+                        or not isinstance(outputs, dict)
+                        or (to is not None and not isinstance(to, str))
+                        or (template_id is not None and not isinstance(template_id, str))
+                        or (stage is not None and not isinstance(stage, str))):
+                    raise ApiError(400, "invalid_workflow_payload")
+                try:
+                    if action == "start":
+                        result = dashboardctl.workflow_start(record_id, template_id=template_id, stage=stage,
+                                                             actor_role=actor_role, actor=actor, note=note,
+                                                             evidence=evidence, expected_revision=expected)
+                    elif action == "submit":
+                        result = dashboardctl.workflow_submit(record_id, outputs, actor_role=actor_role, actor=actor,
+                                                              note=note, evidence=evidence, expected_revision=expected)
+                    elif action == "advance":
+                        result = dashboardctl.workflow_advance(record_id, actor_role=actor_role, actor=actor,
+                                                               note=note, evidence=evidence, to=to,
+                                                               expected_revision=expected)
+                    elif action == "rework":
+                        if not isinstance(to, str):
+                            raise ApiError(400, "invalid_stage")
+                        result = dashboardctl.workflow_rework(record_id, to, actor_role=actor_role, actor=actor,
+                                                              note=note, evidence=evidence, expected_revision=expected)
+                    elif action == "block":
+                        result = dashboardctl.workflow_block(record_id, actor_role=actor_role, actor=actor,
+                                                             note=note, expected_revision=expected)
+                    elif action == "unblock":
+                        result = dashboardctl.workflow_unblock(record_id, actor_role=actor_role, actor=actor,
+                                                               note=note, expected_revision=expected)
+                    elif action == "claim":
+                        result = dashboardctl.workflow_claim(record_id, actor_role=actor_role, actor=actor,
+                                                             expected_revision=expected)
+                    elif action == "heartbeat":
+                        result = dashboardctl.workflow_heartbeat(record_id, actor_role=actor_role, actor=actor,
+                                                                 expected_revision=expected)
+                    elif action == "release":
+                        result = dashboardctl.workflow_release(record_id, actor_role=actor_role, actor=actor,
+                                                               expected_revision=expected)
+                    else:
+                        result = dashboardctl.workflow_close(record_id, actor_role=actor_role, actor=actor,
+                                                             note=note, evidence=evidence, expected_revision=expected)
+                except ValueError as exc:
+                    code = dashboardctl.error_code(exc)
+                    detail = getattr(exc, "detail", None)
+                    status = 404 if code in {"record_not_found", "template_not_found"} else 409 if code == "revision_conflict" else 400
+                    raise ApiError(status, code, detail if isinstance(detail, dict) else None)
+                self._send_json(result)
+                return
             agent_route = re.fullmatch(r"/api/agents/(claim|heartbeat|report|release|update)", route)
             if agent_route:
                 action = agent_route.group(1)
@@ -640,13 +822,35 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "inspection_dispatch_failed"}, status=503)
                 return
             if route == "/api/sources/link":
-                self._only_keys(payload, {"url", "name", "category", "purpose", "primary"})
+                self._only_keys(payload, {"url", "name", "category", "purpose", "primary", "slot", "group_id", "version_label"})
                 url, name, category = payload.get("url"), payload.get("name"), payload.get("category", "需求资料")
                 purpose, primary = payload.get("purpose"), payload.get("primary")
-                if not isinstance(url, str) or (name is not None and not isinstance(name, str)) or not isinstance(category, str) or (purpose is not None and not isinstance(purpose, str)) or (primary is not None and not isinstance(primary, bool)):
+                slot, group_id, version_label = payload.get("slot"), payload.get("group_id"), payload.get("version_label")
+                if (not isinstance(url, str) or (name is not None and not isinstance(name, str)) or not isinstance(category, str)
+                        or (purpose is not None and not isinstance(purpose, str)) or (primary is not None and not isinstance(primary, bool))
+                        or (slot is not None and not isinstance(slot, str)) or (group_id is not None and not isinstance(group_id, str))
+                        or (version_label is not None and not isinstance(version_label, str))):
                     raise ApiError(400, "invalid_source_payload")
-                result = dashboardctl.add_source_link(url, name, category, "dashboard", purpose=purpose, primary=primary)
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])}, status=201)
+                result = dashboardctl.add_source_link(url, name, category, "dashboard", purpose=purpose, primary=primary,
+                                                      slot=slot, group_id=group_id, version_label=version_label)
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])}, status=201)
+                return
+            source_inspection = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/inspection", route)
+            if source_inspection:
+                self._only_keys(payload, {"enabled"})
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise ApiError(400, "invalid_source_inspection")
+                result = dashboardctl.set_source_inspection(source_inspection.group(1), enabled)
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
+                return
+            source_slot = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/slot", route)
+            if source_slot:
+                self._only_keys(payload, {"slot"})
+                if "slot" not in payload or (payload["slot"] is not None and not isinstance(payload["slot"], str)):
+                    raise ApiError(400, "invalid_source_slot")
+                result = dashboardctl.set_source_slot(source_slot.group(1), payload["slot"])
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             override = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/override", route)
             if override:
@@ -654,38 +858,44 @@ class Handler(BaseHTTPRequestHandler):
                 fields = payload.get("fields")
                 if not isinstance(fields, dict): raise ApiError(400, "invalid_source_override")
                 result = dashboardctl.override_source(override.group(1), fields)
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])})
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             lifecycle = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/lifecycle", route)
             if lifecycle:
                 self._only_keys(payload, {"lifecycle_status", "lifecycle_reason", "last_verified_at", "lifecycle_override"})
                 result = dashboardctl.set_source_lifecycle(lifecycle.group(1), payload)
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])})
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             read_state = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/read-state", route)
             if read_state:
                 result = dashboardctl.set_source_read_state(read_state.group(1), payload)
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])})
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             if route == "/api/sources/file":
-                self._only_keys(payload, {"filename", "content_base64", "category"})
+                self._only_keys(payload, {"filename", "content_base64", "category", "name", "slot", "group_id", "version_label"})
                 filename = payload.get("filename")
                 encoded = payload.get("content_base64")
                 category = payload.get("category", "需求资料")
-                if not isinstance(filename, str) or not isinstance(encoded, str) or not isinstance(category, str):
+                name, slot = payload.get("name"), payload.get("slot")
+                group_id, version_label = payload.get("group_id"), payload.get("version_label")
+                if (not isinstance(filename, str) or not isinstance(encoded, str) or not isinstance(category, str)
+                        or (name is not None and not isinstance(name, str))
+                        or (slot is not None and not isinstance(slot, str)) or (group_id is not None and not isinstance(group_id, str))
+                        or (version_label is not None and not isinstance(version_label, str))):
                     raise ApiError(400, "invalid_source_payload")
                 try:
                     file_bytes = base64.b64decode(encoded, validate=True)
                 except (binascii.Error, ValueError):
                     raise ApiError(400, "invalid_base64")
-                result = dashboardctl.add_source_file(filename, file_bytes, category, "dashboard")
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])}, status=201)
+                result = dashboardctl.add_source_file(filename, file_bytes, category, "dashboard", name=name,
+                                                      slot=slot, group_id=group_id, version_label=version_label)
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])}, status=201)
                 return
             restore = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/restore", route)
             if restore:
                 self._only_keys(payload, set())
                 result = dashboardctl.change_source_state(restore.group(1), True)
-                self._send_json({"revision": result["revision"], "source": public_source(result["source"])})
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             if route == "/api/followups/claim":
                 self._only_keys(payload, {"ids", "limit", "claimed_by"})
@@ -727,11 +937,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raise ApiError(404, "not_found")
         except ApiError as exc:
-            self._send_json({"error": exc.code}, status=exc.status)
+            self._send_api_error(exc)
         except ValueError as exc:
             code = dashboardctl.error_code(exc)
-            status = 404 if code in {"record_not_found", "record_attachment_not_found", "followup_not_found", "source_not_found"} else 413 if code == "record_attachment_too_large" else 409 if code in {"followup_not_claimed", "source_duplicate", "attachment_duplicate", "revision_conflict", "agent_owner_conflict", "agent_expired", "record_completed"} else 400
-            self._send_json({"error": code}, status=status)
+            status = 404 if code in {"record_not_found", "record_attachment_not_found", "followup_not_found", "source_not_found", "source_group_not_found"} else 413 if code == "record_attachment_too_large" else 409 if code in {"followup_not_claimed", "source_duplicate", "attachment_duplicate", "revision_conflict", "agent_owner_conflict", "agent_expired", "record_completed", "source_group_slot_conflict"} else 400
+            detail = getattr(exc, "detail", None)
+            self._send_api_error(ApiError(status, code, detail if isinstance(detail, dict) else None))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({"error": "invalid_json"}, status=400)
         except OSError:
@@ -746,12 +957,12 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 raise ApiError(404, "not_found")
             result = dashboardctl.change_source_state(match.group(1), False)
-            self._send_json({"revision": result["revision"], "source": public_source(result["source"])})
+            self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
         except ApiError as exc:
-            self._send_json({"error": exc.code}, status=exc.status)
+            self._send_api_error(exc)
         except ValueError as exc:
             code = dashboardctl.error_code(exc)
-            self._send_json({"error": code}, status=404 if code == "source_not_found" else 400)
+            self._send_api_error(ApiError(404 if code == "source_not_found" else 400, code))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({"error": "invalid_json"}, status=400)
         except OSError:
@@ -781,6 +992,12 @@ class Handler(BaseHTTPRequestHandler):
     def _only_keys(payload: dict, allowed: set[str]) -> None:
         if set(payload) - allowed:
             raise ApiError(400, "unsupported_fields")
+
+    def _send_api_error(self, exc: "ApiError") -> None:
+        payload = {"error": exc.code}
+        if exc.detail:
+            payload["detail"] = exc.detail
+        self._send_json(payload, status=exc.status)
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

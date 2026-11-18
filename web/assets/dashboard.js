@@ -1,5 +1,6 @@
 (() => {
-  const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null };
+  const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
+    workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set() };
   const inspectionClock = { schedule: null, serverEpoch: null, syncedAt: null, nextRunAt: null };
   const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…" };
   const themeStorage = (() => { try { return window.localStorage; } catch (_) { return { getItem: () => null, setItem: () => {} }; } })();
@@ -16,8 +17,9 @@
     { key: "task", field: "delegated", list: "#task-records", empty: "#task-empty", done: "#task-completed", doneCount: "#task-completed-count", doneList: "#task-completed-list", count: "#task-count" }
   ];
   const labels = {
-    in_progress: "进行中", on_hold: "搁置", awaiting_acceptance: "待验收", blocked: "阻塞", completed: "已完成", cancelled: "已取消", partial: "部分完成",
-    pending: "待处理", unknown: "未核实", archived: "已归档", platform_testing: "平台测试中", submitted_for_testing: "我方已提交测试"
+    in_progress: "进行中", developing: "开发中", testing: "测试中", on_hold: "搁置", awaiting_acceptance: "待验收", blocked: "阻塞", completed: "已完成", cancelled: "已取消", partial: "部分完成", pending_release: "待发布",
+    pending: "待处理", unknown: "未核实", archived: "已归档", platform_testing: "平台测试中", submitted_for_testing: "我方已提交测试",
+    owner_changed: "责任人变更"
   };
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -58,7 +60,8 @@
   }
   function isCompleted(record) { return effectiveStatus(record) === "completed"; }
   function isCancelled(record) { return effectiveStatus(record) === "cancelled"; }
-  function isTerminal(record) { return isCompleted(record) || isCancelled(record); }
+  function isOwnerChanged(record) { return effectiveStatus(record) === "owner_changed"; }
+  function isTerminal(record) { return isCompleted(record) || isCancelled(record) || isOwnerChanged(record); }
   const beijingDate = value => model.beijingDate(value);
   function hasManualCompletion(record) { return record.manual_completed === true || record.effective_status_basis === "manual"; }
   function groupRecords(group) {
@@ -80,7 +83,7 @@
   function sortTaskRecords(items) {
     return [...items].sort((a, b) => {
       const aDone = isCompleted(a), bDone = isCompleted(b);
-      const aActive = effectiveStatus(a) === "in_progress", bActive = effectiveStatus(b) === "in_progress";
+      const aActive = ["in_progress", "developing", "testing"].includes(effectiveStatus(a)), bActive = ["in_progress", "developing", "testing"].includes(effectiveStatus(b));
       return Number(bActive) - Number(aActive) || Number(aDone) - Number(bDone) ||
         String(b.created_at || "").localeCompare(String(a.created_at || "")) ||
         String(a.id).localeCompare(String(b.id));
@@ -165,7 +168,7 @@
   }
   function renderWorktimeProgress() {
     const percent = model.workPeriodProgress(Date.now(), workHours.start, workHours.end);
-    $("#worktime-fill").style.width = `${percent}%`;
+    $("#worktime-fill").style.transform = `scaleX(${percent / 100})`;
     $("#worktime-percent").textContent = `${percent}%`;
     const label = `${workHours.start}–${workHours.end}`;
     const button = $("#worktime-open");
@@ -457,10 +460,12 @@
     }
   }
 
+  const libraryReadLabels = { success: "读取成功", succeeded: "读取成功", complete: "读取成功", partial: "部分读取", failed: "读取失败", error: "读取失败", running: "正在读取", in_progress: "正在读取", not_checked: "尚未读取", not_read: "尚未读取", unknown: "读取状态未知" };
   function sourceCategory(source) {
     const category = source.overrides?.category || source.category;
-    if (category) return ({ cloud_document: "云文档", web_link: "网页链接", acceptance_reference: "验收参考", file: "本地文件" })[category] || category;
+    if (category) return ({ cloud_document: "云文档", web_link: "网页链接", acceptance_reference: "验收参考", file: "本地文件", requirement_doc: "需求文档", figma: "Figma", codesign: "CoDesign", api_doc: "接口文档" })[category] || category;
     if (source.type === "file") return "本地文件";
+    if (source.slot && model.librarySlotLabels[source.slot]) return model.librarySlotLabels[source.slot];
     try {
       const host = new URL(source.url).hostname.toLowerCase();
       return ["docs.qq.com", "kdocs.cn", "feishu.cn", "larksuite.com", "yuque.com", "docs.google.com", "figma.com"].some(domain => host === domain || host.endsWith(`.${domain}`)) ? "云文档" : "网页链接";
@@ -471,74 +476,290 @@
     try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) && !url.username && !url.password ? url.href : null; }
     catch (_) { return null; }
   }
-  function makeSourceRow(source, active) {
-    const row = document.createElement("li"); row.className = "source-row";
-    const info = document.createElement("div"); info.className = "source-info";
-    const name = document.createElement("strong"); name.className = "source-name"; name.textContent = source.overrides?.name || source.name || source.filename || source.url || "未命名来源";
-    const lifecycle = source.suspected_deprecated || source.lifecycle_status === "suspected_deprecated" ? "疑似废弃" : source.lifecycle_status === "deprecated" ? "已废弃" : "";
-    const verificationState = source.verification_state || source.overrides?.verification_state || "not_checked";
-    const verificationLabels = { not_checked: "未核查", verified: "已核验", failed: "核验失败" };
-    const kind = document.createElement("span"); kind.className = "source-kind"; kind.textContent = `${sourceCategory(source)} · ${verificationLabels[verificationState] || verificationState}${lifecycle ? ` · ${lifecycle}` : ""}`;
-    info.append(name, kind);
-    if (source.lifecycle_reason) { const reason = document.createElement("span"); reason.className = "source-kind"; reason.textContent = source.lifecycle_reason; info.append(reason); }
+  function sourceLogoKind(source) {
+    const kind = source.logo_kind || source.slot;
+    return ["requirement_doc", "figma", "codesign", "api_doc", "file", "link"].includes(kind) ? kind : (source.type === "file" ? "file" : "link");
+  }
+  function makeSourceLogo(sourceOrKind) {
+    const kind = typeof sourceOrKind === "string" ? sourceOrKind : sourceLogoKind(sourceOrKind);
+    const safeKind = ["requirement_doc", "figma", "codesign", "api_doc", "file", "link"].includes(kind) ? kind : "link";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "library-logo-icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", `#library-logo-${safeKind}`);
+    svg.append(use);
+    return svg;
+  }
+  function sourceDisplayName(source) {
+    return source.overrides?.name || source.name || source.filename || source.url || "未命名资料";
+  }
+  function sourceLinkText(source) {
+    if (source.type === "file") return source.filename || sourceDisplayName(source);
+    return source.url || sourceDisplayName(source);
+  }
+  function sourceOpenHref(source) {
+    const safeApiPath = /^\/api\/sources\/[A-Za-z0-9_-]{1,100}\/(?:open|file)$/;
+    if (source.type === "link") {
+      if (typeof source.open_path === "string" && safeApiPath.test(source.open_path)) return source.open_path;
+      return safeHttpUrl(source.url || "");
+    }
+    if (source.type === "file" && typeof source.download_url === "string" && safeApiPath.test(source.download_url)) return source.download_url;
+    return null;
+  }
+  function makeSourceOpenLink(source, label, className = "library-text-link") {
+    const link = document.createElement("a");
+    link.className = className;
+    link.textContent = label;
+    link.title = label || sourceLinkText(source);
+    const href = sourceOpenHref(source);
+    if (!href) {
+      link.href = "#";
+      link.setAttribute("aria-disabled", "true");
+      link.addEventListener("click", event => event.preventDefault());
+      return link;
+    }
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    if (source.type === "file" && window.workbenchTransport?.openSource) {
+      link.addEventListener("click", event => {
+        event.preventDefault();
+        window.workbenchTransport.openSource(source, source.download_url);
+      });
+    }
+    return link;
+  }
+  function sourceLastInspectionSuccess(source) {
+    return source.last_inspection_success_at || source.last_successful_read_at || null;
+  }
+  function makeInspectionStatus(source, compact = false, groupLastSuccess = null) {
+    const holder = document.createElement("span");
+    holder.className = `library-inspection-status${compact ? " is-compact" : ""}`;
+    if (source.inspection_active) {
+      const badge = document.createElement("span");
+      badge.className = "library-inspection-badge is-active";
+      const dot = document.createElement("span"); dot.className = "library-inspection-dot"; dot.setAttribute("aria-hidden", "true");
+      const text = document.createElement("span"); text.textContent = "巡检包含";
+      badge.append(dot, text);
+      holder.append(badge);
+    } else {
+      const off = document.createElement("span");
+      off.className = "library-inspection-off";
+      off.textContent = source.inspection_eligible === false ? "历史版本不巡检" : "未加入巡检";
+      holder.append(off);
+    }
+    const success = sourceLastInspectionSuccess(source) || (source.inspection_active ? groupLastSuccess : null);
+    if (success) {
+      const time = document.createElement("span");
+      time.className = "library-inspection-time";
+      time.textContent = `上次巡检成功 ${dateLabel(success)}`;
+      holder.append(time);
+    }
+    return holder;
+  }
+  function makeInspectionToggle(source) {
+    if (source.inspection_eligible === false) return null;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "library-inspection-toggle";
+    button.dataset.sourceAction = "inspection";
+    button.dataset.sourceId = source.id;
+    button.textContent = source.inspection_active ? "移出巡检" : "加入巡检";
+    button.title = source.slot === "requirement_doc" ? "仅影响当前版本；需求文档只巡检最新与上一版。" : "将当前资料加入或移出巡检。";
+    return button;
+  }
+  function libraryHistoryId(groupId) {
+    return `library-history-${cssSafe(groupId)}`;
+  }
+  function makeVersionToggle(group, historyId) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "library-version-toggle";
+    button.dataset.libraryVersions = group.group_id;
+    button.setAttribute("aria-expanded", String(state.libraryExpanded.has(group.group_id)));
+    button.setAttribute("aria-controls", historyId);
+    button.textContent = `还有 ${group.history_count} 个版本`;
+    return button;
+  }
+  function makeVersionRow(source, groupId) {
+    const row = document.createElement("li");
+    row.className = "library-version-row";
+    const open = makeSourceOpenLink(source, "", "library-version-open");
+    const label = document.createElement("span"); label.className = "library-version-label"; label.textContent = source.version_label || `v${source.version_no || 1}`;
+    const time = document.createElement("span"); time.className = "library-version-time"; time.textContent = dateLabel(source.added_at, "时间未知");
+    open.append(label, time);
+    const meta = document.createElement("div"); meta.className = "library-version-meta";
+    if (source.is_latest) {
+      const latest = document.createElement("span"); latest.className = "library-latest-mark"; latest.textContent = "最新"; meta.append(latest);
+    }
+    meta.append(makeInspectionStatus(source, true));
+    const toggle = makeInspectionToggle(source); if (toggle) meta.append(toggle);
+    row.append(open, meta);
+    return row;
+  }
+  function makeVersionHistory(group) {
+    const historyId = libraryHistoryId(group.group_id);
+    const wrapper = document.createElement("div");
+    wrapper.className = "library-history";
+    wrapper.id = historyId;
+    wrapper.hidden = !state.libraryExpanded.has(group.group_id);
+    const list = document.createElement("ol");
+    list.className = "library-version-list";
+    list.append(...group.versions.map(source => makeVersionRow(source, group.group_id)));
+    wrapper.append(list);
+    return wrapper;
+  }
+  function makeSlotCard(slot) {
+    const article = document.createElement("article");
+    article.className = `library-card${slot.empty ? " is-empty" : ""}`;
+    article.dataset.slot = slot.slot;
+    const titleId = `library-slot-title-${slot.slot}`;
+    article.setAttribute("aria-labelledby", titleId);
+    const head = document.createElement("div"); head.className = "library-card-head";
+    const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo(slot.card || slot.slot));
+    const type = document.createElement("span"); type.className = "library-card-type"; type.id = titleId; type.textContent = slot.label;
+    head.append(logo, type);
+    if (!slot.empty && (slot.card.suspected_deprecated || slot.card.lifecycle_status === "suspected_deprecated" || slot.card.lifecycle_status === "deprecated")) {
+      const lifecycle = document.createElement("span"); lifecycle.className = "library-lifecycle-mark";
+      lifecycle.textContent = slot.card.lifecycle_status === "deprecated" ? "已废弃" : "疑似废弃"; head.append(lifecycle);
+    }
+    if (!slot.empty && slot.card.is_latest) {
+      const latest = document.createElement("span"); latest.className = "library-latest-mark"; latest.textContent = "最新"; head.append(latest);
+    }
+    article.append(head);
+    if (slot.empty) {
+      const name = document.createElement("h4"); name.className = "library-card-name is-empty"; name.textContent = `尚未添加${slot.label}`;
+      const hint = document.createElement("p"); hint.className = "library-card-hint"; hint.textContent = "添加后在这里展示最新版本，历史版本仍会完整保留。";
+      const actions = document.createElement("div"); actions.className = "library-card-actions";
+      const add = document.createElement("button"); add.type = "button"; add.className = "library-card-add"; add.dataset.sourceAction = "add-slot"; add.dataset.slot = slot.slot; add.textContent = `添加${slot.label}`;
+      actions.append(add); article.append(name, hint, actions);
+      return article;
+    }
+    const card = slot.card;
+    const name = document.createElement("h4"); name.className = "library-card-name"; name.textContent = sourceDisplayName(card);
+    const link = makeSourceOpenLink(card, sourceLinkText(card), "library-card-link");
+    const historyId = libraryHistoryId(card.group_id);
+    const subtitle = makeVersionToggle(slot.group, historyId);
+    const inspection = document.createElement("div"); inspection.className = "library-inspection";
+    inspection.append(makeInspectionStatus(card, false, slot.group.last_inspection_success_at));
+    const inspectionToggle = makeInspectionToggle(card); if (inspectionToggle) inspection.append(inspectionToggle);
+    const actions = document.createElement("div"); actions.className = "library-card-actions";
+    const addVersion = document.createElement("button"); addVersion.type = "button"; addVersion.className = "library-text-button"; addVersion.dataset.sourceAction = "add-version"; addVersion.dataset.groupId = card.group_id; addVersion.dataset.slot = slot.slot; addVersion.dataset.name = sourceDisplayName(card); addVersion.textContent = "添加新版本";
+    const open = makeSourceOpenLink(card, "打开", "library-text-button");
+    const lifecycle = document.createElement("button"); lifecycle.type = "button"; lifecycle.className = "library-text-button";
+    lifecycle.textContent = card.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
+    lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = card.id;
+    actions.append(addVersion, open, lifecycle);
+    article.append(name, link, subtitle, inspection, actions, makeVersionHistory(slot.group));
+    return article;
+  }
+  function sourceMetaLine(source) {
+    const line = document.createElement("span"); line.className = "library-row-meta";
+    const parts = [sourceCategory(source)];
     const readStatus = source.read_state || source.read_status || "not_checked";
-    const readLabels = { success: "读取成功", succeeded: "读取成功", complete: "读取成功", partial: "部分读取", failed: "读取失败", error: "读取失败", running: "正在读取", in_progress: "正在读取", not_checked: "尚未读取", not_read: "尚未读取", unknown: "读取状态未知" };
-    const readState = document.createElement("span"); readState.className = `source-kind source-read-state source-read-${escClass(readStatus)}`;
-    readState.textContent = readLabels[readStatus] || "读取状态未知";
-    const gaps = Array.isArray(source.read_gap) ? source.read_gap : source.read_gap ? [source.read_gap] : [];
-    if (gaps.length && ["failed", "error", "partial"].includes(readStatus)) readState.textContent += ` · 缺口：${gaps.map(item => typeof item === "string" ? item : item.description || item.message || JSON.stringify(item)).join("；")}`;
-    info.append(readState);
-    const attemptedAt = source.latest_read_attempt_at || source.last_read_at;
-    if (attemptedAt) { const attempted = document.createElement("span"); attempted.className = "source-kind"; attempted.textContent = `最近尝试读取 ${dateLabel(attemptedAt)}`; info.append(attempted); }
-    const successfulAt = source.last_successful_read_at;
-    if (successfulAt) { const succeeded = document.createElement("span"); succeeded.className = "source-kind"; succeeded.textContent = `上次成功读取 ${dateLabel(successfulAt)}`; info.append(succeeded); }
-    if (source.last_verified_at) { const checked = document.createElement("span"); checked.className = "source-kind"; checked.textContent = `最近核验 ${dateLabel(source.last_verified_at)}`; info.append(checked); }
-    if (source.overrides?.purpose || source.purpose) { const purpose = document.createElement("span"); purpose.className = "source-kind"; purpose.textContent = source.overrides?.purpose || source.purpose; info.append(purpose); }
-    if (source.type === "link" && source.url) {
-      const urlText = document.createElement("span"); urlText.className = "source-url"; urlText.textContent = source.url; info.append(urlText);
+    parts.push(libraryReadLabels[readStatus] || "读取状态未知");
+    if (source.suspected_deprecated || source.lifecycle_status === "suspected_deprecated") parts.push("疑似废弃");
+    else if (source.lifecycle_status === "deprecated") parts.push("已废弃");
+    if (source.verification_state === "verified") parts.push("已核验");
+    line.textContent = parts.join(" · ");
+    return line;
+  }
+  function makeSlotSelect(group) {
+    const select = document.createElement("select");
+    select.className = "library-slot-select";
+    select.dataset.sourceSlot = "true";
+    select.dataset.sourceId = group.card.id;
+    select.title = "设为固定资料";
+    select.setAttribute("aria-label", `设为固定资料：${sourceDisplayName(group.card)}`);
+    const options = [{ value: "", label: "其他来源" }, ...model.librarySlots.map(slot => ({ value: slot.id, label: slot.label }))];
+    for (const option of options) {
+      const node = document.createElement("option"); node.value = option.value; node.textContent = option.label; select.append(node);
     }
-    const actions = document.createElement("div"); actions.className = "source-row-actions";
-    const open = document.createElement("a"); open.className = "source-text-action"; open.textContent = "打开";
-    if (active) {
-      const openPath = source.type === "link" ? source.open_path : source.download_url;
-      const safeLocalPath = typeof openPath === "string" && /^\/api\/sources\/[A-Za-z0-9_-]{1,100}\/(?:open|file)$/.test(openPath);
-      if (safeLocalPath && source.type === "link" && safeHttpUrl(source.url || "")) {
-        open.href = source.url; open.target = "_blank"; open.rel = "noopener noreferrer";
-      } else if (safeLocalPath && source.type !== "link" && window.workbenchTransport?.openSource) {
-        open.href = "#";
-        open.addEventListener("click", event => { event.preventDefault(); window.workbenchTransport.openSource(source, openPath); });
-      } else { open.href = "#"; open.setAttribute("aria-disabled", "true"); open.addEventListener("click", event => event.preventDefault()); }
-      actions.append(open);
-    }
-    const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "source-text-action";
-    toggle.textContent = active ? "移出" : "恢复"; toggle.dataset.sourceAction = active ? "remove" : "restore"; toggle.dataset.sourceId = source.id;
-    const lifecycleOverride = document.createElement("button"); lifecycleOverride.type = "button"; lifecycleOverride.className = "source-text-action";
+    select.value = model.librarySlotLabels[group.slot] ? group.slot : "";
+    return select;
+  }
+  function makeOtherRow(group) {
+    const source = group.card;
+    const row = document.createElement("li");
+    row.className = "library-row";
+    row.dataset.groupId = group.group_id;
+    const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo(source));
+    const info = document.createElement("div"); info.className = "library-row-info";
+    const titleLine = document.createElement("div"); titleLine.className = "library-row-title";
+    const name = document.createElement("strong"); name.className = "library-row-name"; name.textContent = sourceDisplayName(source);
+    const type = document.createElement("span"); type.className = "library-type-pill"; type.textContent = group.slot ? model.librarySlotLabels[group.slot] : "其他来源";
+    titleLine.append(name, type);
+    const link = makeSourceOpenLink(source, sourceLinkText(source), "library-row-link");
+    const meta = document.createElement("div"); meta.className = "library-row-meta-line";
+    meta.append(sourceMetaLine(source), makeInspectionStatus(source, true, group.last_inspection_success_at));
+    const historyId = libraryHistoryId(group.group_id);
+    const subtitle = makeVersionToggle(group, historyId);
+    const history = makeVersionHistory(group);
+    info.append(titleLine, link, meta, subtitle, history);
+    const actions = document.createElement("div"); actions.className = "library-row-actions";
+    actions.append(makeSourceOpenLink(source, "打开", "library-text-button"));
+    const addVersion = document.createElement("button"); addVersion.type = "button"; addVersion.className = "library-text-button";
+    addVersion.textContent = "添加新版本"; addVersion.dataset.sourceAction = "add-version";
+    addVersion.dataset.groupId = group.group_id; addVersion.dataset.slot = group.slot || ""; addVersion.dataset.name = sourceDisplayName(source);
+    actions.append(addVersion);
+    const inspectionToggle = makeInspectionToggle(source); if (inspectionToggle) actions.append(inspectionToggle);
+    const lifecycleOverride = document.createElement("button"); lifecycleOverride.type = "button"; lifecycleOverride.className = "library-text-button";
     lifecycleOverride.textContent = source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
     lifecycleOverride.dataset.sourceAction = "nondeprecated"; lifecycleOverride.dataset.sourceId = source.id;
-    actions.append(lifecycleOverride, toggle); row.append(info, actions); return row;
+    const remove = document.createElement("button"); remove.type = "button"; remove.className = "library-text-button is-muted";
+    remove.textContent = "移出资料"; remove.title = "移出后可随时恢复"; remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = source.id;
+    actions.append(lifecycleOverride, remove, makeSlotSelect(group));
+    row.append(logo, info, actions);
+    return row;
+  }
+  function makeRemovedRow(source) {
+    const row = document.createElement("li");
+    row.className = "library-row is-removed";
+    const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo(source));
+    const info = document.createElement("div"); info.className = "library-row-info";
+    const name = document.createElement("strong"); name.className = "library-row-name"; name.textContent = sourceDisplayName(source);
+    const meta = document.createElement("span"); meta.className = "library-row-meta";
+    meta.textContent = `${sourceCategory(source)} · ${dateLabel(source.removed_at || source.updated_at, "已移出")}`;
+    info.append(name, meta);
+    const actions = document.createElement("div"); actions.className = "library-row-actions";
+    const restore = document.createElement("button"); restore.type = "button"; restore.className = "library-text-button";
+    restore.textContent = "恢复资料"; restore.dataset.sourceAction = "restore"; restore.dataset.sourceId = source.id;
+    const lifecycle = document.createElement("button"); lifecycle.type = "button"; lifecycle.className = "library-text-button";
+    lifecycle.textContent = source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
+    lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = source.id;
+    actions.append(restore, lifecycle);
+    row.append(logo, info, actions);
+    return row;
   }
   function renderSources() {
-    const active = state.sources.filter(source => source.status !== "removed" && source.active !== false);
-    const removed = state.sources.filter(source => source.status === "removed" || source.active === false);
-    $("#source-count").textContent = String(active.length);
-    $("#removed-source-count").textContent = String(removed.length);
-    $("#source-active-list").replaceChildren(...active.map(source => makeSourceRow(source, true)));
-    $("#source-removed-list").replaceChildren(...removed.map(source => makeSourceRow(source, false)));
-    $("#source-active-empty").hidden = active.length > 0;
-    $("#removed-sources-section").hidden = removed.length === 0;
+    const view = model.libraryView(state.sources);
+    $("#source-count").textContent = String(view.activeCount);
+    $("#other-source-count").textContent = String(view.others.length);
+    $("#removed-source-count").textContent = String(view.removed.length);
+    $("#library-slot-grid").replaceChildren(...view.slots.map(makeSlotCard));
+    $("#library-other-list").replaceChildren(...view.others.map(makeOtherRow));
+    $("#library-others-empty").hidden = view.others.length > 0;
+    $("#removed-sources-section").hidden = view.removed.length === 0;
+    $("#source-removed-list").replaceChildren(...view.removed.map(makeRemovedRow));
   }
   function sourceFeedback(message, kind = "") {
-    const feedback = $("#source-feedback"); feedback.textContent = message; feedback.className = `source-feedback${kind ? ` ${kind}` : ""}`;
+    const feedback = $("#source-feedback"); feedback.textContent = message; feedback.className = `source-feedback library-feedback${kind ? ` ${kind}` : ""}`;
   }
   function sourceError(payload, status) {
     const errors = {
-      source_duplicate: "这条来源已在清单中。", invalid_source_url: "链接格式无效，请使用 http 或 https 地址。",
-      invalid_source_category: "资料类别无效。", invalid_source_name: "请填写有效的来源名称。",
+      source_duplicate: "这条资料已在清单中。", invalid_source_url: "链接格式无效，请使用 http 或 https 地址。",
+      invalid_source_category: "资料类别无效。", invalid_source_name: "请填写有效的资料名称。",
       source_file_size_invalid: "文件为空或超过 15 MiB 大小限制。", unsupported_source_file_type: "当前文件类型不受支持。",
       source_file_type_mismatch: "文件内容与扩展名不符。", invalid_source_filename: "文件名无效。",
-      source_archive_limits_exceeded: "Office 文件内容超出安全限制。", macros_not_allowed: "含宏文件不能加入来源清单。",
-      source_text_must_be_utf8: "文本文件必须使用 UTF-8 编码。", source_not_found: "找不到这条来源，请刷新清单。",
-      source_file_unavailable: "托管文件暂时不可用。", payload_too_large: "文件超过上传请求大小限制。"
+      source_archive_limits_exceeded: "Office 文件内容超出安全限制。", macros_not_allowed: "含宏文件不能加入资料库。",
+      source_text_must_be_utf8: "文本文件必须使用 UTF-8 编码。", source_not_found: "找不到这条资料，请刷新资料库。",
+      source_file_unavailable: "托管文件暂时不可用。", payload_too_large: "文件超过上传请求大小限制。",
+      invalid_source_slot: "资料类型无效。", invalid_source_group: "资料版本组无效。", invalid_source_version: "版本说明无效。",
+      source_group_not_found: "找不到要追加版本的资料组，请刷新后重试。", source_group_slot_conflict: "该资料组已属于其他固定资料位。",
+      invalid_source_inspection: "巡检状态无效。"
     };
     return payload.message || errors[payload.error] || `操作失败，请重试（${payload.error || status}）`;
   }
@@ -550,17 +771,20 @@
   }
   async function loadSources() {
     try {
-      const data = await sourceRequest("/api/sources?include_removed=1");
+      const data = await sourceRequest("/api/sources?include_removed=1&all_versions=1");
       state.sources = Array.isArray(data.sources) ? data.sources : [];
-      renderSources(); sourceFeedback("来源清单已更新。");
+      renderSources(); sourceFeedback("资料库已更新。");
     } catch (error) {
-      sourceFeedback(error.message || "无法读取需求来源，请确认本地服务正常。", "error");
+      sourceFeedback(error.message || "无法读取资料库，请确认本地服务正常。", "error");
     }
   }
   function setSourcesBusy(busy, message = "") {
     state.sourcesBusy = busy;
-    ["#source-add-file", "#source-toggle-link", "#source-link-submit"].forEach(selector => { const button = $(selector); if (button) button.disabled = busy; });
+    ["#source-add-file", "#source-link-submit", "#library-add-cancel", "#library-file-clear", "#library-add-slot"].forEach(selector => {
+      const control = $(selector); if (control) control.disabled = busy || (selector === "#library-add-slot" && !!state.libraryGroup);
+    });
     $$("[data-source-action]").forEach(button => { button.disabled = busy; });
+    $$("[data-source-slot]").forEach(select => { select.disabled = busy; });
     if (message) sourceFeedback(message, busy ? "busy" : "");
   }
   async function encodeFile(file) {
@@ -569,52 +793,143 @@
     for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
     return btoa(binary);
   }
-  async function uploadSourceFile(file) {
-    if (!file) return;
-    const maxBytes = 15 * 1024 * 1024;
-    if (file.size > maxBytes) { sourceFeedback("文件超过 15 MiB，请选择更小的文件。", "error"); return; }
-    setSourcesBusy(true, `正在添加“${file.name}”…`);
-    try {
-      const content_base64 = await encodeFile(file);
-      await sourceRequest("/api/sources/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: file.name, content_base64 }) });
-      await loadSources(); sourceFeedback(`已添加文件“${file.name}”。`);
-    } catch (error) { sourceFeedback(error.message || "文件添加失败，请重试。", "error"); }
-    finally { setSourcesBusy(false); $("#source-file-input").value = ""; }
+  function selectLibraryFile(file) {
+    state.libraryFile = file || null;
+    $("#library-file-name").textContent = file ? file.name : "未选择文件";
+    $("#library-file-clear").hidden = !file;
   }
-  async function submitSourceLink(event) {
+  function openLibraryAdd({ slot = "", group = null, name = "" } = {}) {
+    state.libraryGroup = group ? { group_id: group.group_id, slot: group.slot || slot, name: group.name || name } : null;
+    const displayName = state.libraryGroup?.name || name || "";
+    selectLibraryFile(null);
+    $("#source-file-input").value = "";
+    $("#source-link-name").value = displayName;
+    $("#source-link-url").value = "";
+    $("#library-add-version").value = "";
+    $("#library-add-slot").value = state.libraryGroup?.slot || slot || "";
+    $("#library-add-slot").disabled = !!state.libraryGroup;
+    const context = $("#library-add-context");
+    context.hidden = !state.libraryGroup;
+    context.textContent = state.libraryGroup
+      ? `新版本将加入「${displayName || "当前资料"}」，资料类型保持为${model.librarySlotLabels[state.libraryGroup.slot] || "其他来源"}。`
+      : "";
+    $("#library-add-fold").open = true;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    $("#library-add-fold").scrollIntoView({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
+    $("#source-link-name").focus({ preventScroll: true });
+  }
+  function resetLibraryAdd(close = true) {
+    state.libraryGroup = null;
+    selectLibraryFile(null);
+    $("#source-link-form").reset();
+    $("#library-add-slot").disabled = false;
+    $("#library-add-context").hidden = true;
+    if (close) $("#library-add-fold").open = false;
+  }
+  async function submitLibraryEntry(event) {
     event.preventDefault();
-    const name = $("#source-link-name").value.trim(), url = $("#source-link-url").value.trim(), category = $("#source-link-category").value;
-    if (!name || !url) { sourceFeedback("请填写名称和链接。", "error"); return; }
-    if (!safeHttpUrl(url)) { sourceFeedback("链接格式无效，请使用 http 或 https 地址。", "error"); return; }
-    setSourcesBusy(true, "正在添加链接…");
+    if (state.sourcesBusy) return;
+    const file = state.libraryFile;
+    const group = state.libraryGroup;
+    const name = $("#source-link-name").value.trim();
+    const url = $("#source-link-url").value.trim();
+    if (!file && !name) { sourceFeedback("请填写资料名称。", "error"); return; }
+    if (!file && !url) { sourceFeedback("请填写资料链接，或选择一个文件。", "error"); return; }
+    if (!file && !safeHttpUrl(url)) { sourceFeedback("链接格式无效，请使用 http 或 https 地址。", "error"); return; }
+    if (file && file.size > 15 * 1024 * 1024) { sourceFeedback("文件超过 15 MiB，请选择更小的文件。", "error"); return; }
+    const slot = group?.slot || $("#library-add-slot").value || null;
+    const versionLabel = $("#library-add-version").value.trim() || null;
+    const category = slot && model.librarySlotLabels[slot] ? model.librarySlotLabels[slot] : "其他资料";
+    setSourcesBusy(true, file ? `正在添加“${file.name}”…` : "正在添加资料…");
     try {
-      await sourceRequest("/api/sources/link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, url, category }) });
-      $("#source-link-name").value = ""; $("#source-link-url").value = ""; $("#source-link-form").hidden = true; $("#source-toggle-link").setAttribute("aria-expanded", "false");
-      await loadSources(); sourceFeedback("已添加需求来源链接。");
-    } catch (error) { sourceFeedback(error.message || "链接添加失败，请重试。", "error"); }
+      if (file) {
+        const content_base64 = await encodeFile(file);
+        await sourceRequest("/api/sources/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          filename: file.name, content_base64, category, name: name || file.name, slot, group_id: group?.group_id || null, version_label: versionLabel
+        }) });
+      } else {
+        await sourceRequest("/api/sources/link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          name, url, category, slot, group_id: group?.group_id || null, version_label: versionLabel
+        }) });
+      }
+      await loadSources();
+      sourceFeedback(file ? `已添加文件“${file.name}”。` : "已添加资料。");
+      resetLibraryAdd();
+    } catch (error) {
+      sourceFeedback(error.message || "资料添加失败，请重试。", "error");
+    } finally {
+      setSourcesBusy(false);
+    }
+  }
+  async function toggleSourceInspection(sourceId) {
+    const source = state.sources.find(item => item.id === sourceId);
+    if (!source || state.sourcesBusy) return;
+    const enabled = !(source.inspection_enabled === true);
+    setSourcesBusy(true, enabled ? "正在加入巡检…" : "正在移出巡检…");
+    try {
+      await sourceRequest(`/api/sources/${encodeURIComponent(sourceId)}/inspection`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) });
+      await loadSources();
+      sourceFeedback(enabled ? "已加入巡检。" : "已移出巡检。");
+    } catch (error) { sourceFeedback(error.message || "巡检状态更新失败，请重试。", "error"); }
+    finally { setSourcesBusy(false); }
+  }
+  async function changeSourceSlot(sourceId, slot) {
+    if (state.sourcesBusy) return;
+    setSourcesBusy(true, "正在更新资料类型…");
+    try {
+      await sourceRequest(`/api/sources/${encodeURIComponent(sourceId)}/slot`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slot: slot || null }) });
+      await loadSources(); sourceFeedback(slot ? "资料已归入固定资料位。" : "资料已移到其他来源。");
+    } catch (error) { sourceFeedback(error.message || "资料类型更新失败，请重试。", "error"); }
     finally { setSourcesBusy(false); }
   }
   async function changeSourceActive(sourceId, action) {
     if (state.sourcesBusy) return;
     const route = `/api/sources/${encodeURIComponent(sourceId)}${action === "restore" ? "/restore" : ""}`;
-    setSourcesBusy(true, action === "restore" ? "正在恢复来源…" : "正在移出清单…");
+    setSourcesBusy(true, action === "restore" ? "正在恢复资料…" : "正在移出资料…");
     try {
       if (action === "restore") await sourceRequest(route, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       else await sourceRequest(route, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: "{}" });
-      await loadSources(); sourceFeedback(action === "restore" ? "来源已恢复到清单。" : "来源已移出清单，可在下方恢复。");
-    } catch (error) { sourceFeedback(error.message || "来源状态更新失败，请重试。", "error"); }
+      await loadSources(); sourceFeedback(action === "restore" ? "资料已恢复。" : "资料已移出，可在下方恢复。");
+    } catch (error) { sourceFeedback(error.message || "资料状态更新失败，请重试。", "error"); }
     finally { setSourcesBusy(false); }
   }
   async function setSourceLifecycle(sourceId) {
     const source = state.sources.find(item => item.id === sourceId);
     if (!source || state.sourcesBusy) return;
     const lifecycleOverride = source.lifecycle_override === "active" ? null : "active";
-    setSourcesBusy(true, lifecycleOverride ? "正在锁定来源为非废弃…" : "正在取消来源状态锁定…");
+    setSourcesBusy(true, lifecycleOverride ? "正在锁定资料为非废弃…" : "正在取消资料状态锁定…");
     try {
       await sourceRequest(`/api/sources/${encodeURIComponent(sourceId)}/lifecycle`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lifecycle_override: lifecycleOverride }) });
-      await loadSources(); sourceFeedback(lifecycleOverride ? "来源已设为非废弃并锁定。" : "来源状态锁定已取消。");
-    } catch (error) { sourceFeedback(error.message || "来源状态更新失败。", "error"); }
+      await loadSources(); sourceFeedback(lifecycleOverride ? "资料已设为非废弃并锁定。" : "资料状态锁定已取消。");
+    } catch (error) { sourceFeedback(error.message || "资料状态更新失败。", "error"); }
     finally { setSourcesBusy(false); }
+  }
+  function handleSourceAction(button) {
+    if (!button) return;
+    if (button.dataset.sourceAction === "nondeprecated") return setSourceLifecycle(button.dataset.sourceId);
+    if (button.dataset.sourceAction === "inspection") return toggleSourceInspection(button.dataset.sourceId);
+    if (button.dataset.sourceAction === "remove" || button.dataset.sourceAction === "restore") return changeSourceActive(button.dataset.sourceId, button.dataset.sourceAction);
+    if (button.dataset.sourceAction === "add-slot") return openLibraryAdd({ slot: button.dataset.slot || "" });
+    if (button.dataset.sourceAction === "add-version") return openLibraryAdd({
+      slot: button.dataset.slot || "", group: { group_id: button.dataset.groupId, slot: button.dataset.slot || null, name: button.dataset.name || "" }
+    });
+  }
+  function handleLibraryClick(event) {
+    const versionToggle = event.target.closest("[data-library-versions]");
+    if (versionToggle) {
+      const groupId = versionToggle.dataset.libraryVersions;
+      if (state.libraryExpanded.has(groupId)) state.libraryExpanded.delete(groupId);
+      else state.libraryExpanded.add(groupId);
+      renderSources();
+      const focusTarget = $$("[data-library-versions]").find(button => button.dataset.libraryVersions === groupId);
+      focusTarget?.focus({ preventScroll: true });
+      return;
+    }
+    handleSourceAction(event.target.closest("[data-source-action]"));
+  }
+  function handleLibrarySlotChange(event) {
+    const select = event.target.closest("[data-source-slot]");
+    if (select) changeSourceSlot(select.dataset.sourceId, select.value || null);
   }
   function updateThemeButton() {
     const theme = document.body.dataset.theme || "minimal";
@@ -674,18 +989,43 @@
     const article = document.createElement("article");
     article.dataset.recordId = record.id;
     const pin = document.createElement("span"); pin.className = "pushpin"; pin.setAttribute("aria-hidden", "true"); article.append(pin);
-    const done = isCompleted(record), cancelled = isCancelled(record), terminal = done || cancelled, busy = state.busy.has(record.id);
-    article.className = `record-card${terminal ? " record-completed record-terminal" : ""}${cancelled ? " record-cancelled" : ""}${record.transfer_disposition === "transfer_pending" ? " transfer-pending" : ""}${busy ? " is-busy" : ""}`;
+    const ownerChanged = isOwnerChanged(record);
+    const done = isCompleted(record) || ownerChanged, cancelled = isCancelled(record), terminal = done || cancelled, busy = state.busy.has(record.id);
+    const pendingRelease = effectiveStatus(record) === "pending_release";
+    article.className = `record-card${terminal ? " record-completed record-terminal" : ""}${cancelled ? " record-cancelled" : ""}${pendingRelease ? " record-pending-release" : ""}${record.transfer_disposition === "transfer_pending" ? " transfer-pending" : ""}${busy ? " is-busy" : ""}`;
     const head = document.createElement("div"); head.className = "record-head";
     const idLabel = document.createElement("span"); idLabel.className = "record-id"; idLabel.textContent = record.display_id || record.id; idLabel.title = record.display_id && record.display_id !== record.id ? `原始编号：${record.id}` : record.id; head.append(idLabel);
     const status = document.createElement("span"); status.className = `status-pill ${record.transfer_disposition === "transfer_pending" ? "transfer-pending" : escClass(record.type === "bug" ? (record.platform_status || record.status) : effectiveStatus(record))}`;
     const statusCode = effectiveStatus(record);
-    status.textContent = record.transfer_disposition === "transfer_pending" ? "待转交" : record.transfer_disposition === "transferred" ? "已转交" : cancelled ? "已取消" : done ? "已完成" : statusLabel(statusCode === "in_progress" || statusCode === "on_hold" || record.type === "task" ? statusCode : sourceStatus(record)); head.append(status);
+    status.textContent = record.transfer_disposition === "transfer_pending" ? "待转交" : record.transfer_disposition === "transferred" ? "责任转移" : ownerChanged ? "责任人变更" : cancelled ? "已取消" : done ? "已完成" : statusLabel(["in_progress", "developing", "testing", "on_hold", "pending_release"].includes(statusCode) || record.type === "task" ? statusCode : sourceStatus(record)); head.append(status);
+    const chip = model.workflowChip(record);
+    if (chip) {
+      const stageChip = document.createElement("span");
+      stageChip.className = "stage-chip"; stageChip.dataset.stage = chip.stageId; stageChip.dataset.status = chip.status;
+      // 展示层：把流程阶段写成“第 n/6 阶段 + 名称”，并用六格细轨标出位置；
+      // 不改变阶段数据、状态机或详情里的 stepper。
+      const stages = model.workflowStagesFallback || [];
+      const stageIndex = stages.findIndex(stage => stage.id === chip.stageId);
+      const stageTotal = stages.length;
+      const stagePosition = stageIndex >= 0 ? `${stageIndex + 1}/${stageTotal}` : "";
+      const stageNote = chip.status === "rework" ? ` · ${chip.statusLabel}` : "";
+      const stageTitle = stagePosition ? chip.title.replace("流水线：", `流水线第 ${stageIndex + 1}/${stageTotal} 阶段：`) : chip.title;
+      stageChip.textContent = `${stagePosition ? `阶段 ${stagePosition} · ` : "阶段 · "}${chip.label}${stageNote}`;
+      stageChip.title = stageTitle; stageChip.setAttribute("aria-label", stageTitle);
+      if (stagePosition) {
+        const rail = document.createElement("span"); rail.className = "stage-rail"; rail.setAttribute("aria-hidden", "true");
+        for (let index = 0; index < stageTotal; index += 1) {
+          const tick = document.createElement("i"); if (index <= stageIndex) tick.className = "is-on"; rail.append(tick);
+        }
+        stageChip.append(rail);
+      }
+      head.append(stageChip);
+    }
     const open = document.createElement("button"); open.type = "button"; open.className = "record-title-button"; open.dataset.openRecord = record.id; open.setAttribute("aria-label", `查看详情：${record.title}`);
     const title = document.createElement("span"); title.className = "record-title"; title.textContent = record.title; open.append(title);
     const summary = document.createElement("p"); summary.className = "card-summary"; summary.textContent = record.latest_brief || cardBrief(record);
     article.append(head, open, summary);
-    if (effectiveStatus(record) === "in_progress" && record.current_agent_session_id) {
+    if (["in_progress", "developing", "testing"].includes(effectiveStatus(record)) && record.current_agent_session_id) {
       const processing = document.createElement("p"); processing.className = "agent-processing";
       processing.textContent = `${txt(record.current_agent_name, "Agent")}正在处理中`;
       article.append(processing);
@@ -782,7 +1122,7 @@
     currentSection.hidden = !currentBatchId || currentTasks.length === 0;
     const currentEnded = currentBatchTasks.length > 0 && currentBatchTasks.every(isTerminal);
     const currentComplete = currentEnded && currentBatchTasks.every(isCompleted);
-    $("#task-current-state").textContent = current ? (currentComplete ? "本批已完成" : currentEnded ? "本批已结束" : "正在处理") : "批次状态同步中";
+    $("#task-current-state").textContent = current ? (currentComplete ? "已完成" : currentEnded ? "已结束" : "正在处理") : "状态同步中";
     $("#task-current-state").className = currentEnded ? "task-batch-state is-complete" : "task-batch-state";
     populateMasonryList($("#task-current-records"), sortTaskRecords(currentTasks).map(record => makeTaskCard(record, true)));
 
@@ -836,8 +1176,11 @@
     setText("#revision", `r${state.data.revision ?? 0}`);
     const selected = findRecord(state.selectedId);
     if (selected && $("#record-dialog").open) {
+      const cachedWorkflow = state.workflows.get(selected.id);
+      if (cachedWorkflow && !cachedWorkflow.unavailable && cachedWorkflow.record_revision !== undefined && String(cachedWorkflow.record_revision) !== String(selected.revision)) state.workflows.delete(selected.id);
       renderDetail(selected); detail.scrollTop = detailScroll;
       if (detailFocus) $(`[data-dialog-focus="${CSS.escape(detailFocus)}"]`, detail)?.focus({ preventScroll: true });
+      loadItemWorkflow(selected);
     }
     for (const node of $$("details")) {
       const key = node.dataset.preserveKey || node.id;
@@ -1051,6 +1394,275 @@
     if (Array.isArray(item.evidence) && item.evidence.length) parts.push(`证据：${item.evidence.map(txt).join("；")}`);
     return parts.filter(Boolean).join(" · ");
   }
+  const cssSafe = value => String(value || "").replace(/[^a-z0-9_-]/gi, "_");
+  const workflowPanelId = (recordId, stageId) => `workflow-panel-${cssSafe(recordId)}-${cssSafe(stageId)}`;
+  function workflowGlyph(status) { return ({ done: "✓", active: "●", pending: "○", blocked: "⚠", rework: "↺" })[status] || "○"; }
+
+  function makeWorkflowSection(record) {
+    const section = document.createElement("section");
+    section.className = "detail-workflow";
+    section.dataset.workflowSection = record.id;
+    section.setAttribute("aria-labelledby", `workflow-title-${cssSafe(record.id)}`);
+    if (!state.workflowEntered.has(record.id)) { state.workflowEntered.add(record.id); section.classList.add("workflow-enter"); }
+    renderWorkflowInto(section, record);
+    return section;
+  }
+  function workflowRetryButton(record) {
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "workflow-retry"; button.dataset.workflowRetry = record.id; button.textContent = "重试读取";
+    return button;
+  }
+  function renderWorkflowInto(section, record) {
+    const detail = $("#detail");
+    const scrollTop = detail ? detail.scrollTop : 0;
+    const focusedStage = document.activeElement?.dataset?.workflowStage || "";
+    const view = model.workflowView(record, state.workflows.get(record.id) || null);
+    const nodes = [];
+    const header = document.createElement("div"); header.className = "workflow-head";
+    const title = document.createElement("h3"); title.id = `workflow-title-${cssSafe(record.id)}`; title.textContent = "流水线";
+    header.append(title);
+    if (view.enabled) {
+      const meta = document.createElement("span"); meta.className = "workflow-head-meta";
+      meta.textContent = `第 ${view.stageIndex || 1} / ${view.stageCount} 步 · ${view.statusLabel}`;
+      header.append(meta);
+      if (view.reworkCount > 0) { const badge = document.createElement("span"); badge.className = "workflow-rework-badge"; badge.textContent = `退回 ×${view.reworkCount}`; header.append(badge); }
+    }
+    nodes.push(header);
+    if (!view.enabled) {
+      const empty = document.createElement("div"); empty.className = "workflow-disabled";
+      const emptyTitle = document.createElement("p"); emptyTitle.className = "workflow-disabled-title"; emptyTitle.textContent = "未启用标准流程";
+      const hint = document.createElement("p"); hint.className = "workflow-disabled-hint";
+      hint.textContent = view.detailState === "unavailable"
+        ? "流程接口暂时不可用，无法确认是否已启用，可稍后重试。"
+        : "这条记录创建于流水线启用之前。启用后从“接单/立项”开始，由 Lead 决定后续推进，不会自动填写内容。";
+      const start = document.createElement("button"); start.type = "button"; start.className = "workflow-start"; start.dataset.workflowStart = record.id;
+      const busy = state.workflowBusy.has(record.id);
+      start.textContent = busy ? "启用中…" : "启用标准流程"; start.disabled = busy;
+      empty.append(emptyTitle, hint, start);
+      if (view.detailState === "unavailable") empty.append(workflowRetryButton(record));
+      nodes.push(empty);
+      section.dataset.state = "disabled";
+    } else {
+      const selectedStage = state.workflowStage.get(record.id) || view.stageId;
+      const list = document.createElement("ol"); list.className = "workflow-steps"; list.setAttribute("aria-label", "六阶段流水线");
+      view.steps.forEach((step, index) => {
+        const item = document.createElement("li");
+        item.className = "workflow-step"; item.dataset.status = step.status; item.dataset.stage = step.id;
+        item.style.setProperty("--workflow-delay", String(index));
+        if (step.current) item.setAttribute("aria-current", "step");
+        const button = document.createElement("button"); button.type = "button"; button.className = "workflow-step-button";
+        button.dataset.workflowStage = step.id; button.dataset.dialogFocus = `workflow-${cssSafe(step.id)}`;
+        button.setAttribute("aria-expanded", String(step.id === selectedStage));
+        button.setAttribute("aria-controls", workflowPanelId(record.id, step.id));
+        button.setAttribute("aria-label", `第 ${step.index} 步 ${step.label}，负责人 ${step.owner}，${step.statusLabel}${step.current ? "，当前阶段" : ""}`);
+        const marker = document.createElement("span"); marker.className = "workflow-step-marker"; marker.setAttribute("aria-hidden", "true");
+        const markerIndex = document.createElement("span"); markerIndex.className = "workflow-step-index"; markerIndex.textContent = String(step.index); marker.append(markerIndex);
+        const copy = document.createElement("span"); copy.className = "workflow-step-copy";
+        const label = document.createElement("span"); label.className = "workflow-step-label"; label.textContent = step.short || step.label;
+        const owner = document.createElement("span"); owner.className = "workflow-step-owner"; owner.textContent = step.owner; owner.title = step.owner;
+        const stateRow = document.createElement("span"); stateRow.className = "workflow-step-state"; stateRow.dataset.status = step.status;
+        const glyph = document.createElement("span"); glyph.className = "workflow-step-glyph"; glyph.setAttribute("aria-hidden", "true"); glyph.textContent = workflowGlyph(step.status);
+        const stateText = document.createElement("span"); stateText.textContent = step.statusLabel;
+        stateRow.append(glyph, stateText);
+        copy.append(label, owner, stateRow);
+        button.append(marker, copy);
+        item.append(button);
+        list.append(item);
+      });
+      nodes.push(list);
+      if (view.detailState === "pending") {
+        const loading = document.createElement("p"); loading.className = "workflow-loading"; loading.setAttribute("role", "status");
+        loading.textContent = "正在读取流程详情…"; nodes.push(loading);
+      } else if (view.detailState === "unavailable") {
+        const failed = document.createElement("p"); failed.className = "workflow-loading is-error"; failed.setAttribute("role", "status");
+        failed.textContent = "流程详情暂时读取失败，仅显示列表摘要。"; failed.append(workflowRetryButton(record)); nodes.push(failed);
+      }
+      const panels = document.createElement("div"); panels.className = "workflow-panels";
+      view.steps.forEach(step => panels.append(makeWorkflowStagePanel(record, step, step.id === selectedStage)));
+      nodes.push(panels);
+      if (view.history.length) nodes.push(makeWorkflowHistory(record, view));
+      section.dataset.state = view.stageStatus || "unknown";
+    }
+    section.replaceChildren(...nodes);
+    if (detail && detail.contains(section)) detail.scrollTop = scrollTop;
+    if (focusedStage) $(`[data-workflow-stage="${CSS.escape(focusedStage)}"]`, section)?.focus({ preventScroll: true });
+  }
+  function makeWorkflowStagePanel(record, step, open) {
+    const panel = document.createElement("div");
+    panel.className = "workflow-stage-panel"; panel.id = workflowPanelId(record.id, step.id); panel.dataset.stage = step.id; panel.hidden = !open;
+    const meta = document.createElement("p"); meta.className = "workflow-stage-meta";
+    const addMeta = (name, value) => {
+      const item = document.createElement("span"); item.className = "workflow-meta-item";
+      const key = document.createElement("span"); key.textContent = name;
+      const strong = document.createElement("strong"); strong.textContent = value;
+      item.append(key, strong); meta.append(item);
+    };
+    addMeta(step.current ? "当前阶段" : "阶段", step.label);
+    addMeta("负责人", step.owner);
+    addMeta("下一步", step.nextLabel);
+    if (!step.current) addMeta("状态", step.statusLabel);
+    panel.append(meta);
+    if (step.current) {
+      const lockRow = document.createElement("div"); lockRow.className = "workflow-lock";
+      const label = document.createElement("span"); label.className = "workflow-lock-label";
+      const detail = document.createElement("span"); detail.className = "workflow-lock-detail";
+      if (step.lock) {
+        lockRow.dataset.state = step.lock.expired ? "expired" : "locked";
+        label.textContent = step.lock.expired ? "锁已过期" : "已锁定";
+        detail.textContent = step.lock.expired
+          ? `${step.lock.actor || "未知"} · ${step.lock.roleLabel} · 可接管`
+          : `${step.lock.actor || "未知"} · ${step.lock.roleLabel} · 剩余 ${step.lock.remainingMinutes} 分钟`;
+        lockRow.title = step.lock.expiresAt ? `锁定到期：${step.lock.expiresAt}` : "";
+      } else {
+        lockRow.dataset.state = "unlocked";
+        label.textContent = "未锁定";
+        detail.textContent = `等待 ${step.owner} 接手`;
+      }
+      lockRow.append(label, detail); panel.append(lockRow);
+    }
+    if (step.substeps.length) {
+      const subBox = document.createElement("div"); subBox.className = "workflow-stage-substeps-box";
+      const subTitle = document.createElement("h4"); subTitle.textContent = "子步骤";
+      const subList = document.createElement("ul"); subList.className = "workflow-stage-substeps";
+      subList.setAttribute("aria-label", `${step.label}子步骤`);
+      step.substeps.forEach(sub => {
+        const subItem = document.createElement("li"); subItem.dataset.status = sub.status;
+        const subIndex = document.createElement("span"); subIndex.className = "workflow-substep-index"; subIndex.textContent = sub.indexLabel;
+        const subLabel = document.createElement("span"); subLabel.className = "workflow-substep-label"; subLabel.textContent = sub.label;
+        const subRole = document.createElement("span"); subRole.className = "workflow-substep-role"; subRole.textContent = sub.roleLabel;
+        const subState = document.createElement("span"); subState.className = "workflow-substep-state"; subState.textContent = sub.statusLabel;
+        subItem.append(subIndex, subLabel, subRole, subState);
+        subList.append(subItem);
+      });
+      subBox.append(subTitle, subList); panel.append(subBox);
+    }
+    const gates = document.createElement("div"); gates.className = "workflow-gates-box";
+    const gatesTitle = document.createElement("h4"); gatesTitle.textContent = "阶段输出";
+    const gateList = document.createElement("ul"); gateList.className = "workflow-gates"; gateList.setAttribute("aria-label", `${step.label}阶段输出检查`);
+    if (!step.checklist.length) {
+      const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = "unknown";
+      const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = "·";
+      const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = "该阶段未定义输出要求";
+      item.append(mark, name); gateList.append(item);
+    }
+    step.checklist.forEach(gate => {
+      const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = gate.done === null ? "unknown" : String(gate.done);
+      const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = gate.done === null ? "·" : gate.done ? "✓" : "✗";
+      const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = gate.label;
+      const stateText = document.createElement("span"); stateText.className = "workflow-gate-state"; stateText.textContent = gate.done === null ? "未取得" : gate.done ? "已完成" : "缺失";
+      item.append(mark, name, stateText); gateList.append(item);
+    });
+    gates.append(gatesTitle, gateList); panel.append(gates);
+    const note = document.createElement("div"); note.className = "workflow-note";
+    const noteLabel = document.createElement("span"); noteLabel.className = "workflow-note-label"; noteLabel.textContent = "最近记录";
+    const noteText = document.createElement("p"); noteText.className = "workflow-note-text";
+    noteText.textContent = step.note || (step.at || step.actor ? "该阶段暂无文字说明。" : "尚未记录阶段说明。");
+    note.append(noteLabel, noteText);
+    if (step.note && (step.actor || step.at || step.roleLabel)) {
+      const who = document.createElement("span"); who.className = "workflow-note-meta";
+      who.textContent = [step.actor, step.roleLabel, step.at ? dateLabel(step.at) : ""].filter(Boolean).join(" · ");
+      note.append(who);
+    }
+    if (step.evidence.length) {
+      const evidence = document.createElement("ul"); evidence.className = "workflow-evidence"; evidence.setAttribute("aria-label", "证据");
+      step.evidence.forEach(value => { const item = document.createElement("li"); item.textContent = value; evidence.append(item); });
+      note.append(evidence);
+    }
+    panel.append(note);
+    return panel;
+  }
+  function makeWorkflowHistory(record, view) {
+    const fold = document.createElement("details"); fold.className = "detail-history-fold workflow-history"; fold.dataset.preserveKey = `workflow-history-${record.id}`;
+    const summary = document.createElement("summary"); summary.textContent = `阶段历史（${view.history.length}）`; summary.dataset.dialogFocus = "workflow-history";
+    const body = document.createElement("div"); body.className = "detail-history-body";
+    const list = document.createElement("ol"); list.className = "workflow-history-list";
+    [...view.history].reverse().forEach(item => {
+      const row = document.createElement("li"); row.className = "workflow-history-row"; row.dataset.action = item.action;
+      const head = document.createElement("p"); head.className = "workflow-history-head";
+      const time = document.createElement("time"); time.className = "workflow-history-time"; time.textContent = dateLabel(item.at, "时间未记录"); if (item.at) time.dateTime = item.at;
+      const action = document.createElement("span"); action.className = "workflow-history-action"; action.textContent = item.actionLabel;
+      const who = document.createElement("span"); who.className = "workflow-history-who"; who.textContent = [item.actor, item.roleLabel, item.stageLabel].filter(Boolean).join(" · ");
+      head.append(time, action, who); row.append(head);
+      if (item.note) { const note = document.createElement("p"); note.className = "workflow-history-note"; note.textContent = item.note; row.append(note); }
+      if (item.evidence.length) {
+        const evidence = document.createElement("ul"); evidence.className = "workflow-evidence"; evidence.setAttribute("aria-label", "证据");
+        item.evidence.forEach(value => { const li = document.createElement("li"); li.textContent = value; evidence.append(li); });
+        row.append(evidence);
+      }
+      list.append(row);
+    });
+    body.append(list); fold.append(summary, body);
+    return fold;
+  }
+  function selectWorkflowStage(button) {
+    const section = button.closest("[data-workflow-section]");
+    if (!section) return;
+    const recordId = section.dataset.workflowSection, stageId = button.dataset.workflowStage;
+    state.workflowStage.set(recordId, stageId);
+    $$("[data-workflow-stage]", section).forEach(node => node.setAttribute("aria-expanded", String(node.dataset.workflowStage === stageId)));
+    $$(".workflow-stage-panel", section).forEach(panel => { panel.hidden = panel.dataset.stage !== stageId; });
+  }
+  async function loadItemWorkflow(record) {
+    const id = record.id;
+    if (state.workflows.has(id)) return null;
+    if (state.workflowRequests.has(id)) return state.workflowRequests.get(id);
+    const operation = (async () => {
+      let payload = null;
+      try {
+        const response = await fetch(`/api/items/${encodeURIComponent(id)}/workflow`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        payload = await response.json();
+        if (!payload || typeof payload !== "object") throw new Error("invalid_payload");
+      } catch (_) {
+        payload = { unavailable: true };
+      }
+      state.workflows.set(id, payload);
+      state.workflowRequests.delete(id);
+      const current = findRecord(id) || record;
+      const section = $(`[data-workflow-section="${CSS.escape(id)}"]`, $("#detail"));
+      if (section && state.selectedId === id && $("#record-dialog").open) renderWorkflowInto(section, current);
+      return payload;
+    })();
+    state.workflowRequests.set(id, operation);
+    return operation;
+  }
+  function retryWorkflow(id) {
+    state.workflows.delete(id);
+    const record = findRecord(id);
+    const section = $(`[data-workflow-section="${CSS.escape(id)}"]`, $("#detail"));
+    if (record && section) renderWorkflowInto(section, record);
+    if (record) loadItemWorkflow(record);
+  }
+  async function startWorkflow(button) {
+    const id = button.dataset.workflowStart, record = findRecord(id);
+    if (!record || state.workflowBusy.has(id)) return;
+    state.workflowBusy.add(id); button.disabled = true; button.textContent = "启用中…";
+    try {
+      const response = await fetch(`/api/items/${encodeURIComponent(id)}/workflow/start`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ template_id: record.type === "bug" ? "bug-standard" : "dev-standard", actor_role: "lead", actor: "user", expected_revision: record.revision })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const errors = { record_not_found: "找不到该事项", workflow_terminal: "流程已结束", invalid_role: "当前角色不能启动流程", revision_conflict: "事项已更新，请刷新后重试" };
+        throw new Error(payload.message || errors[payload.error] || (response.status === 404 || response.status === 405 || response.status === 501 ? "当前服务版本还不支持流水线接口" : `启用失败（${payload.error || response.status}）`));
+      }
+      if (payload.record && typeof payload.record === "object") Object.assign(record, payload.record);
+      if (payload.workflow && typeof payload.workflow === "object") state.workflows.set(id, { workflow: payload.workflow, template: payload.template || null });
+      else state.workflows.delete(id);
+      state.workflowStage.delete(id);
+      showToast("已启用标准流程");
+      await refresh();
+      const current = findRecord(id) || record;
+      const section = $(`[data-workflow-section="${CSS.escape(id)}"]`, $("#detail"));
+      if (section && state.selectedId === id) renderWorkflowInto(section, current);
+      if (!state.workflows.has(id)) await loadItemWorkflow(current);
+    } catch (error) {
+      showToast(error.message || "启用失败，请重试", "error");
+      if (button.isConnected) { button.disabled = false; button.textContent = "启用标准流程"; }
+    } finally { state.workflowBusy.delete(id); }
+  }
+
   function renderDetail(record) {
     const detail = $("#detail"); detail.replaceChildren();
     const head = document.createElement("div"); head.className = "detail-head";
@@ -1091,7 +1703,7 @@
       gap.textContent = "交接信息还不完整，详情及历史记录中可能有更多依据。"; overviewGrid.append(gap);
     }
     overview.append(overviewTitle, conclusion, overviewGrid);
-    detail.append(head, statusLine, overview);
+    detail.append(head, statusLine, makeWorkflowSection(record), overview);
     const followupSummary = model.summarizeFollowups(followups(record));
     if (followupSummary.activeCount) {
       const activeBox = document.createElement("section"); activeBox.className = "active-followup-summary";
@@ -1168,7 +1780,7 @@
   }
   function openDetail(id) {
     const record = findRecord(id); if (!record) return;
-    state.selectedId = id; renderDetail(record); $("#record-dialog").showModal();
+    state.selectedId = id; renderDetail(record); $("#record-dialog").showModal(); loadItemWorkflow(record);
   }
   async function loadItemContext(record) {
     const id = record.id, expectedRevision = String(record.revision ?? "unversioned");
@@ -1361,21 +1973,15 @@
   $("#sources-close").addEventListener("click", () => $("#sources-dialog").close());
   $("#sources-dialog").addEventListener("click", event => { if (event.target === $("#sources-dialog")) $("#sources-dialog").close(); });
   $("#source-add-file").addEventListener("click", () => $("#source-file-input").click());
-  $("#source-file-input").addEventListener("change", event => uploadSourceFile(event.target.files?.[0]));
-  $("#source-toggle-link").addEventListener("click", () => {
-    const form = $("#source-link-form"), show = form.hidden; form.hidden = !show;
-    $("#source-toggle-link").setAttribute("aria-expanded", String(show));
-    if (show) $("#source-link-name").focus();
-  });
-  $("#source-link-cancel").addEventListener("click", () => { $("#source-link-form").hidden = true; $("#source-toggle-link").setAttribute("aria-expanded", "false"); });
-  $("#source-link-form").addEventListener("submit", submitSourceLink);
-  function handleSourceAction(button) {
-    if (!button) return;
-    if (button.dataset.sourceAction === "nondeprecated") return setSourceLifecycle(button.dataset.sourceId);
-    return changeSourceActive(button.dataset.sourceId, button.dataset.sourceAction);
-  }
-  $("#source-active-list").addEventListener("click", event => handleSourceAction(event.target.closest("[data-source-action]")));
-  $("#source-removed-list").addEventListener("click", event => handleSourceAction(event.target.closest("[data-source-action]")));
+  $("#source-file-input").addEventListener("change", event => selectLibraryFile(event.target.files?.[0]));
+  $("#library-file-clear").addEventListener("click", () => { $("#source-file-input").value = ""; selectLibraryFile(null); });
+  $("#library-add-cancel").addEventListener("click", () => resetLibraryAdd(true));
+  $("#source-link-form").addEventListener("submit", submitLibraryEntry);
+  $("#source-link-form").addEventListener("reset", () => { selectLibraryFile(null); });
+  $("#library-slot-grid").addEventListener("click", handleLibraryClick);
+  $("#library-other-list").addEventListener("click", handleLibraryClick);
+  $("#source-removed-list").addEventListener("click", handleLibraryClick);
+  $("#library-other-list").addEventListener("change", handleLibrarySlotChange);
   $("#dialog-close").addEventListener("click", () => $("#record-dialog").close());
   $("#followup-close").addEventListener("click", closeFollowup);
   $("#followup-cancel").addEventListener("click", closeFollowup);
@@ -1383,9 +1989,13 @@
   $("#followup-dialog-form").addEventListener("submit", submitFollowup);
   $("#followup-dialog").addEventListener("click", event => { if (event.target === $("#followup-dialog")) closeFollowup(); });
   $("#record-dialog").addEventListener("click", event => { if (event.target === $("#record-dialog")) $("#record-dialog").close(); });
+  $("#record-dialog").addEventListener("close", () => { if (state.selectedId) state.workflowEntered.delete(state.selectedId); });
   document.addEventListener("click", event => {
     const open = event.target.closest("[data-open-record]"); if (open) openDetail(open.dataset.openRecord);
     if (!event.target.closest("button,a,input,select,textarea,summary")) { const card = event.target.closest(".record-card"); if (card) openDetail(card.dataset.recordId); }
+    const workflowStage = event.target.closest("[data-workflow-stage]"); if (workflowStage) selectWorkflowStage(workflowStage);
+    const workflowStart = event.target.closest("[data-workflow-start]"); if (workflowStart) startWorkflow(workflowStart);
+    const workflowRetry = event.target.closest("[data-workflow-retry]"); if (workflowRetry) retryWorkflow(workflowRetry.dataset.workflowRetry);
     const transfer = event.target.closest("[data-transfer-id]"); if (transfer) submitTransfer(transfer);
     const complete = event.target.closest("[data-complete-id]"); if (complete) submitCompletion(complete);
     const followup = event.target.closest("[data-followup-id]"); if (followup) openFollowup(followup.dataset.followupId);

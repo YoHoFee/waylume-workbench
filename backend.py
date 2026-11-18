@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import workflow
+
 
 def _atomic_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,6 +58,9 @@ def _context(record: dict[str, Any]) -> str:
         lines.append("")
     add_value("执行阶段", record.get("phase"))
     add_value("当前简报", record.get("latest_brief"))
+    workflow_lines = workflow.context_lines(record)
+    if workflow_lines:
+        lines.extend(workflow_lines)
     add_value("阻塞", record.get("blocked_reason"))
     add_value("下一步", record.get("next_step"))
     for label, key in (("备注", "notes"), ("已完成证据", "evidence")):
@@ -132,8 +137,9 @@ def _context(record: dict[str, Any]) -> str:
         "progress", "followups", "final_result", "attachments", "revision", "updated_at",
         "created_at", "source_updated_at", "observed_at", "evidence_at", "effective_status",
         "effective_status_basis", "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name",
-        "last_agent_activity_at", "agent_state", "completed_at", "manual_status",
+        "last_agent_activity_at", "agent_state", "agent_work_status", "completed_at", "manual_status",
         "manual_completed_at", "manual_completed_by",
+        "workflow", "workflow_template_id", "workflow_stage", "workflow_stage_status",
     }
     # Keep legacy/source-specific evidence available without repeating the
     # identity and status fields already shown in the detail header.

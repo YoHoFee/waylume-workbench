@@ -131,6 +131,67 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual(body, png_data)
         self.assertEqual(mime, "image/png")
 
+    def test_iteration_display_order_insert_and_reorder(self):
+        first = dashboardctl.create_iteration("13.4.0", "13.4.0")["iteration"]
+        second = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        inserted = dashboardctl.create_iteration("13.4.0 埋点", "13.4.0 埋点", order=1)["iteration"]
+
+        listing = dashboardctl.list_iterations()["iterations"]
+        self.assertEqual([it["id"] for it in listing], [first["id"], inserted["id"], second["id"]])
+        self.assertEqual([it["order"] for it in listing], [0, 1, 2])
+
+        reordered = dashboardctl.reorder_iterations([second["id"], first["id"], inserted["id"]])["iterations"]
+        self.assertEqual([it["id"] for it in reordered], [second["id"], first["id"], inserted["id"]])
+        self.assertEqual([it["order"] for it in reordered], [0, 1, 2])
+
+        with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
+            dashboardctl.update_iteration(second["id"], {"version_tag": "13.4.0"})
+        with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
+            dashboardctl.create_iteration("another-tag", "13.4.0 埋点")
+
+    def test_source_location_moves_group_and_archive_context_stays_isolated(self):
+        first = dashboardctl.create_iteration("13.4.0", "13.4.0")["iteration"]
+        second = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        group = dashboardctl.add_source_link(
+            "https://example.com/prd-v1", "PRD v1", slot="requirement_doc",
+            scope="iteration", iteration_id=first["id"]
+        )["source"]
+        v2 = dashboardctl.add_source_link(
+            "https://example.com/prd-v2", "PRD v2", slot="requirement_doc", group_id=group["group_id"],
+            scope="iteration", iteration_id=first["id"]
+        )["source"]
+        other = dashboardctl.add_source_link(
+            "https://example.com/other", "另一个版本的材料", slot="supplementary",
+            scope="iteration", iteration_id=second["id"]
+        )["source"]
+        public = dashboardctl.add_source_link(
+            "https://example.com/api", "公共接口", slot="api_doc", scope="global"
+        )["source"]
+
+        context_first = dashboardctl.assemble_archive_context(iteration_id=first["id"])
+        self.assertEqual({item["id"] for item in context_first["iteration_materials"]}, {group["id"], v2["id"]})
+        self.assertNotIn(other["name"], context_first["summary_markdown"])
+        self.assertIn(public["name"], context_first["summary_markdown"])
+
+        # A version cannot be appended to a group living in another version.
+        with self.assertRaisesRegex(ValueError, "source_group_location_conflict"):
+            dashboardctl.add_source_link(
+                "https://example.com/prd-v3", "PRD v3", slot="requirement_doc", group_id=group["group_id"],
+                scope="iteration", iteration_id=second["id"]
+            )
+
+        moved = dashboardctl.set_source_location(group["id"], scope="iteration", iteration_id=second["id"], slot="supplementary")
+        self.assertEqual(moved["group_size"], 2)
+        context_first = dashboardctl.assemble_archive_context(iteration_id=first["id"])
+        self.assertEqual(context_first["iteration_materials"], [])
+        context_second = dashboardctl.assemble_archive_context(iteration_id=second["id"])
+        self.assertEqual({item["id"] for item in context_second["iteration_materials"]}, {group["id"], v2["id"], other["id"]})
+        self.assertTrue(all(item["scope"] == "iteration" for item in context_second["iteration_materials"]))
+        self.assertTrue(all(item["iteration_id"] == second["id"] for item in context_second["iteration_materials"]))
+
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.set_source_location(group["id"], scope="iteration", iteration_id=second["id"], slot="api_doc")
+
     def test_migrate_iteration_archive(self):
         # Setup legacy store with records and sources without iteration/scope
         db = dashboardctl.load_store()
@@ -240,6 +301,53 @@ class ArchiveApiTests(unittest.TestCase):
         status, data = self.request("POST", f"/api/iterations/{it_id}/release", {"note": "完成上线"})
         self.assertEqual(status, 200)
         self.assertEqual(data["iteration"]["status"], "released")
+
+    def test_iteration_order_and_scoped_file_upload_api(self):
+        status, first = self.request("POST", "/api/iterations", {"version_tag": "13.4.0", "title": "13.4.0"})
+        self.assertEqual(status, 201)
+        status, second = self.request("POST", "/api/iterations", {"version_tag": "13.4.2 迭代二", "title": "13.4.2 迭代二"})
+        self.assertEqual(status, 201)
+        first_id, second_id = first["iteration"]["id"], second["iteration"]["id"]
+
+        status, data = self.request("POST", "/api/iterations/order", {"ids": [second_id, first_id]})
+        self.assertEqual(status, 200)
+        self.assertEqual([it["id"] for it in data["iterations"]], [second_id, first_id])
+
+        encoded = base64.b64encode("需求补充说明".encode("utf-8")).decode("ascii")
+        status, data = self.request("POST", "/api/sources/file", {
+            "filename": "note.txt", "content_base64": encoded, "name": "版本补充说明",
+            "slot": "supplementary", "scope": "iteration", "iteration_id": second_id
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(data["source"]["scope"], "iteration")
+        self.assertEqual(data["source"]["iteration_id"], second_id)
+
+        status, data = self.request("POST", "/api/sources/file", {
+            "filename": "note2.txt", "content_base64": encoded, "name": "公共补充说明",
+            "slot": "supplementary", "scope": "global"
+        })
+        self.assertEqual(status, 201)
+        self.assertIsNone(data["source"]["iteration_id"])
+
+        status, data = self.request("POST", "/api/sources/file", {
+            "filename": "bad.txt", "content_base64": encoded, "name": "错位资料",
+            "slot": "figma", "scope": "global"
+        })
+        self.assertEqual(status, 400)
+
+    def test_record_iteration_can_be_cleared(self):
+        iteration = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        record = dashboardctl.normalize_record({
+            "id": "ZT-W-CLEAR", "type": "work", "title": "归属可清空", "status": "in_progress",
+            "iteration_id": iteration["id"]
+        })
+        db = dashboardctl.load_store()
+        db["records"].append(record)
+        dashboardctl.atomic_write(db)
+
+        status, data = self.request("POST", "/api/items/ZT-W-CLEAR/iteration", {"iteration_id": None})
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["record"]["iteration_id"])
 
 
 if __name__ == "__main__":

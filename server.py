@@ -418,7 +418,7 @@ def build_payload() -> dict:
         "current_batch_id": db.get("current_batch_id"),
         "batches": batches,
         "current_iteration_id": db.get("current_iteration_id"),
-        "iterations": db.get("iterations", []),
+        "iterations": dashboardctl.ordered_iterations(db.get("iterations", [])),
         "legacy_task_ids": legacy_task_ids,
         "preferences": db.get("preferences", {}),
         **grouped,
@@ -709,19 +709,28 @@ class Handler(BaseHTTPRequestHandler):
                 result["attachment"]["download_url"] = f"/api/items/{attachment.group(1)}/attachments/{filename}"
                 self._send_json(result, status=201); return
             if route == "/api/iterations":
-                self._only_keys(payload, {"version_tag", "title", "status", "target_release_date", "description", "iteration_id"})
+                self._only_keys(payload, {"version_tag", "title", "status", "target_release_date", "description", "iteration_id", "order"})
                 version_tag = payload.get("version_tag")
                 title = payload.get("title")
-                if not isinstance(version_tag, str) or not isinstance(title, str):
+                order = payload.get("order")
+                if (not isinstance(version_tag, str) or not isinstance(title, str)
+                        or (order is not None and (isinstance(order, bool) or not isinstance(order, int)))):
                     raise ApiError(400, "invalid_iteration_payload")
                 result = dashboardctl.create_iteration(
                     version_tag, title,
                     status=payload.get("status", "active"),
                     target_release_date=payload.get("target_release_date"),
                     description=payload.get("description", ""),
-                    iteration_id=payload.get("iteration_id")
+                    iteration_id=payload.get("iteration_id"),
+                    order=order
                 )
                 self._send_json(result, status=201); return
+            if route == "/api/iterations/order":
+                self._only_keys(payload, {"ids"})
+                ids = payload.get("ids")
+                if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+                    raise ApiError(400, "invalid_iteration_order")
+                self._send_json(dashboardctl.reorder_iterations(ids)); return
             iter_action = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})/(release|switch)", route)
             if iter_action:
                 it_id, it_act = iter_action.groups()
@@ -740,7 +749,7 @@ class Handler(BaseHTTPRequestHandler):
             if item_iteration:
                 self._only_keys(payload, {"iteration_id"})
                 it_id = payload.get("iteration_id")
-                if not isinstance(it_id, str):
+                if it_id is not None and not isinstance(it_id, str):
                     raise ApiError(400, "invalid_iteration_id")
                 self._send_json(dashboardctl.assign_record_iteration(item_iteration.group(1), it_id)); return
             workflow_action = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/workflow/(start|submit|advance|rework|block|unblock|close|claim|heartbeat|release)", route)
@@ -927,7 +936,8 @@ class Handler(BaseHTTPRequestHandler):
                     iteration_id=payload.get("iteration_id"),
                     slot=payload.get("slot")
                 )
-                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
+                self._send_json({"revision": result["revision"], "group_size": result.get("group_size", 1),
+                                 "source": public_enriched_source(result["source"])})
                 return
             override = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/override", route)
             if override:
@@ -949,23 +959,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             if route == "/api/sources/file":
-                self._only_keys(payload, {"filename", "content_base64", "category", "name", "slot", "group_id", "version_label"})
+                self._only_keys(payload, {"filename", "content_base64", "category", "name", "slot", "group_id", "version_label", "scope", "iteration_id"})
                 filename = payload.get("filename")
                 encoded = payload.get("content_base64")
                 category = payload.get("category", "需求资料")
                 name, slot = payload.get("name"), payload.get("slot")
                 group_id, version_label = payload.get("group_id"), payload.get("version_label")
+                scope, iteration_id = payload.get("scope"), payload.get("iteration_id")
                 if (not isinstance(filename, str) or not isinstance(encoded, str) or not isinstance(category, str)
                         or (name is not None and not isinstance(name, str))
                         or (slot is not None and not isinstance(slot, str)) or (group_id is not None and not isinstance(group_id, str))
-                        or (version_label is not None and not isinstance(version_label, str))):
+                        or (version_label is not None and not isinstance(version_label, str))
+                        or (scope is not None and not isinstance(scope, str))
+                        or (iteration_id is not None and not isinstance(iteration_id, str))):
                     raise ApiError(400, "invalid_source_payload")
                 try:
                     file_bytes = base64.b64decode(encoded, validate=True)
                 except (binascii.Error, ValueError):
                     raise ApiError(400, "invalid_base64")
                 result = dashboardctl.add_source_file(filename, file_bytes, category, "dashboard", name=name,
-                                                      slot=slot, group_id=group_id, version_label=version_label)
+                                                      slot=slot, group_id=group_id, version_label=version_label,
+                                                      scope=scope, iteration_id=iteration_id)
                 self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])}, status=201)
                 return
             restore = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/restore", route)

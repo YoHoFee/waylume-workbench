@@ -85,6 +85,10 @@ SOURCE_SLOT_LABELS = {
     "standard": "公共规范",
     "other": "其他资料",
 }
+# Fixed slots are scoped: interface contracts are shared across versions while
+# the requirement/design/test matrix belongs to exactly one version.
+GLOBAL_FIXED_SLOTS = {"api_doc", "architecture", "standard"}
+ITERATION_FIXED_SLOTS = {"requirement_doc", "figma", "prototype", "codesign", "testcase"}
 ITERATION_STATUSES = {"planning", "active", "pending_release", "released", "archived"}
 DEFAULT_ITERATION_STATUS = "active"
 MAX_ITERATION_TAG_CHARS = 50
@@ -1311,6 +1315,31 @@ def _find_iteration(db: dict[str, Any], iteration_id: str) -> dict[str, Any] | N
     return None
 
 
+def _iteration_order_value(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _iteration_sort_key(it: dict[str, Any]) -> tuple[int, int, str, str]:
+    """Stable display order: explicit `order` first, then creation time."""
+    order = _iteration_order_value(it.get("order"))
+    return (0 if order is not None else 1, order if order is not None else 0,
+            str(it.get("created_at") or ""), str(it.get("id") or ""))
+
+
+def ordered_iterations(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((it for it in iterations if isinstance(it, dict)), key=_iteration_sort_key)
+
+
+def _normalize_iteration_orders(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Persist a sequential 0..n-1 order so insertion and reordering are stable."""
+    ordered = ordered_iterations(iterations)
+    for index, it in enumerate(ordered):
+        it["order"] = index
+    return ordered
+
+
 def list_iterations() -> dict[str, Any]:
     db = load_store()
     iterations = _iteration_store_list(db)
@@ -1318,18 +1347,21 @@ def list_iterations() -> dict[str, Any]:
     return {
         "revision": db.get("revision", 0),
         "current_iteration_id": current_id,
-        "iterations": copy.deepcopy(iterations)
+        "iterations": copy.deepcopy(ordered_iterations(iterations))
     }
 
 
 def create_iteration(version_tag: str, title: str, *, status: str = "active", target_release_date: str | None = None,
-                     description: str = "", notes: list[str] | None = None, iteration_id: str | None = None) -> dict[str, Any]:
+                     description: str = "", notes: list[str] | None = None, iteration_id: str | None = None,
+                     order: int | None = None) -> dict[str, Any]:
     if not isinstance(version_tag, str) or not version_tag.strip() or len(version_tag) > MAX_ITERATION_TAG_CHARS:
         raise ValueError("invalid_iteration_version_tag")
     if not isinstance(title, str) or not title.strip() or len(title) > MAX_ITERATION_TITLE_CHARS:
         raise ValueError("invalid_iteration_title")
     if status not in ITERATION_STATUSES:
         raise ValueError("invalid_iteration_status")
+    if order is not None and (isinstance(order, bool) or not isinstance(order, int) or order < 0):
+        raise ValueError("invalid_iteration_order")
 
     clean_tag = version_tag.strip()
     clean_title = title.strip()
@@ -1338,7 +1370,8 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
     def update() -> dict[str, Any]:
         db = load_store()
         iterations = _iteration_store_list(db)
-        if any(it.get("id") == it_id or it.get("version_tag") == clean_tag for it in iterations):
+        if any(it.get("id") == it_id or it.get("version_tag") == clean_tag
+               or str(it.get("title") or "").strip() == clean_title for it in iterations):
             raise ValueError("iteration_duplicate")
         now = timestamp()
         entry = {
@@ -1353,6 +1386,11 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
             "description": str(description or ""),
             "notes": list(notes or []),
         }
+        ordered = _normalize_iteration_orders(iterations)
+        position = len(ordered) if order is None else min(order, len(ordered))
+        ordered.insert(position, entry)
+        for index, item in enumerate(ordered):
+            item["order"] = index
         iterations.append(entry)
         if not db.get("current_iteration_id") or status == "active":
             db["current_iteration_id"] = it_id
@@ -1364,6 +1402,30 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
     return with_lock(update)
 
 
+def reorder_iterations(iteration_ids: list[str]) -> dict[str, Any]:
+    if (not isinstance(iteration_ids, list) or not iteration_ids
+            or any(not isinstance(item, str) or not item for item in iteration_ids)
+            or len(set(iteration_ids)) != len(iteration_ids)):
+        raise ValueError("invalid_iteration_order")
+
+    def update() -> dict[str, Any]:
+        db = load_store()
+        iterations = _iteration_store_list(db)
+        by_id = {it.get("id"): it for it in iterations}
+        if set(iteration_ids) != set(by_id):
+            raise ValueError("iteration_order_mismatch")
+        now = timestamp()
+        for index, it_id in enumerate(iteration_ids):
+            by_id[it_id]["order"] = index
+            by_id[it_id]["updated_at"] = now
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        event("iterations_reordered", {"id": "iterations", "type": "iteration"}, db["revision"])
+        return {"revision": db["revision"], "iterations": copy.deepcopy(ordered_iterations(iterations))}
+
+    return with_lock(update)
+
+
 def update_iteration(iteration_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     def update() -> dict[str, Any]:
         db = load_store()
@@ -1371,9 +1433,24 @@ def update_iteration(iteration_id: str, patch: dict[str, Any]) -> dict[str, Any]
         if not it:
             raise ValueError("iteration_not_found")
         now = timestamp()
+        if "version_tag" in patch and patch["version_tag"] is not None:
+            new_tag = str(patch["version_tag"]).strip()
+            if not new_tag:
+                raise ValueError("invalid_iteration_version_tag")
+            duplicate = next((other for other in _iteration_store_list(db)
+                              if other is not it and other.get("version_tag") == new_tag), None)
+            if duplicate:
+                raise ValueError("iteration_duplicate")
+        if "title" in patch and patch["title"] is not None:
+            if not isinstance(patch["title"], str) or not patch["title"].strip():
+                raise ValueError("invalid_iteration_title")
+            duplicate_title = next((other for other in _iteration_store_list(db)
+                                    if other is not it and str(other.get("title") or "").strip() == patch["title"].strip()), None)
+            if duplicate_title:
+                raise ValueError("iteration_duplicate")
         for key in ("title", "version_tag", "description", "target_release_date", "notes"):
             if key in patch and patch[key] is not None:
-                it[key] = patch[key]
+                it[key] = patch[key].strip() if key in {"title", "version_tag"} else patch[key]
         if "status" in patch:
             new_status = patch["status"]
             if new_status not in ITERATION_STATUSES:
@@ -1427,10 +1504,10 @@ def set_current_iteration(iteration_id: str) -> dict[str, Any]:
     return with_lock(update)
 
 
-def assign_record_iteration(record_id: str, iteration_id: str) -> dict[str, Any]:
+def assign_record_iteration(record_id: str, iteration_id: str | None) -> dict[str, Any]:
     if not isinstance(record_id, str) or not record_id.strip():
         raise ValueError("invalid_record_id")
-    if not isinstance(iteration_id, str) or not iteration_id.strip():
+    if iteration_id is not None and (not isinstance(iteration_id, str) or not iteration_id.strip()):
         raise ValueError("invalid_iteration_id")
 
     def update() -> dict[str, Any]:
@@ -1438,14 +1515,17 @@ def assign_record_iteration(record_id: str, iteration_id: str) -> dict[str, Any]
         rec = next((r for r in db.get("records", []) if r.get("id") == record_id), None)
         if rec is None:
             raise ValueError("record_not_found")
-        it = _find_iteration(db, iteration_id.strip())
-        if it is None:
-            raise ValueError("iteration_not_found")
-        rec["iteration_id"] = it["id"]
+        if iteration_id is None:
+            rec["iteration_id"] = None
+        else:
+            it = _find_iteration(db, iteration_id.strip())
+            if it is None:
+                raise ValueError("iteration_not_found")
+            rec["iteration_id"] = it["id"]
         rec["updated_at"] = timestamp()
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
-        event("record_iteration_assigned", {"id": record_id, "type": rec.get("type", "task"), "iteration_id": it["id"]}, db["revision"])
+        event("record_iteration_assigned", {"id": record_id, "type": rec.get("type", "task"), "iteration_id": rec["iteration_id"]}, db["revision"])
         return {"revision": db["revision"], "record": rec}
 
     return with_lock(update)
@@ -2584,6 +2664,15 @@ def _source_effective_slot(source: dict[str, Any]) -> str | None:
     return slot if slot in SOURCE_SLOTS else None
 
 
+def _source_scope(source: dict[str, Any]) -> str:
+    stored = source.get("scope")
+    if stored in {"global", "iteration"}:
+        return stored
+    if _source_effective_slot(source) in GLOBAL_FIXED_SLOTS:
+        return "global"
+    return "iteration" if source.get("iteration_id") else "global"
+
+
 def _source_group_id(source: dict[str, Any]) -> str:
     value = source.get("group_id")
     if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
@@ -2733,7 +2822,7 @@ def enrich_source_records(records: list[dict[str, Any]], all_sources: list[dict[
             "version_count": len(active) if active else len(members),
             "latest": bool(_source_is_active(record) and active_latest.get(group_id) == str(record.get("id"))),
             "is_latest": bool(_source_is_active(record) and active_latest.get(group_id) == str(record.get("id"))),
-            "scope": record.get("scope") or ("global" if slot in {"api_doc", "architecture", "standard"} else "iteration" if record.get("iteration_id") else "global"),
+            "scope": _source_scope(record),
             "iteration_id": record.get("iteration_id"),
             "attachments": list(record.get("attachments") or []),
             "inspection_enabled": inspection_enabled,
@@ -2751,7 +2840,19 @@ def enrich_source_records(records: list[dict[str, Any]], all_sources: list[dict[
     return enriched
 
 
-def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *, slot: Any, group_id: Any, version_label: Any, scope: Any = None, iteration_id: Any = None, attachments: Any = None) -> dict[str, Any]:
+def _validate_scope_slot(scope: str, slot: str | None) -> None:
+    """Reject fixed slots that belong to the other archive scope."""
+    if slot is None:
+        return
+    if scope == "global" and slot in ITERATION_FIXED_SLOTS:
+        raise ValueError("invalid_source_slot")
+    if scope == "iteration" and slot in GLOBAL_FIXED_SLOTS:
+        raise ValueError("invalid_source_slot")
+
+
+def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *, slot: Any, group_id: Any, version_label: Any,
+                               scope: Any = None, iteration_id: Any = None, attachments: Any = None,
+                               iterations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Validate and derive library fields for a newly created source/version."""
     slot = _source_slot_value(slot)
     group_id = _source_group_key(group_id)
@@ -2778,8 +2879,42 @@ def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *,
             raise ValueError("invalid_source_scope")
         effective_scope = scope
     else:
-        effective_scope = "global" if slot in {"api_doc", "architecture", "standard"} else "iteration" if iteration_id else "global"
+        effective_scope = "global" if slot in GLOBAL_FIXED_SLOTS else "iteration" if iteration_id else "global"
     clean_iter_id = str(iteration_id).strip() if (iteration_id and isinstance(iteration_id, str)) else None
+    if members:
+        # Versions must live with the group; new members inherit the group's location.
+        member_scope = next((item.get("scope") for item in members if item.get("scope") in {"global", "iteration"}), None)
+        member_iter = next((item.get("iteration_id") for item in members if item.get("iteration_id")), None)
+        if scope is None and member_scope:
+            effective_scope = member_scope
+        elif scope is None and member_iter:
+            effective_scope = "iteration"
+        if clean_iter_id is None and member_iter:
+            clean_iter_id = member_iter
+    if effective_scope == "iteration":
+        if not clean_iter_id:
+            raise ValueError("missing_iteration_id")
+        matched = next((it for it in (iterations or []) if str(it.get("id")) == clean_iter_id or it.get("version_tag") == clean_iter_id), None)
+        if not matched:
+            raise ValueError("iteration_not_found")
+        clean_iter_id = str(matched.get("id"))
+        _validate_scope_slot("iteration", slot)
+    else:
+        clean_iter_id = None
+        if scope is not None:
+            _validate_scope_slot("global", slot)
+    if members:
+        # Every version in a group must share one home. Moving is a group
+        # operation, never a per-version side effect.
+        canonical_member_iter = None
+        if member_iter:
+            matched_member = next((it for it in (iterations or [])
+                                   if str(it.get("id")) == member_iter or it.get("version_tag") == member_iter), None)
+            canonical_member_iter = str(matched_member.get("id")) if matched_member else str(member_iter)
+        if member_scope and effective_scope != member_scope:
+            raise ValueError("source_group_location_conflict")
+        if canonical_member_iter and clean_iter_id != canonical_member_iter:
+            raise ValueError("source_group_location_conflict")
     return {
         "slot": slot,
         "group_id": group_id,
@@ -2830,7 +2965,9 @@ def add_source_link(url: str, name: str | None = None, category: str = "需求�
         sources = _source_store_list(db)
         if any(item.get("id") == source["id"] for item in sources):
             raise ValueError("source_duplicate")
-        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label, scope=scope, iteration_id=iteration_id, attachments=attachments)
+        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label,
+                                             scope=scope, iteration_id=iteration_id, attachments=attachments,
+                                             iterations=_iteration_store_list(db))
         duplicate = next((item for item in sources if item.get("normalized_url") == normalized_url), None)
         if duplicate and not (library["group_id"] != source["id"] and _source_group_id(duplicate) == library["group_id"]):
             raise ValueError("source_duplicate")
@@ -2926,7 +3063,9 @@ def add_source_file(filename: str, data: bytes, category: str = "需求资料", 
         sources = _source_store_list(db)
         if any(item.get("id") == source["id"] for item in sources):
             raise ValueError("source_duplicate")
-        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label, scope=scope, iteration_id=iteration_id, attachments=attachments)
+        library = _new_source_library_fields(sources, source["id"], slot=slot, group_id=group_id, version_label=version_label,
+                                             scope=scope, iteration_id=iteration_id, attachments=attachments,
+                                             iterations=_iteration_store_list(db))
         source.update({key: value for key, value in library.items() if key != "promote_group_slot"})
         source.update({"file_ext": extension.lstrip("."), "mime": mime, "logo_kind": _source_logo_kind(source)})
         at = timestamp()
@@ -3058,6 +3197,7 @@ def set_source_location(source_id: str, scope: str, iteration_id: str | None = N
     if scope == "iteration" and (not iteration_id or not isinstance(iteration_id, str) or not iteration_id.strip()):
         raise ValueError("missing_iteration_id")
     clean_slot = _source_slot_value(slot)
+    _validate_scope_slot(scope, clean_slot)
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -3065,20 +3205,26 @@ def set_source_location(source_id: str, scope: str, iteration_id: str | None = N
         source = next((item for item in sources if item.get("id") == source_id), None)
         if source is None:
             raise ValueError("source_not_found")
-        source["scope"] = scope
+        target_iteration_id = None
         if scope == "iteration":
             it = _find_iteration(db, iteration_id.strip())
             if not it:
                 raise ValueError("iteration_not_found")
-            source["iteration_id"] = it["id"]
-        else:
-            source["iteration_id"] = None
-        source["slot"] = clean_slot
-        source["updated_at"] = timestamp()
+            target_iteration_id = it["id"]
+        # A material group shares one location. Moving one row moves every
+        # version so fixed-slot history cannot leak across versions.
+        group_id = _source_group_id(source)
+        members = [item for item in sources if _source_group_id(item) == group_id]
+        at = timestamp()
+        for member in members:
+            member["scope"] = scope
+            member["iteration_id"] = target_iteration_id
+            member["slot"] = clean_slot
+            member["updated_at"] = at
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         _source_event("source_location_updated", source, db["revision"])
-        return {"revision": db["revision"], "source": source}
+        return {"revision": db["revision"], "source": source, "group_size": len(members)}
 
     return with_lock(update)
 
@@ -3294,7 +3440,8 @@ def cmd_iteration(args: argparse.Namespace) -> None:
             args.version_tag, args.title, status=args.status,
             target_release_date=args.target_release_date,
             description=args.description or "",
-            iteration_id=args.iteration_id
+            iteration_id=args.iteration_id,
+            order=getattr(args, "order", None)
         ), ensure_ascii=False, indent=2))
     elif action == "show":
         db = load_store()
@@ -3316,7 +3463,9 @@ def cmd_iteration(args: argparse.Namespace) -> None:
         if getattr(args, "status", None): patch["status"] = args.status
         print(json.dumps(update_iteration(args.id, patch), ensure_ascii=False, indent=2))
     elif action == "assign-record":
-        print(json.dumps(assign_record_iteration(args.record_id, args.iteration_id), ensure_ascii=False, indent=2))
+        print(json.dumps(assign_record_iteration(args.record_id, args.iteration_id or None), ensure_ascii=False, indent=2))
+    elif action == "reorder":
+        print(json.dumps(reorder_iterations(args.ids), ensure_ascii=False, indent=2))
     elif action == "migrate":
         tag = getattr(args, "version_tag", None) or "v13.4.2"
         title = getattr(args, "title", None) or "13.4.2 智能相册与AI音乐优化"
@@ -3689,6 +3838,7 @@ def main() -> None:
     iter_create.add_argument("--target-release-date", help="target release date (YYYY-MM-DD)")
     iter_create.add_argument("--description", default="")
     iter_create.add_argument("--iteration-id", help="optional custom iteration ID")
+    iter_create.add_argument("--order", type=int, help="insert position, 0-based; defaults to the end")
     iter_show = iter_sub.add_parser("show", help="show one iteration")
     iter_show.add_argument("id")
     iter_switch = iter_sub.add_parser("switch", help="set current active iteration")
@@ -3706,6 +3856,8 @@ def main() -> None:
     iter_assign = iter_sub.add_parser("assign-record", help="assign record to iteration")
     iter_assign.add_argument("record_id")
     iter_assign.add_argument("iteration_id")
+    iter_reorder = iter_sub.add_parser("reorder", help="persist the display order of all iterations")
+    iter_reorder.add_argument("ids", nargs="+")
     iter_migrate = iter_sub.add_parser("migrate", help="migrate legacy records and sources into default iteration archive")
     iter_migrate.add_argument("--version-tag", default="v13.4.2", help="default iteration version tag")
     iter_migrate.add_argument("--title", default="13.4.2 智能相册与AI音乐优化", help="default iteration title")

@@ -1381,10 +1381,13 @@
     columns.forEach(column => { column.className = "masonry-column"; });
     list.replaceChildren(...columns);
     const canMeasure = list.clientWidth > 0;
+    // At <=339px CSS hides the second column. Never balance cards into a
+    // column that has no layout box, otherwise they disappear visually.
+    const visibleColumns = columns.map(column => getComputedStyle(column).display !== "none");
     if (!canMeasure) {
       cards.forEach((card, index) => {
         card.dataset.masonryOrder = String(index);
-        columns[index % 2].append(card);
+        columns[model.masonryColumnIndex([], visibleColumns, index)].append(card);
       });
       return;
     }
@@ -1398,9 +1401,9 @@
     const heights = [0, 0];
     const measured = cards.map(card => card.offsetHeight);
     cards.forEach((card, index) => {
-      const columnIndex = model.shortestMasonryColumn(heights);
+      const columnIndex = model.masonryColumnIndex(heights, visibleColumns, index);
       columns[columnIndex].append(card);
-      heights[columnIndex] += measured[index] + gap;
+      if (visibleColumns[columnIndex]) heights[columnIndex] += measured[index] + gap;
     });
   }
   function relayoutMasonryList(list) {
@@ -1496,17 +1499,29 @@
     }
     return section;
   }
+  function makeReleasedVersionBody(item) {
+    const body = document.createElement("div");
+    body.className = "record-list released-version-records";
+    populateMasonryList(body, item.records.map(makeCard));
+    return body;
+  }
   function renderWorkReleasedVersions(groups) {
     const section = $("#work-released-section");
     const toggle = $("#work-released-toggle");
     const list = $("#work-released-list");
     const count = $("#work-released-count");
+    const hint = $("#work-released-search-hint");
     if (!section || !toggle || !list || !count) return;
     section.hidden = groups.length === 0;
     count.textContent = String(groups.length);
-    const open = groups.length > 0 && state.workReleasedOpen;
+    const searchActive = !!state.query.trim();
+    const searchForced = searchActive && groups.length > 0;
+    const open = groups.length > 0 && model.releasedEntryOpen(state.workReleasedOpen, searchActive, groups.length);
+    if (hint) hint.hidden = !searchForced;
     toggle.setAttribute("aria-expanded", String(open));
     toggle.classList.toggle("is-open", open);
+    toggle.classList.toggle("is-search-forced", searchForced);
+    toggle.title = searchForced ? "搜索命中已发布版本，已临时展开；清空搜索后恢复原状态" : "";
     list.hidden = !open;
     if (!open) {
       list.replaceChildren();
@@ -1517,7 +1532,7 @@
       details.className = "released-version-card";
       details.dataset.iterationId = item.iteration.id;
       details.dataset.preserveKey = `work-released-${item.iteration.id}`;
-      details.open = state.workReleasedExpanded.has(item.iteration.id);
+      details.open = model.releasedVersionOpen(state.workReleasedExpanded.has(item.iteration.id), searchActive, true);
       const summary = document.createElement("summary");
       const name = document.createElement("span");
       name.className = "released-version-name";
@@ -1526,14 +1541,18 @@
       meta.className = "released-version-meta";
       meta.textContent = `${item.records.length} 项`;
       summary.append(name, iterationStatusPill(item.iteration), meta);
-      const body = document.createElement("div");
-      body.className = "record-list released-version-records";
-      populateMasonryList(body, item.records.map(makeCard));
-      details.append(summary, body);
+      details._releasedGroup = item;
+      // Build cards only when the version is actually open. Closed versions
+      // keep just their summary until first expansion.
+      details.append(summary);
+      if (details.open) details.append(makeReleasedVersionBody(item));
       return details;
     }));
   }
   function toggleWorkReleased() {
+    // While search results force the list open, the click must not hide the
+    // matched cards; the manual state is restored after clearing the search.
+    if (state.query.trim() && (state.workReleasedGroups || []).length) return;
     state.workReleasedOpen = !state.workReleasedOpen;
     renderWorkReleasedVersions(state.workReleasedGroups || []);
   }
@@ -3134,8 +3153,14 @@
     const target = event.target;
     if (target.matches?.("details.released-version-card")) {
       const iterationId = target.dataset.iterationId;
-      if (target.open) state.workReleasedExpanded.add(iterationId);
-      else state.workReleasedExpanded.delete(iterationId);
+      if (target.open) {
+        state.workReleasedExpanded.add(iterationId);
+        if (!target.querySelector(".released-version-records") && target._releasedGroup) {
+          target.append(makeReleasedVersionBody(target._releasedGroup));
+        }
+      } else {
+        state.workReleasedExpanded.delete(iterationId);
+      }
     }
     if (target.matches?.("details.archive-block-released")) {
       const iterationId = target.dataset.iterationId;

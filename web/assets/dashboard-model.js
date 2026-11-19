@@ -72,6 +72,24 @@
     if (!Array.isArray(heights) || heights.length < 2) return 0;
     return heights[0] <= heights[1] ? 0 : 1;
   }
+  // Small-screen layouts hide the second column. Only visible columns may
+  // receive cards; when neither is measurable fall back to alternating, which
+  // is corrected by the next visible relayout.
+  // Search temporarily overrides manual released-version folding without
+  // mutating the user's saved open state.
+  function releasedEntryOpen(manualOpen, searchActive, matchCount) {
+    return !!manualOpen || (!!searchActive && Number(matchCount) > 0);
+  }
+  function releasedVersionOpen(manualOpen, searchActive, hasMatches) {
+    return !!manualOpen || (!!searchActive && !!hasMatches);
+  }
+  function masonryColumnIndex(heights, visibleColumns, cardIndex = 0) {
+    const visible = Array.isArray(visibleColumns) ? visibleColumns : [true, true];
+    const candidates = [0, 1].filter(index => visible[index] !== false);
+    if (!candidates.length) return Math.abs(Number(cardIndex) || 0) % 2;
+    const measured = index => Number(heights?.[index]) || 0;
+    return candidates.reduce((best, index) => measured(index) < measured(best) ? index : best, candidates[0]);
+  }
   function partitionTerminalRecords(records, today) { return partitionDailyCompletions(records, today); }
   function partitionCompletedRecords(records, today) { return partitionTerminalRecords(records, today); }
   const iterationStatusLabels = Object.freeze({
@@ -646,7 +664,7 @@
       activeCount: active.length
     };
   }
-  const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionIterationRecords, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, sortTaskRecords, workPeriodProgress,
+  const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionIterationRecords, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, masonryColumnIndex, releasedEntryOpen, releasedVersionOpen, sortTaskRecords, workPeriodProgress,
     iterationStatusLabels, iterationStatusLabel, iterationIsReleased, iterationName, iterationSecondaryTag, orderedIterations, iterationApplies,
     librarySlots, librarySlotLabels, libraryActive, libraryView, sourceScope, sourceDisplayNameOf,
     globalArchiveSlots, iterationArchiveSlots, archiveSlotLabels, archiveView,

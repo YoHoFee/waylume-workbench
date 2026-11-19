@@ -159,3 +159,22 @@ assert.equal(wfView.auditMode, "lightweight");
 assert.equal(wfView.history[0].actionLabel, "发起二次修改");
 
 console.log("all archive and zero-collapse iteration tests passed!");
+
+// ROUND4: small-screen masonry must never place cards in the hidden column.
+assert.equal(model.masonryColumnIndex([0, 0], [true, false], 0), 0);
+assert.equal(model.masonryColumnIndex([0, 0], [true, false], 1), 0);
+assert.equal(model.masonryColumnIndex([100, 0], [true, false], 5), 0);
+assert.equal(model.masonryColumnIndex([0, 10], [true, true], 0), 0);
+assert.equal(model.masonryColumnIndex([10, 0], [true, true], 0), 1);
+assert.equal(model.masonryColumnIndex([10, 10], [true, true], 0), 0);
+assert.equal(model.masonryColumnIndex([0, 0], [false, true], 0), 1);
+assert.equal(model.masonryColumnIndex([0, 0], [false, false], 1), 1);
+
+// Search may temporarily open released versions without changing manual state.
+assert.equal(model.releasedEntryOpen(false, false, 0), false);
+assert.equal(model.releasedEntryOpen(false, true, 1), true);
+assert.equal(model.releasedEntryOpen(true, false, 0), true);
+assert.equal(model.releasedVersionOpen(false, true, true), true);
+assert.equal(model.releasedVersionOpen(false, false, true), false);
+assert.equal(model.releasedVersionOpen(true, false, false), true);
+console.log("round4 masonry and search expansion checks passed");

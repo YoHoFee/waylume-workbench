@@ -2533,3 +2533,7 @@ body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-records{pa
 .sources-dialog.library-dialog::backdrop{backdrop-filter:none;-webkit-backdrop-filter:none;background:#0000005c}
 body[data-theme="dark"] .sources-dialog.library-dialog::backdrop{backdrop-filter:none;-webkit-backdrop-filter:none;background:#000000a8}
 body .library-dialog .library-top{backdrop-filter:none;-webkit-backdrop-filter:none}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-list[hidden]{display:none;margin-top:0}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-search-hint{
+  flex:none;color:var(--home-muted);font-size:10.5px;font-weight:500;white-space:nowrap;
+}

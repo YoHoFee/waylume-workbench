@@ -93,6 +93,15 @@ class ArchiveUIContractTests(unittest.TestCase):
             self.assertIn(marker, SCRIPT + HTML + STYLE)
         self.assertIn("已发布版本", SCRIPT)
 
+    def test_small_screen_masonry_and_search_expand_released_versions(self):
+        self.assertIn("const visibleColumns = columns.map(column => getComputedStyle(column).display !== \"none\");", SCRIPT)
+        self.assertIn("model.masonryColumnIndex(heights, visibleColumns, index)", SCRIPT)
+        self.assertIn("model.releasedEntryOpen(state.workReleasedOpen, searchActive, groups.length)", SCRIPT)
+        self.assertIn("model.releasedVersionOpen(state.workReleasedExpanded.has(item.iteration.id), searchActive, true)", SCRIPT)
+        self.assertIn("搜索命中，临时展开", HTML)
+        self.assertIn("target._releasedGroup", SCRIPT)
+        self.assertIn(".released-version-list[hidden]{display:none;margin-top:0}", STYLE.replace("\n", ""))
+
     def test_library_dialog_drops_scroll_blur_and_skips_redundant_rerenders(self):
         self.assertIn(".sources-dialog.library-dialog::backdrop{backdrop-filter:none", STYLE)
         self.assertIn("body .library-dialog .library-top{backdrop-filter:none", STYLE)

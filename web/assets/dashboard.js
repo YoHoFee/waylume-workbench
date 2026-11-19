@@ -2564,6 +2564,7 @@
     button.dataset.iterationId = iterationId;
     if (extra.disabled) button.disabled = true;
     if (extra.title) button.title = extra.title;
+    if (extra.ariaLabel) button.setAttribute("aria-label", extra.ariaLabel);
     return button;
   }
   function renderIterationManager() {
@@ -2593,9 +2594,10 @@
       copy.className = "iteration-manager-copy";
       const titleLine = document.createElement("div");
       titleLine.className = "iteration-manager-title-line";
+      const versionLabel = iterationName(iteration);
       const name = document.createElement("strong");
       name.className = "iteration-manager-name";
-      name.textContent = iterationName(iteration);
+      name.textContent = versionLabel;
       titleLine.append(name, iterationStatusPill(iteration));
       const tag = model.iterationSecondaryTag(iteration);
       if (tag) name.title = `版本标识：${tag}`;
@@ -2607,12 +2609,12 @@
       const actions = document.createElement("div");
       actions.className = "iteration-manager-actions";
       actions.append(
-        makeManagerAction("上移", "up", iteration.id, { disabled: busy || index === 0, title: "上移版本（更靠前、更新）" }),
-        makeManagerAction("下移", "down", iteration.id, { disabled: busy || index === iterations.length - 1, title: "下移版本（更靠后、更旧）" }),
-        makeManagerAction("编辑", "edit", iteration.id, { disabled: busy, title: "修改版本名、日期或描述" })
+        makeManagerAction("上移", "up", iteration.id, { disabled: busy || index === 0, title: "上移版本（更靠前、更新）", ariaLabel: `上移 ${versionLabel}` }),
+        makeManagerAction("下移", "down", iteration.id, { disabled: busy || index === iterations.length - 1, title: "下移版本（更靠后、更旧）", ariaLabel: `下移 ${versionLabel}` }),
+        makeManagerAction("编辑", "edit", iteration.id, { disabled: busy, title: "修改版本名、日期或描述", ariaLabel: `编辑 ${versionLabel}` })
       );
       if (!released) {
-        actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", disabled: busy, title: "发布后该版本需求不再支持直接二次修改" }));
+        actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", disabled: busy, title: "发布后该版本需求不再支持直接二次修改", ariaLabel: `标记发布 ${versionLabel}` }));
       }
       row.append(position, copy, actions);
       return row;

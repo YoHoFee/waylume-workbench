@@ -114,6 +114,19 @@ const split1340 = splitArchive.iterations.find(section => section.iteration.id =
 assert.deepEqual(split1342.supplementaryGroups.flatMap(group => group.versions.map(v => v.id)), ["split-a"]);
 assert.deepEqual(split1340.supplementaryGroups.flatMap(group => group.versions.map(v => v.id)), ["split-b"]);
 
+// Simulated whole-group move interaction: the view must relocate the card
+// immediately, and the old version must no longer render it anywhere.
+const movedSources = sources.map(source => source.id === "s-1340-figma"
+  ? { ...source, iteration_id: "ITER-v1342" }
+  : source);
+const movedArchive = model.archiveView(movedSources, iterations);
+const moved1342 = movedArchive.iterations.find(section => section.iteration.id === "ITER-v1342");
+const moved1340 = movedArchive.iterations.find(section => section.iteration.id === "ITER-v1340");
+assert.equal(moved1342.slots.find(slot => slot.slot === "figma").card.name, "13.4.0 Figma");
+assert.equal(moved1340.slots.find(slot => slot.slot === "figma").empty, true);
+assert.ok(!moved1340.groups.some(group => group.card.name === "13.4.0 Figma"));
+assert.ok(!moved1340.supplementaryGroups.some(group => group.card.name === "13.4.0 Figma"));
+
 // Test workflowView reopen
 const reopenedRecord = {
   id: "ZT-T-001",

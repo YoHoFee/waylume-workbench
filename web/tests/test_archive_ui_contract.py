@@ -90,6 +90,13 @@ class ArchiveUIContractTests(unittest.TestCase):
         self.assertNotIn("📦", SCRIPT)
         self.assertNotIn("style.cssText", SCRIPT)
 
+    def test_render_detail_defines_iteration_before_reopen_check(self):
+        start = SCRIPT.index("function renderDetail(record)")
+        end = SCRIPT.index("function openDetail(", start)
+        body = SCRIPT[start:end]
+        self.assertIn("const it = iterationById(record.iteration_id);", body)
+        self.assertIn('if (isCompleted(record) && (!it ||', body)
+
     def test_relocate_dialog_shows_current_and_group_context(self):
         for selector in ("relocate-current-location", "relocate-group-hint", "relocate-scope-select",
                          "relocate-iteration-select", "relocate-slot-select"):

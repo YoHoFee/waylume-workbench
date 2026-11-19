@@ -2058,6 +2058,9 @@
 
   function renderDetail(record) {
     const detail = $("#detail"); detail.replaceChildren();
+    // Kept in this scope for the reopen decision below; previously this was
+    // accidentally inherited from makeCard and threw before showModal().
+    const it = iterationById(record.iteration_id);
     const head = document.createElement("div"); head.className = "detail-head";
     const title = document.createElement("h2"); title.id = "dialog-title"; title.textContent = record.title;
     if (isCancelled(record)) title.classList.add("record-cancelled-title");

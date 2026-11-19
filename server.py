@@ -418,7 +418,7 @@ def build_payload() -> dict:
         "current_batch_id": db.get("current_batch_id"),
         "batches": batches,
         "current_iteration_id": db.get("current_iteration_id"),
-        "iterations": dashboardctl.ordered_iterations(db.get("iterations", [])),
+        "iterations": dashboardctl.display_iterations(db.get("iterations", [])),
         "legacy_task_ids": legacy_task_ids,
         "preferences": db.get("preferences", {}),
         **grouped,

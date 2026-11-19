@@ -2,6 +2,7 @@
   const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
     workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set(),
     iterations: [], currentIterationId: null, archiveScopeTab: "iteration", libraryAddContext: null, libraryHighlight: null,
+    sourcesRevision: null, workReleasedOpen: false, workReleasedGroups: [], workReleasedExpanded: new Set(), archiveReleasedExpanded: new Set(),
     iterationEditId: null, reopenTargetId: null, reopenFile: null, iterationBusy: false };
   const inspectionClock = { schedule: null, serverEpoch: null, syncedAt: null, nextRunAt: null };
   const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…" };
@@ -824,44 +825,52 @@
     button.dataset.slot = slot || "supplementary";
     return button;
   }
-  function makeArchiveSection(section) {
+  function makeArchiveSection(section, options = {}) {
     const scope = section.scope;
     const iteration = section.iteration;
-    const block = document.createElement("section");
-    block.className = `archive-block${scope === "global" ? " archive-block-global" : ""}`;
+    const released = !!options.released;
+    const block = document.createElement(released ? "details" : "section");
+    block.className = `archive-block${scope === "global" ? " archive-block-global" : ""}${released ? " archive-block-released" : ""}`;
     block.dataset.scope = scope;
     if (iteration) block.dataset.iterationId = iteration.id;
+    if (released) {
+      block.dataset.preserveKey = `archive-released-${iteration.id}`;
+      block.open = state.archiveReleasedExpanded.has(iteration.id);
+    }
 
-    const head = document.createElement("header");
+    const head = document.createElement(released ? "summary" : "header");
     head.className = "archive-block-head";
-    const copy = document.createElement("div");
+    const copy = document.createElement(released ? "span" : "div");
     copy.className = "archive-block-copy";
     const kicker = document.createElement("span");
     kicker.className = "archive-block-kicker";
-    kicker.textContent = scope === "global" ? "跨版本共享" : "版本资料";
-    const titleLine = document.createElement("div");
+    kicker.textContent = scope === "global" ? "跨版本共享" : released ? "已发布版本" : "版本资料";
+    const titleLine = document.createElement(released ? "span" : "div");
     titleLine.className = "archive-block-title-line";
-    const title = document.createElement("h3");
+    const title = document.createElement(released ? "span" : "h3");
     title.className = "archive-block-title";
     title.textContent = scope === "global" ? "公共材料" : iterationName(iteration);
     titleLine.append(title);
     if (iteration) titleLine.append(iterationStatusPill(iteration));
     const tag = iteration ? model.iterationSecondaryTag(iteration) : "";
     if (tag) title.title = `版本标识：${tag}`;
-    const meta = document.createElement("p");
+    const meta = document.createElement(released ? "span" : "p");
     meta.className = "archive-block-meta";
     meta.textContent = scope === "global"
       ? `接口文档 1 个固定位置 · 补充材料 ${section.supplementaryCount} 项`
       : `4 个固定位置 · 已填 ${section.fixedCount} 个 · 补充材料 ${section.supplementaryCount} 项`;
     copy.append(kicker, titleLine, meta);
-    const actions = document.createElement("div");
-    actions.className = "archive-block-actions";
-    if (scope === "iteration" && iteration) {
-      actions.append(makeArchiveAddButton("iteration", iteration.id, "supplementary", "添加资料"));
-    } else {
-      actions.append(makeArchiveAddButton("global", null, "supplementary", "添加资料"));
+    head.append(copy);
+    if (!released) {
+      const actions = document.createElement("div");
+      actions.className = "archive-block-actions";
+      if (scope === "iteration" && iteration) {
+        actions.append(makeArchiveAddButton("iteration", iteration.id, "supplementary", "添加资料"));
+      } else {
+        actions.append(makeArchiveAddButton("global", null, "supplementary", "添加资料"));
+      }
+      head.append(actions);
     }
-    head.append(copy, actions);
 
     const slotGrid = document.createElement("div");
     slotGrid.className = "library-slot-grid";
@@ -966,7 +975,21 @@
         : "还没有版本可添加资料；请先在「编辑迭代」中新建版本。";
     }
   }
+  function makeReleasedArchiveHeading(count) {
+    const heading = document.createElement("div");
+    heading.className = "archive-released-heading";
+    const title = document.createElement("span");
+    title.className = "archive-released-title";
+    title.textContent = "已发布版本";
+    const hint = document.createElement("span");
+    hint.className = "archive-released-hint";
+    hint.textContent = `${count} 个版本 · 默认折叠，点击版本名展开`;
+    heading.append(title, hint);
+    return heading;
+  }
   function renderSources() {
+    const shell = $("#sources-dialog .library-shell");
+    const scrollTop = shell?.scrollTop || 0;
     const archive = model.archiveView(state.sources, state.iterations);
     const activeScope = state.archiveScopeTab === "global" ? "global" : "iteration";
     $$(".archive-tab-btn").forEach(btn => {
@@ -976,10 +999,20 @@
     });
 
     const body = $("#archive-body");
-    const blocks = activeScope === "global"
-      ? [makeArchiveSection(archive.global)]
-      : archive.iterations.map(makeArchiveSection);
+    let blocks;
+    if (activeScope === "global") {
+      blocks = [makeArchiveSection(archive.global)];
+    } else {
+      const activeSections = archive.iterations.filter(section => !model.iterationIsReleased(section.iteration));
+      const releasedSections = archive.iterations.filter(section => model.iterationIsReleased(section.iteration));
+      blocks = activeSections.map(section => makeArchiveSection(section));
+      if (releasedSections.length) {
+        blocks.push(makeReleasedArchiveHeading(releasedSections.length));
+        blocks.push(...releasedSections.map(section => makeArchiveSection(section, { released: true })));
+      }
+    }
     body.replaceChildren(...blocks);
+    if (shell) shell.scrollTop = scrollTop;
 
     const empty = $("#archive-empty");
     const noVersions = activeScope === "iteration" && archive.iterations.length === 0;
@@ -1033,8 +1066,12 @@
   async function loadSources() {
     try {
       const data = await sourceRequest("/api/sources?include_removed=1&all_versions=1");
+      const revision = String(data.revision ?? "");
+      const changed = state.sourcesRevision !== revision;
       state.sources = Array.isArray(data.sources) ? data.sources : [];
-      renderSources(); sourceFeedback("资料馆已更新。");
+      state.sourcesRevision = revision;
+      if (changed || !$("#archive-body")?.childElementCount) renderSources();
+      sourceFeedback("资料馆已更新。");
     } catch (error) {
       sourceFeedback(error.message || "无法读取资料馆，请确认本地服务正常。", "error");
     }
@@ -1198,12 +1235,13 @@
   function handleLibraryClick(event) {
     const versionToggle = event.target.closest("[data-library-versions]");
     if (versionToggle) {
-      const groupId = versionToggle.dataset.libraryVersions;
-      if (state.libraryExpanded.has(groupId)) state.libraryExpanded.delete(groupId);
-      else state.libraryExpanded.add(groupId);
-      renderSources();
-      const focusTarget = $$("[data-library-versions]").find(button => button.dataset.libraryVersions === groupId);
-      focusTarget?.focus({ preventScroll: true });
+      const historyKey = versionToggle.dataset.libraryVersions;
+      const expanded = !state.libraryExpanded.has(historyKey);
+      if (expanded) state.libraryExpanded.add(historyKey);
+      else state.libraryExpanded.delete(historyKey);
+      versionToggle.setAttribute("aria-expanded", String(expanded));
+      const history = document.getElementById(libraryHistoryId(historyKey));
+      if (history) history.hidden = !expanded;
       return;
     }
     handleSourceAction(event.target.closest("[data-source-action]"));
@@ -1342,14 +1380,27 @@
     const columns = [document.createElement("div"), document.createElement("div")];
     columns.forEach(column => { column.className = "masonry-column"; });
     list.replaceChildren(...columns);
-    const heights = [0, columns[1].clientWidth > 0 ? 0 : Number.POSITIVE_INFINITY];
     const canMeasure = list.clientWidth > 0;
+    if (!canMeasure) {
+      cards.forEach((card, index) => {
+        card.dataset.masonryOrder = String(index);
+        columns[index % 2].append(card);
+      });
+      return;
+    }
+    // Measure in one pass instead of interleaving append/offsetHeight, which
+    // forced a synchronous layout per card on long lists.
     cards.forEach((card, index) => {
       card.dataset.masonryOrder = String(index);
-      const columnIndex = canMeasure ? model.shortestMasonryColumn(heights) : index % 2;
-      const column = columns[columnIndex];
-      column.append(card);
-      heights[columnIndex] += card.offsetHeight + (parseFloat(getComputedStyle(column).rowGap) || 0);
+      columns[0].append(card);
+    });
+    const gap = parseFloat(getComputedStyle(columns[0]).rowGap) || 0;
+    const heights = [0, 0];
+    const measured = cards.map(card => card.offsetHeight);
+    cards.forEach((card, index) => {
+      const columnIndex = model.shortestMasonryColumn(heights);
+      columns[columnIndex].append(card);
+      heights[columnIndex] += measured[index] + gap;
     });
   }
   function relayoutMasonryList(list) {
@@ -1445,6 +1496,47 @@
     }
     return section;
   }
+  function renderWorkReleasedVersions(groups) {
+    const section = $("#work-released-section");
+    const toggle = $("#work-released-toggle");
+    const list = $("#work-released-list");
+    const count = $("#work-released-count");
+    if (!section || !toggle || !list || !count) return;
+    section.hidden = groups.length === 0;
+    count.textContent = String(groups.length);
+    const open = groups.length > 0 && state.workReleasedOpen;
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.classList.toggle("is-open", open);
+    list.hidden = !open;
+    if (!open) {
+      list.replaceChildren();
+      return;
+    }
+    list.replaceChildren(...groups.map(item => {
+      const details = document.createElement("details");
+      details.className = "released-version-card";
+      details.dataset.iterationId = item.iteration.id;
+      details.dataset.preserveKey = `work-released-${item.iteration.id}`;
+      details.open = state.workReleasedExpanded.has(item.iteration.id);
+      const summary = document.createElement("summary");
+      const name = document.createElement("span");
+      name.className = "released-version-name";
+      name.textContent = iterationName(item.iteration);
+      const meta = document.createElement("span");
+      meta.className = "released-version-meta";
+      meta.textContent = `${item.records.length} 项`;
+      summary.append(name, iterationStatusPill(item.iteration), meta);
+      const body = document.createElement("div");
+      body.className = "record-list released-version-records";
+      populateMasonryList(body, item.records.map(makeCard));
+      details.append(summary, body);
+      return details;
+    }));
+  }
+  function toggleWorkReleased() {
+    state.workReleasedOpen = !state.workReleasedOpen;
+    renderWorkReleasedVersions(state.workReleasedGroups || []);
+  }
   function renderGroup(group) {
     const records = sortRecords(groupRecords(group));
     const unfinished = records.filter(record => !isTerminal(record));
@@ -1457,20 +1549,24 @@
 
       if (iterations.length && model.partitionIterationRecords) {
         const partition = model.partitionIterationRecords(records, iterations);
-        const blocks = partition.groups
+        const blocks = partition.activeGroups
           .filter(item => item.records.length)
           .map(item => makeWorkIterationBlock(item));
         if (iterContainer) {
           iterContainer.replaceChildren(...blocks);
           iterContainer.hidden = blocks.length === 0;
         }
+        state.workReleasedGroups = partition.releasedGroups.filter(item => item.records.length);
+        renderWorkReleasedVersions(state.workReleasedGroups);
 
         const completion = model.partitionTerminalRecords(partition.backlog.completed);
         populateMasonryList(list, [...partition.backlog.unfinished, ...completion.todayRecords].map(makeCard));
-        $(group.empty).hidden = blocks.length > 0 || partition.backlog.unfinished.length > 0 || completion.todayRecords.length > 0;
+        $(group.empty).hidden = blocks.length > 0 || state.workReleasedGroups.length > 0 || partition.backlog.unfinished.length > 0 || completion.todayRecords.length > 0;
         renderCompletedGroups(group, completion);
       } else {
         if (iterContainer) iterContainer.hidden = true;
+        state.workReleasedGroups = [];
+        renderWorkReleasedVersions([]);
         const completion = model.partitionTerminalRecords(completed);
         populateMasonryList(list, [...unfinished, ...completion.todayRecords].map(makeCard));
         $(group.empty).hidden = unfinished.length > 0 || completion.todayRecords.length > 0;
@@ -2621,20 +2717,25 @@
     }
   }
   function openIterationCreateDialog() {
-    const iterations = orderedIterations();
+    const iterations = orderedIterations(); // display order: newest first
     $("#iteration-feedback").textContent = "";
     $("#iteration-feedback").className = "source-feedback";
     $("#iteration-form").reset();
     const select = $("#iteration-order-select");
-    const options = iterations.map((iteration, index) => ({ value: String(index), label: `插入到「${iterationName(iteration)}」之前` }));
-    options.push({ value: String(iterations.length), label: "放在最后" });
+    const count = iterations.length;
+    // UI positions are display positions (0 = newest). The backend `order`
+    // field stays ascending, so display index k maps to count - k.
+    const options = [{ value: String(count), label: "放在最前（最新）" }];
+    iterations.forEach((iteration, index) => {
+      options.push({ value: String(count - index - 1), label: `放在「${iterationName(iteration)}」之后` });
+    });
     select.replaceChildren(...options.map(option => {
       const node = document.createElement("option");
       node.value = option.value;
       node.textContent = option.label;
       return node;
     }));
-    select.value = String(iterations.length);
+    select.value = String(count);
     $("#iteration-dialog").showModal();
     $("#iteration-title-input").focus();
   }
@@ -2865,6 +2966,7 @@
   $("#search").addEventListener("input", event => { state.query = event.target.value; render(); });
   $("#show-archived").addEventListener("change", event => { state.showArchived = event.target.checked; render(); });
   $("#refresh").addEventListener("click", refresh);
+  $("#work-released-toggle").addEventListener("click", toggleWorkReleased);
   $("#worktime-open").addEventListener("click", openWorkHours);
   $("#settings-open").addEventListener("click", openSettings);
   $("#settings-close").addEventListener("click", () => $("#settings-dialog").close());
@@ -3027,8 +3129,19 @@
     });
   }
   document.addEventListener("toggle", event => {
-    if (event.target.matches("details") && event.target.open) {
-      requestAnimationFrame(() => $$(".record-list", event.target).forEach(relayoutMasonryList));
+    const target = event.target;
+    if (target.matches?.("details.released-version-card")) {
+      const iterationId = target.dataset.iterationId;
+      if (target.open) state.workReleasedExpanded.add(iterationId);
+      else state.workReleasedExpanded.delete(iterationId);
+    }
+    if (target.matches?.("details.archive-block-released")) {
+      const iterationId = target.dataset.iterationId;
+      if (target.open) state.archiveReleasedExpanded.add(iterationId);
+      else state.archiveReleasedExpanded.delete(iterationId);
+    }
+    if (target.matches?.("details") && target.open) {
+      requestAnimationFrame(() => $$(".record-list", target).forEach(relayoutMasonryList));
     }
   }, true);
   document.addEventListener("submit", event => {

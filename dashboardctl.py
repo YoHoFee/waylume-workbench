@@ -1334,7 +1334,16 @@ def _iteration_sort_key(it: dict[str, Any]) -> tuple[int, int, str, str]:
 
 
 def ordered_iterations(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ascending persistence order: smaller `order` is older."""
     return sorted((it for it in iterations if isinstance(it, dict)), key=_iteration_sort_key)
+
+
+def display_iterations(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Newest first for UI/API while keeping `order` ascending on disk."""
+    ordered = ordered_iterations(iterations)
+    explicit = [it for it in ordered if _iteration_order_value(it.get("order")) is not None]
+    missing = [it for it in ordered if _iteration_order_value(it.get("order")) is None]
+    return list(reversed(explicit)) + list(reversed(missing))
 
 
 def _normalize_iteration_orders(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1352,7 +1361,7 @@ def list_iterations() -> dict[str, Any]:
     return {
         "revision": db.get("revision", 0),
         "current_iteration_id": current_id,
-        "iterations": copy.deepcopy(ordered_iterations(iterations))
+        "iterations": copy.deepcopy(display_iterations(iterations))
     }
 
 
@@ -1425,13 +1434,16 @@ def reorder_iterations(iteration_ids: list[str]) -> dict[str, Any]:
         if set(iteration_ids) != set(by_id):
             raise ValueError("iteration_order_mismatch")
         now = timestamp()
+        # The API/UI passes display order (newest first); `order` stays
+        # ascending on disk so larger always means newer.
+        count = len(iteration_ids)
         for index, it_id in enumerate(iteration_ids):
-            by_id[it_id]["order"] = index
+            by_id[it_id]["order"] = count - 1 - index
             by_id[it_id]["updated_at"] = now
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event("iterations_reordered", {"id": "iterations", "type": "iteration"}, db["revision"])
-        return {"revision": db["revision"], "iterations": copy.deepcopy(ordered_iterations(iterations))}
+        return {"revision": db["revision"], "iterations": copy.deepcopy(display_iterations(iterations))}
 
     return with_lock(update)
 
@@ -3886,7 +3898,7 @@ def main() -> None:
     iter_create.add_argument("--target-release-date", help="target release date (YYYY-MM-DD)")
     iter_create.add_argument("--description", default="")
     iter_create.add_argument("--iteration-id", help="optional custom iteration ID")
-    iter_create.add_argument("--order", type=int, help="insert position, 0-based; defaults to the end")
+    iter_create.add_argument("--order", type=int, help="insert position in ascending order (0=oldest, default=newest)")
     iter_show = iter_sub.add_parser("show", help="show one iteration")
     iter_show.add_argument("id")
     iter_switch = iter_sub.add_parser("switch", help="set current active iteration")
@@ -3904,7 +3916,7 @@ def main() -> None:
     iter_assign = iter_sub.add_parser("assign-record", help="assign record to iteration")
     iter_assign.add_argument("record_id")
     iter_assign.add_argument("iteration_id")
-    iter_reorder = iter_sub.add_parser("reorder", help="persist the display order of all iterations")
+    iter_reorder = iter_sub.add_parser("reorder", help="persist display order; pass IDs newest first")
     iter_reorder.add_argument("ids", nargs="+")
     iter_migrate = iter_sub.add_parser("migrate", help="migrate legacy records and sources into default iteration archive")
     iter_migrate.add_argument("--version-tag", default="v13.4.2", help="default iteration version tag")

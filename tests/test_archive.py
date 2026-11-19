@@ -137,12 +137,13 @@ class ArchiveStoreTests(unittest.TestCase):
         inserted = dashboardctl.create_iteration("13.4.0 埋点", "13.4.0 埋点", order=1)["iteration"]
 
         listing = dashboardctl.list_iterations()["iterations"]
-        self.assertEqual([it["id"] for it in listing], [first["id"], inserted["id"], second["id"]])
-        self.assertEqual([it["order"] for it in listing], [0, 1, 2])
+        # Display order is newest first; on disk order stays ascending.
+        self.assertEqual([it["id"] for it in listing], [second["id"], inserted["id"], first["id"]])
+        self.assertEqual([it["order"] for it in listing], [2, 1, 0])
 
         reordered = dashboardctl.reorder_iterations([second["id"], first["id"], inserted["id"]])["iterations"]
         self.assertEqual([it["id"] for it in reordered], [second["id"], first["id"], inserted["id"]])
-        self.assertEqual([it["order"] for it in reordered], [0, 1, 2])
+        self.assertEqual([it["order"] for it in reordered], [2, 1, 0])
 
         with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
             dashboardctl.update_iteration(second["id"], {"version_tag": "13.4.0"})

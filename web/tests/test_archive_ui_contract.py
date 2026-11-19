@@ -77,6 +77,27 @@ class ArchiveUIContractTests(unittest.TestCase):
         self.assertIn("source_group_location_conflict", SCRIPT)
         self.assertIn("set_source_location", (WEB.parent / "dashboardctl.py").read_text(encoding="utf-8"))
 
+    def test_versions_are_newest_first_and_released_items_are_progressive(self):
+        self.assertIn("return bOrder - aOrder;", MODEL)
+        self.assertIn("activeGroups: groups.filter", MODEL)
+        self.assertIn("releasedGroups: groups.filter", MODEL)
+        for selector in ("work-released-section", "work-released-toggle", "work-released-list"):
+            self.assertIn(f'id="{selector}"', HTML)
+        for marker in ("查看已发布版本", "state.workReleasedOpen", "state.workReleasedExpanded",
+                       "state.archiveReleasedExpanded", "makeArchiveSection(section, { released: true })",
+                       "archive-block-released"):
+            self.assertIn(marker, SCRIPT + HTML + STYLE)
+        self.assertIn("已发布版本", SCRIPT)
+
+    def test_library_dialog_drops_scroll_blur_and_skips_redundant_rerenders(self):
+        self.assertIn(".sources-dialog.library-dialog::backdrop{backdrop-filter:none", STYLE)
+        self.assertIn("body .library-dialog .library-top{backdrop-filter:none", STYLE)
+        self.assertNotIn("library-dialog::backdrop{background:#00000038;backdrop-filter", STYLE)
+        self.assertIn("state.sourcesRevision !== revision", SCRIPT)
+        self.assertIn('if (changed || !$("#archive-body")?.childElementCount) renderSources();', SCRIPT)
+        self.assertIn("history.hidden = !expanded", SCRIPT)
+        self.assertIn("cards.map(card => card.offsetHeight)", SCRIPT)
+
     def test_new_sections_reuse_the_existing_visual_language(self):
         compact = STYLE.replace(" ", "").replace("\n", "")
         for selector in (".archive-block{", ".archive-block-head{", ".archive-supplementary{",

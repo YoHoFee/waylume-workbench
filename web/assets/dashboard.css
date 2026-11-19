@@ -733,10 +733,10 @@ body[data-theme="dark"] .stage-chip[data-status="done"]{background:#293e34;borde
   box-shadow:var(--lib-shadow);overflow:hidden;
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","Noto Sans SC",sans-serif;
 }
-.sources-dialog.library-dialog::backdrop{background:#00000038;backdrop-filter:blur(8px)}
+.sources-dialog.library-dialog::backdrop{background:#0000005c}
 .library-shell{display:flex;max-height:90vh;flex-direction:column;overflow-y:auto;overscroll-behavior:contain}
 body .library-dialog .library-top{position:sticky;top:0;z-index:3;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
-  padding:22px 24px 12px;border:0;background:var(--lib-bg);backdrop-filter:blur(18px)}
+  padding:22px 24px 12px;border:0;background:var(--lib-bg)}
 body .library-dialog .library-top .dialog-kicker{color:var(--lib-muted);font-size:12px;font-weight:600;letter-spacing:.02em}
 body .library-dialog .library-top h2{margin:3px 0 0;color:var(--lib-text);font-size:28px;line-height:1.15;font-weight:650;letter-spacing:-.025em}
 .library-dialog .dialog-close{width:30px;height:30px;border:1px solid var(--lib-line);background:var(--lib-surface);color:var(--lib-muted);box-shadow:0 1px 2px #0000000d}
@@ -875,8 +875,6 @@ body[data-theme="dark"] .library-dialog #source-link-form input,
 body[data-theme="dark"] .library-dialog #source-link-form select{background:var(--lib-surface);border:1px solid var(--lib-line);color:var(--lib-text);box-shadow:none}
 body[data-theme="dark"] .library-dialog #source-link-form input:focus,
 body[data-theme="dark"] .library-dialog #source-link-form select:focus{border-color:var(--lib-accent);box-shadow:0 0 0 3px var(--lib-accent-soft)}
-.sources-dialog.library-dialog::backdrop{-webkit-backdrop-filter:blur(8px)}
-body .library-dialog .library-top{-webkit-backdrop-filter:blur(18px)}
 .library-lifecycle-mark{color:#a15c45;font-size:10px;font-weight:600;white-space:nowrap}
 body[data-theme="dark"] .library-lifecycle-mark{color:#e0a08d}
 
@@ -2465,3 +2463,73 @@ body[data-theme="dark"] .relocate-group-hint{background:#33280f;color:#f0c674}
 }
 .archive-warning-pill{flex:none;padding:2px 7px;border-radius:999px;background:#fff4df;color:#8a5a12;font-size:9.5px;font-weight:650;line-height:1.5;white-space:nowrap}
 body[data-theme="dark"] .archive-warning-pill{background:#33280f;color:#f0c674}
+
+/* 12 · 最新版本在上、已发布逐级折叠（ROUND3） --------------------------- */
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-section{margin:2px 0 14px;min-width:0}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-toggle{
+  display:flex;align-items:center;gap:8px;width:100%;min-height:40px;padding:8px 12px;
+  border:1px solid var(--home-line);border-radius:12px;background:var(--home-surface);
+  color:var(--home-text);font-size:12.5px;font-weight:600;cursor:pointer;text-align:left;
+  transition:background-color 160ms var(--home-ease),border-color 160ms var(--home-ease);
+}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-toggle:hover{background:var(--home-surface-2);border-color:var(--home-line-strong)}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-toggle:focus-visible{outline:2px solid var(--home-accent);outline-offset:3px}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-chevron{
+  flex:none;width:8px;height:8px;margin-left:auto;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+  transform:rotate(45deg) translateY(-1px);transition:transform 180ms var(--home-ease);
+}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-versions-toggle.is-open .released-versions-chevron{transform:rotate(225deg) translateY(-1px)}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-list{display:grid;gap:8px;margin-top:8px;min-width:0}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card{
+  min-width:0;border:1px solid var(--home-line);border-radius:12px;background:var(--home-surface);overflow:hidden;
+}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card summary{
+  display:flex;align-items:center;gap:8px;min-height:38px;padding:8px 12px;list-style:none;cursor:pointer;
+  color:var(--home-text);font-size:12.5px;font-weight:600;
+}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card summary::-webkit-details-marker{display:none}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card summary::after{
+  content:"";flex:none;width:7px;height:7px;margin-left:2px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;
+  transform:rotate(45deg) translateY(-1px);transition:transform 180ms var(--home-ease);
+}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card[open] summary::after{transform:rotate(225deg) translateY(-1px)}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-card[open] summary{border-bottom:1px solid var(--home-line)}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-name{min-width:0;overflow-wrap:anywhere}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-meta{margin-left:auto;color:var(--home-muted);font-size:11px;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
+body:is([data-theme="minimal"],[data-theme="dark"]) .released-version-records{padding:10px}
+
+/* 资料馆已发布版本折叠 */
+.archive-released-heading{display:flex;align-items:baseline;gap:8px;padding:6px 24px 8px;min-width:0}
+.archive-released-title{color:var(--lib-text);font-size:13px;font-weight:650;letter-spacing:-.01em}
+.archive-released-hint{color:var(--lib-muted);font-size:11px}
+.archive-block-released{border:1px solid var(--lib-line);border-radius:18px;background:var(--lib-surface);overflow:hidden;margin:0 24px 10px;padding:0}
+.archive-block-released+.archive-block-released{margin-top:8px}
+.archive-block-released>.archive-block-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 16px;cursor:pointer;list-style:none}
+.archive-block-released>.archive-block-head::-webkit-details-marker{display:none}
+.archive-block-released>.archive-block-head::after{
+  content:"";flex:none;width:8px;height:8px;margin-left:4px;border-right:1.5px solid var(--lib-muted);border-bottom:1.5px solid var(--lib-muted);
+  transform:rotate(45deg) translateY(-1px);transition:transform 180ms var(--home-ease);
+}
+.archive-block-released[open]>.archive-block-head::after{transform:rotate(225deg) translateY(-1px)}
+.archive-block-released[open]>.archive-block-head{border-bottom:1px solid var(--lib-line)}
+.archive-block-released .archive-block-copy{gap:2px}
+.archive-block-released .archive-block-title{font-size:16px;font-weight:620}
+.archive-block-released .archive-block-meta{display:block}
+.archive-block-released .library-slot-grid{padding:12px 16px 8px}
+.archive-block-released .archive-supplementary{margin:0 16px 10px;padding-top:10px}
+.archive-block-released .archive-removed-fold{margin:6px 16px 10px}
+.archive-block:not(.archive-block-released) .archive-block-meta{display:block}
+@media(max-width:640px){
+  .archive-released-heading{padding:6px 16px 8px;flex-direction:column;gap:2px}
+  .archive-block-released{margin:0 16px 10px}
+  .archive-block-released>.archive-block-head{padding:12px 13px}
+}
+@media(max-width:380px){
+  .archive-released-heading{padding:6px 12px 8px}
+  .archive-block-released{margin:0 12px 10px}
+}
+
+/* 去掉资料馆滚动路径上的模糊合成，保留不透明背景与发丝线 */
+.sources-dialog.library-dialog::backdrop{backdrop-filter:none;-webkit-backdrop-filter:none;background:#0000005c}
+body[data-theme="dark"] .sources-dialog.library-dialog::backdrop{backdrop-filter:none;-webkit-backdrop-filter:none;background:#000000a8}
+body .library-dialog .library-top{backdrop-filter:none;-webkit-backdrop-filter:none}

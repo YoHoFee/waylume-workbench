@@ -26,12 +26,12 @@ const iterations = [
   { id: "ITER-v1342", version_tag: "13.4.2 迭代二", title: "13.4.2 迭代二", status: "active", order: 1, created_at: "2026-11-05T00:00:00+08:00" },
   { id: "ITER-v1341", version_tag: "13.4.1", title: "13.4.1", status: "released", order: 2, created_at: "2026-10-20T00:00:00+08:00" }
 ];
-assert.deepEqual(model.orderedIterations(iterations).map(it => it.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
+assert.deepEqual(model.orderedIterations(iterations).map(it => it.id), ["ITER-v1341", "ITER-v1342", "ITER-v1340"], "newest order first");
 const legacyIterations = [
   { id: "ITER-b", title: "B", created_at: "2026-11-02T00:00:00+08:00" },
   { id: "ITER-a", title: "A", created_at: "2026-11-01T00:00:00+08:00" }
 ];
-assert.deepEqual(model.orderedIterations(legacyIterations).map(it => it.id), ["ITER-a", "ITER-b"]);
+assert.deepEqual(model.orderedIterations(legacyIterations).map(it => it.id), ["ITER-b", "ITER-a"], "legacy fallback is creation-time descending");
 
 // One readable version name; version_tag is a compatibility field only.
 assert.equal(model.iterationName({ id: "X", title: "13.4.2 迭代二", version_tag: "13.4.2 迭代二" }), "13.4.2 迭代二");
@@ -49,7 +49,9 @@ const iterRecords = [
 ];
 
 const iterPartition = model.partitionIterationRecords(iterRecords, iterations);
-assert.deepEqual(iterPartition.groups.map(group => group.iteration.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
+assert.deepEqual(iterPartition.groups.map(group => group.iteration.id), ["ITER-v1341", "ITER-v1342", "ITER-v1340"]);
+assert.deepEqual(iterPartition.activeGroups.map(group => group.iteration.id), ["ITER-v1342"]);
+assert.deepEqual(iterPartition.releasedGroups.map(group => group.iteration.id), ["ITER-v1341", "ITER-v1340"]);
 
 const activeGroup = iterPartition.groups.find(group => group.iteration.id === "ITER-v1342");
 assert.equal(activeGroup.visibleRecords.length, 2, "Both in-progress and completed records remain visible before release");
@@ -77,7 +79,7 @@ const sources = [
 ];
 
 const archive = model.archiveView(sources, iterations);
-assert.deepEqual(archive.iterations.map(section => section.iteration.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
+assert.deepEqual(archive.iterations.map(section => section.iteration.id), ["ITER-v1341", "ITER-v1342", "ITER-v1340"]);
 assert.equal(archive.global.slots.find(slot => slot.slot === "api_doc").card.name, "全局接口文档");
 const section1342 = archive.iterations.find(section => section.iteration.id === "ITER-v1342");
 const section1340 = archive.iterations.find(section => section.iteration.id === "ITER-v1340");

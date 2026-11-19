@@ -99,6 +99,9 @@
   function iterationOrderValue(value) {
     return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
   }
+  // Newest first. `order` is an ascending compatibility field (larger = newer),
+  // so display order is descending; legacy versions without `order` fall back
+  // to creation time descending.
   function orderedIterations(iterations) {
     const list = (Array.isArray(iterations) ? iterations : []).filter(item => item && typeof item === "object");
     return [...list].sort((a, b) => {
@@ -107,10 +110,10 @@
       if (aOrder !== bOrder) {
         if (aOrder === null) return 1;
         if (bOrder === null) return -1;
-        return aOrder - bOrder;
+        return bOrder - aOrder;
       }
-      return String(a.created_at || "").localeCompare(String(b.created_at || ""))
-        || String(a.id || "").localeCompare(String(b.id || ""));
+      return String(b.created_at || "").localeCompare(String(a.created_at || ""))
+        || String(b.id || "").localeCompare(String(a.id || ""));
     });
   }
   // Delegated tasks (and BUGs) intentionally live outside the version matrix.
@@ -160,6 +163,8 @@
     return {
       iterations: iterList,
       groups,
+      activeGroups: groups.filter(group => !group.isReleased),
+      releasedGroups: groups.filter(group => group.isReleased),
       backlog: {
         records: backlog,
         unfinished: backlogUnfinished,

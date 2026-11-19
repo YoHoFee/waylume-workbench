@@ -1687,12 +1687,14 @@
   }
   function rerenderPreservingCardFocus() {
     const active = document.activeElement;
+    const scrollX = window.scrollX, scrollY = window.scrollY;
     let selector = null;
     for (const attribute of ["data-open-record", "data-followup-id", "data-complete-id"]) {
       const value = active?.getAttribute?.(attribute);
       if (value) { selector = `[${attribute}="${CSS.escape(value)}"]`; break; }
     }
     render();
+    if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo(scrollX, scrollY);
     if (selector) $(selector)?.focus({ preventScroll: true });
   }
   function findRecord(id) {

@@ -97,6 +97,7 @@ class ArchiveUIContractTests(unittest.TestCase):
         self.assertIn('if (changed || !$("#archive-body")?.childElementCount) renderSources();', SCRIPT)
         self.assertIn("history.hidden = !expanded", SCRIPT)
         self.assertIn("cards.map(card => card.offsetHeight)", SCRIPT)
+        self.assertIn("window.scrollTo(scrollX, scrollY)", SCRIPT)
 
     def test_new_sections_reuse_the_existing_visual_language(self):
         compact = STYLE.replace(" ", "").replace("\n", "")

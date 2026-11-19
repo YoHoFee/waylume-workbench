@@ -93,6 +93,11 @@ ITERATION_STATUSES = {"planning", "active", "pending_release", "released", "arch
 DEFAULT_ITERATION_STATUS = "active"
 MAX_ITERATION_TAG_CHARS = 50
 MAX_ITERATION_TITLE_CHARS = 120
+MAX_ITERATION_ID_CHARS = 120
+# Must stay aligned with the iteration routes in server.py. Real IDs such as
+# `ITER-13.4.2-iter2` and `ITER-13.4.0-ANALYTICS` contain dots.
+ITERATION_ID_PATTERN = rf"[A-Za-z0-9._-]{{1,{MAX_ITERATION_ID_CHARS}}}"
+ITERATION_ID_RE = re.compile(rf"\A{ITERATION_ID_PATTERN}\Z")
 SOURCE_INSPECTION_MODES = {"auto", "manual"}
 MAX_SOURCE_GROUP_ID = 100
 MAX_SOURCE_VERSION_LABEL = 80
@@ -1365,7 +1370,12 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
 
     clean_tag = version_tag.strip()
     clean_title = title.strip()
-    it_id = iteration_id.strip() if (isinstance(iteration_id, str) and iteration_id.strip()) else f"ITER-{uuid.uuid4().hex[:8]}"
+    if iteration_id is None:
+        it_id = f"ITER-{uuid.uuid4().hex[:8]}"
+    else:
+        if not isinstance(iteration_id, str) or not ITERATION_ID_RE.fullmatch(iteration_id.strip()):
+            raise ValueError("invalid_iteration_id")
+        it_id = iteration_id.strip()
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -1435,14 +1445,14 @@ def update_iteration(iteration_id: str, patch: dict[str, Any]) -> dict[str, Any]
         now = timestamp()
         if "version_tag" in patch and patch["version_tag"] is not None:
             new_tag = str(patch["version_tag"]).strip()
-            if not new_tag:
+            if not new_tag or len(new_tag) > MAX_ITERATION_TAG_CHARS:
                 raise ValueError("invalid_iteration_version_tag")
             duplicate = next((other for other in _iteration_store_list(db)
                               if other is not it and other.get("version_tag") == new_tag), None)
             if duplicate:
                 raise ValueError("iteration_duplicate")
         if "title" in patch and patch["title"] is not None:
-            if not isinstance(patch["title"], str) or not patch["title"].strip():
+            if not isinstance(patch["title"], str) or not patch["title"].strip() or len(patch["title"].strip()) > MAX_ITERATION_TITLE_CHARS:
                 raise ValueError("invalid_iteration_title")
             duplicate_title = next((other for other in _iteration_store_list(db)
                                     if other is not it and str(other.get("title") or "").strip() == patch["title"].strip()), None)
@@ -2522,6 +2532,14 @@ def error_code(exc: ValueError) -> str:
         "invalid_source_inspection": "invalid_source_inspection",
         "source_group_not_found": "source_group_not_found",
         "source_group_slot_conflict": "source_group_slot_conflict",
+        "source_group_location_conflict": "source_group_location_conflict",
+        "invalid_iteration_id": "invalid_iteration_id",
+        "iteration_not_found": "iteration_not_found",
+        "invalid_iteration_order": "invalid_iteration_order",
+        "iteration_order_mismatch": "iteration_order_mismatch",
+        "missing_iteration_id": "missing_iteration_id",
+        "invalid_iteration_title": "invalid_iteration_title",
+        "invalid_iteration_version_tag": "invalid_iteration_version_tag",
     }
     return mapping.get(str(exc), "invalid_request")
 

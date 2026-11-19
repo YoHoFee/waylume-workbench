@@ -462,7 +462,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"revision": db.get("revision", 0), "preferences": db.get("preferences", {})}); return
         if route == "/api/iterations":
             self._send_json(dashboardctl.list_iterations()); return
-        single_iter = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})", route)
+        single_iter = re.fullmatch(rf"/api/iterations/({dashboardctl.ITERATION_ID_PATTERN})", route)
         if single_iter:
             db = dashboardctl.load_store()
             it = dashboardctl._find_iteration(db, single_iter.group(1))
@@ -731,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
                     raise ApiError(400, "invalid_iteration_order")
                 self._send_json(dashboardctl.reorder_iterations(ids)); return
-            iter_action = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})/(release|switch)", route)
+            iter_action = re.fullmatch(rf"/api/iterations/({dashboardctl.ITERATION_ID_PATTERN})/(release|switch)", route)
             if iter_action:
                 it_id, it_act = iter_action.groups()
                 if it_act == "release":
@@ -741,7 +741,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif it_act == "switch":
                     self._only_keys(payload, set())
                     self._send_json(dashboardctl.set_current_iteration(it_id)); return
-            iter_update = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})/update", route)
+            iter_update = re.fullmatch(rf"/api/iterations/({dashboardctl.ITERATION_ID_PATTERN})/update", route)
             if iter_update:
                 self._only_keys(payload, {"version_tag", "title", "description", "target_release_date", "status", "notes"})
                 self._send_json(dashboardctl.update_iteration(iter_update.group(1), payload)); return

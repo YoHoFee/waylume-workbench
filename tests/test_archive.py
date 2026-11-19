@@ -149,6 +149,23 @@ class ArchiveStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
             dashboardctl.create_iteration("another-tag", "13.4.0 埋点")
 
+    def test_iteration_id_charset_and_update_length_limits(self):
+        dotted = dashboardctl.create_iteration(
+            "13.4.0 埋点", "13.4.0 埋点", iteration_id="ITER-13.4.0-ANALYTICS"
+        )["iteration"]
+        self.assertEqual(dotted["id"], "ITER-13.4.0-ANALYTICS")
+        updated = dashboardctl.update_iteration(dotted["id"], {"title": "13.4.0 埋点（更名）"})["iteration"]
+        self.assertEqual(updated["title"], "13.4.0 埋点（更名）")
+
+        with self.assertRaisesRegex(ValueError, "invalid_iteration_id"):
+            dashboardctl.create_iteration("bad id", "bad id", iteration_id="bad id")
+        with self.assertRaisesRegex(ValueError, "invalid_iteration_id"):
+            dashboardctl.create_iteration("too long", "too long", iteration_id="a" * 121)
+        with self.assertRaisesRegex(ValueError, "invalid_iteration_title"):
+            dashboardctl.update_iteration(dotted["id"], {"title": "t" * 121})
+        with self.assertRaisesRegex(ValueError, "invalid_iteration_version_tag"):
+            dashboardctl.update_iteration(dotted["id"], {"version_tag": "t" * 51})
+
     def test_source_location_moves_group_and_archive_context_stays_isolated(self):
         first = dashboardctl.create_iteration("13.4.0", "13.4.0")["iteration"]
         second = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
@@ -301,6 +318,40 @@ class ArchiveApiTests(unittest.TestCase):
         status, data = self.request("POST", f"/api/iterations/{it_id}/release", {"note": "完成上线"})
         self.assertEqual(status, 200)
         self.assertEqual(data["iteration"]["status"], "released")
+
+    def test_dotted_iteration_ids_work_across_iteration_api(self):
+        dotted = "ITER-13.4.0-ANALYTICS"
+        status, created = self.request("POST", "/api/iterations", {
+            "version_tag": "13.4.0 埋点", "title": "13.4.0 埋点", "iteration_id": dotted
+        })
+        self.assertEqual(status, 201)
+        status, second = self.request("POST", "/api/iterations", {
+            "version_tag": "13.4.2 迭代二", "title": "13.4.2 迭代二", "iteration_id": "ITER-13.4.2-iter2"
+        })
+        self.assertEqual(status, 201)
+        second_id = second["iteration"]["id"]
+
+        status, data = self.request("GET", f"/api/iterations/{dotted}")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["iteration"]["id"], dotted)
+
+        status, data = self.request("POST", f"/api/iterations/{dotted}/update", {
+            "title": "13.4.0 埋点（更名）", "version_tag": "13.4.0 埋点（更名）"
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["iteration"]["title"], "13.4.0 埋点（更名）")
+
+        status, data = self.request("POST", "/api/iterations/order", {"ids": [second_id, dotted]})
+        self.assertEqual(status, 200)
+        self.assertEqual([it["id"] for it in data["iterations"]], [second_id, dotted])
+
+        status, data = self.request("POST", f"/api/iterations/{dotted}/release", {"note": "埋点版本收口"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["iteration"]["status"], "released")
+
+        status, data = self.request("POST", f"/api/iterations/{second_id}/switch", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["current_iteration_id"], second_id)
 
     def test_iteration_order_and_scoped_file_upload_api(self):
         status, first = self.request("POST", "/api/iterations", {"version_tag": "13.4.0", "title": "13.4.0"})

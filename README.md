@@ -57,6 +57,7 @@ python3 scripts/install_waylume.py --check --home /tmp/waylume-home --data-dir /
 
 ## Skill 内容索引
 
+- [并行 Git 工作区与本地分支协议（必读）](skills/mcloud-workflow/references/parallel-git-worktree.md)
 - [工作台 workflow 契约（平台无关）](skills/waylume-assistant/references/workflow.md)
 - [工作助理职责与边界](skills/waylume-assistant/references/role-and-boundaries.md)
 - [BUG 分析与处理流程](skills/waylume-assistant/references/bug-workflow.md)

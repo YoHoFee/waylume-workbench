@@ -19,6 +19,10 @@ For BUGs, first determine responsibility from the persisted workbench scope cata
 
 At the start of work, check only the entries in [references/troubleshooting.md](references/troubleshooting.md) that match the current environment, device/UI, platform write, scheduling/handoff, or code/business path. For a known symptom, use its linked canonical evidence and shortest supported handling before investigating again. Do not reread the full lessons file by default. After a fix, add or correct an experience only when its cause and handling have sufficient evidence; mark unresolved or contradicted explanations tentative and retain the evidence gap. Historical lessons never override the user's latest authorization, assigned responsibility, current C/F decision, batch boundary, or visual acceptance requirements.
 
+## Parallel Git workspace (mandatory)
+
+Before claiming, starting, or resuming any code task, read [parallel Git worktree protocol](references/parallel-git-worktree.md). Main checkout is integration-only; every requirement/BUG uses its own `local/` branch and its own worktree under `~/.codex/worktrees/`. The task context must contain record ID, branch, base, worktree, owner and build owner; if any is missing, stop and ask the Lead to allocate before editing. Do not edit the main checkout, share one branch across worktrees, clean another worktree, or start a concurrent build/device operation. The existing `~/.dsh/WORK_ASSISTANT.md` section 7 branch baseline/naming/push/merge rules remain in force; this protocol only adds workspace isolation.
+
 ## Start with the stored item
 
 1. Resolve an exact stable ID from the user or dashboard. If known, read the small current-state package first:

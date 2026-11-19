@@ -44,6 +44,21 @@ def _context(record: dict[str, Any]) -> str:
         if value not in (None, "", [], {}): lines.extend([f"## {label}", "", str(value), ""])
 
     add_value("目标", record.get("initial_brief") or record.get("status_detail"))
+    if record.get("iteration_id"):
+        add_value("所属迭代", record["iteration_id"])
+    if record.get("reopen_count"):
+        lines.extend([f"## 修改轮次", "", f"第 {record['reopen_count']} 轮二次修改中", ""])
+    if record.get("reopen_history"):
+        lines.extend(["## 二次修改历史", ""])
+        for entry in record["reopen_history"]:
+            when = entry.get("at", "时间未知")
+            round_no = entry.get("round", "")
+            reason = entry.get("reason", "")
+            mode = entry.get("audit_mode", "lightweight")
+            lines.append(f"- **第 {round_no} 轮 ({when})** [审计模式: {mode}]: {reason}")
+            for att in entry.get("attachments", []):
+                lines.append(f"  - 补充材料: {att.get('summary') or att.get('filename')}")
+        lines.append("")
     if record.get("decisions"):
         lines.extend(["## 已确认决定", ""])
         for item in record["decisions"]:
@@ -140,6 +155,7 @@ def _context(record: dict[str, Any]) -> str:
         "last_agent_activity_at", "agent_state", "agent_work_status", "completed_at", "manual_status",
         "manual_completed_at", "manual_completed_by",
         "workflow", "workflow_template_id", "workflow_stage", "workflow_stage_status",
+        "iteration_id", "reopen_count", "reopen_history",
     }
     # Keep legacy/source-specific evidence available without repeating the
     # identity and status fields already shown in the detail header.

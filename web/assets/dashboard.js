@@ -1,6 +1,7 @@
 (() => {
   const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
-    workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set() };
+    workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set(),
+    iterations: [], currentIterationId: null, selectedIterationId: null, archiveScopeTab: "iteration", reopenTargetId: null, reopenFile: null, iterationBusy: false };
   const inspectionClock = { schedule: null, serverEpoch: null, syncedAt: null, nextRunAt: null };
   const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…" };
   const themeStorage = (() => { try { return window.localStorage; } catch (_) { return { getItem: () => null, setItem: () => {} }; } })();
@@ -652,7 +653,9 @@
     const lifecycle = document.createElement("button"); lifecycle.type = "button"; lifecycle.className = "library-text-button";
     lifecycle.textContent = card.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
     lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = card.id;
-    actions.append(addVersion, open, lifecycle);
+    const relocate = document.createElement("button"); relocate.type = "button"; relocate.className = "library-text-button source-relocate-btn";
+    relocate.textContent = "移动位置"; relocate.addEventListener("click", () => openRelocateDialog(card));
+    actions.append(addVersion, open, lifecycle, relocate);
     article.append(name, link, subtitle, inspection, actions, makeVersionHistory(slot.group));
     return article;
   }
@@ -711,7 +714,9 @@
     lifecycleOverride.dataset.sourceAction = "nondeprecated"; lifecycleOverride.dataset.sourceId = source.id;
     const remove = document.createElement("button"); remove.type = "button"; remove.className = "library-text-button is-muted";
     remove.textContent = "移出资料"; remove.title = "移出后可随时恢复"; remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = source.id;
-    actions.append(lifecycleOverride, remove, makeSlotSelect(group));
+    const relocate = document.createElement("button"); relocate.type = "button"; relocate.className = "library-text-button source-relocate-btn";
+    relocate.textContent = "移动位置"; relocate.addEventListener("click", () => openRelocateDialog(source));
+    actions.append(lifecycleOverride, remove, relocate, makeSlotSelect(group));
     row.append(logo, info, actions);
     return row;
   }
@@ -736,14 +741,172 @@
   }
   function renderSources() {
     const view = model.libraryView(state.sources);
+    const currentIterId = state.selectedIterationId || state.currentIterationId;
+    const archive = model.archiveView ? model.archiveView(state.sources, state.iterations, currentIterId) : null;
+    const activeScope = state.archiveScopeTab || "iteration";
+
     $("#source-count").textContent = String(view.activeCount);
     $("#other-source-count").textContent = String(view.others.length);
     $("#removed-source-count").textContent = String(view.removed.length);
-    $("#library-slot-grid").replaceChildren(...view.slots.map(makeSlotCard));
+
+    $$(".archive-tab-btn").forEach(btn => {
+      const isActive = btn.dataset.scope === activeScope;
+      btn.classList.toggle("active", isActive);
+      btn.setAttribute("aria-selected", String(isActive));
+    });
+
+    const fixedSection = $(".library-fixed");
+    const suppSection = $("#supplementary-pool-section");
+    const historySection = $("#archive-history-section");
+    const othersSection = $(".library-others");
+
+    if (activeScope === "iteration") {
+      if (fixedSection) fixedSection.hidden = false;
+      $("#library-slot-grid").replaceChildren(...(archive?.iterationSlots || view.slots).map(makeSlotCard));
+      if (suppSection) {
+        suppSection.hidden = false;
+        renderSupplementaryPool(archive?.supplementaryItems || []);
+      }
+      if (historySection) historySection.hidden = true;
+      if (othersSection) othersSection.hidden = false;
+    } else if (activeScope === "history") {
+      if (fixedSection) fixedSection.hidden = true;
+      if (suppSection) suppSection.hidden = true;
+      if (historySection) {
+        historySection.hidden = false;
+        renderArchiveHistoryList(archive?.iterations || []);
+      }
+      if (othersSection) othersSection.hidden = true;
+    } else if (activeScope === "global") {
+      if (fixedSection) fixedSection.hidden = false;
+      $("#library-slot-grid").replaceChildren(...(archive?.globalSlots || []).map(makeSlotCard));
+      if (suppSection) {
+        suppSection.hidden = false;
+        renderSupplementaryPool(archive?.globalSection?.supplementary || []);
+      }
+      if (historySection) historySection.hidden = true;
+      if (othersSection) othersSection.hidden = false;
+    }
+
     $("#library-other-list").replaceChildren(...view.others.map(makeOtherRow));
     $("#library-others-empty").hidden = view.others.length > 0;
     $("#removed-sources-section").hidden = view.removed.length === 0;
     $("#source-removed-list").replaceChildren(...view.removed.map(makeRemovedRow));
+
+    const iterSelect = $("#library-add-iteration");
+    if (iterSelect) {
+      iterSelect.replaceChildren(...(state.iterations || []).map(it => {
+        const opt = document.createElement("option");
+        opt.value = it.id;
+        opt.textContent = `${it.version_tag || ""} · ${it.title}`;
+        if (it.id === currentIterId) opt.selected = true;
+        return opt;
+      }));
+    }
+  }
+
+  function renderArchiveHistoryList(iterationSections) {
+    const list = $("#archive-history-list");
+    if (!list) return;
+    const historySections = (iterationSections || []).filter(s => !s.isCurrent);
+    if (!historySections.length) {
+      const empty = document.createElement("p");
+      empty.className = "library-empty";
+      empty.textContent = "暂无其他历史版本。";
+      list.replaceChildren(empty);
+      return;
+    }
+    list.replaceChildren(...historySections.map(s => {
+      const card = document.createElement("details");
+      card.className = "archive-history-card";
+      card.open = true;
+      const summary = document.createElement("summary");
+      const titleSpan = document.createElement("span");
+      titleSpan.textContent = `📦 ${s.iteration.title} [ID: ${s.iteration.id}] · ${s.iteration.status === "released" ? "已发布" : "历史"}`;
+      const countSpan = document.createElement("span");
+      countSpan.className = "fold-count";
+      countSpan.textContent = `${s.slots.filter(x => !x.empty).length} / 4 固定槽 · ${s.supplementary.length} 补充项`;
+      summary.append(titleSpan, countSpan);
+
+      const body = document.createElement("div");
+      body.className = "archive-history-body";
+      const slotGrid = document.createElement("div");
+      slotGrid.className = "library-slot-grid";
+      slotGrid.append(...s.slots.map(makeSlotCard));
+      body.append(slotGrid);
+
+      if (s.supplementary.length) {
+        const suppTitle = document.createElement("h4");
+        suppTitle.style.cssText = "font-size: 13px; font-weight: 600; margin: 16px 0 8px; color: #636366;";
+        suppTitle.textContent = "版本补充材料：";
+        const suppGrid = document.createElement("div");
+        suppGrid.className = "supplementary-grid";
+        s.supplementary.forEach(item => {
+          const suppCard = document.createElement("div");
+          suppCard.className = "supplementary-card";
+          const titleLink = document.createElement("a");
+          titleLink.href = item.download_url || item.url || "#";
+          titleLink.target = "_blank";
+          titleLink.className = "supplementary-name";
+          titleLink.textContent = item.name || item.filename || "材料";
+          const relBtn = document.createElement("button");
+          relBtn.type = "button";
+          relBtn.className = "source-relocate-btn";
+          relBtn.textContent = "移动";
+          relBtn.onclick = () => openRelocateDialog(item);
+          suppCard.append(titleLink, relBtn);
+          suppGrid.append(suppCard);
+        });
+        body.append(suppTitle, suppGrid);
+      }
+      card.append(summary, body);
+      return card;
+    }));
+  }
+
+  function renderSupplementaryPool(items) {
+    const grid = $("#supplementary-grid");
+    const empty = $("#supplementary-empty");
+    if (!grid) return;
+    if (!items.length) {
+      grid.replaceChildren();
+      if (empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    grid.replaceChildren(...items.map(item => {
+      const card = document.createElement("div");
+      card.className = "supplementary-card";
+      const isImg = item.mime_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(item.filename || item.name || "");
+      const downloadUrl = item.download_url || item.url || (item.id ? `/api/sources/${encodeURIComponent(item.id)}/download` : "#");
+      if (isImg && downloadUrl && downloadUrl !== "#") {
+        const img = document.createElement("img");
+        img.src = downloadUrl;
+        img.alt = item.summary || item.filename || item.name || "图片材料";
+        img.className = "supplementary-thumb";
+        card.append(img);
+      }
+      const titleLink = document.createElement("a");
+      titleLink.href = downloadUrl;
+      titleLink.target = "_blank";
+      titleLink.rel = "noopener noreferrer";
+      titleLink.className = "supplementary-name";
+      titleLink.textContent = item.filename || item.name || "补充材料";
+      const summaryText = document.createElement("p");
+      summaryText.className = "supplementary-summary";
+      summaryText.textContent = item.summary || item.notes || "PM 沟通/补充材料";
+      card.append(titleLink, summaryText);
+
+      if (item.id) {
+        const relocate = document.createElement("button");
+        relocate.type = "button";
+        relocate.className = "source-relocate-btn";
+        relocate.textContent = "移动位置";
+        relocate.addEventListener("click", () => openRelocateDialog(item));
+        card.append(relocate);
+      }
+      return card;
+    }));
   }
   function sourceFeedback(message, kind = "") {
     const feedback = $("#source-feedback"); feedback.textContent = message; feedback.className = `source-feedback library-feedback${kind ? ` ${kind}` : ""}`;
@@ -754,8 +917,8 @@
       invalid_source_category: "资料类别无效。", invalid_source_name: "请填写有效的资料名称。",
       source_file_size_invalid: "文件为空或超过 15 MiB 大小限制。", unsupported_source_file_type: "当前文件类型不受支持。",
       source_file_type_mismatch: "文件内容与扩展名不符。", invalid_source_filename: "文件名无效。",
-      source_archive_limits_exceeded: "Office 文件内容超出安全限制。", macros_not_allowed: "含宏文件不能加入资料库。",
-      source_text_must_be_utf8: "文本文件必须使用 UTF-8 编码。", source_not_found: "找不到这条资料，请刷新资料库。",
+      source_archive_limits_exceeded: "Office 文件内容超出安全限制。", macros_not_allowed: "含宏文件不能加入资料馆。",
+      source_text_must_be_utf8: "文本文件必须使用 UTF-8 编码。", source_not_found: "找不到这条资料，请刷新资料馆。",
       source_file_unavailable: "托管文件暂时不可用。", payload_too_large: "文件超过上传请求大小限制。",
       invalid_source_slot: "资料类型无效。", invalid_source_group: "资料版本组无效。", invalid_source_version: "版本说明无效。",
       source_group_not_found: "找不到要追加版本的资料组，请刷新后重试。", source_group_slot_conflict: "该资料组已属于其他固定资料位。",
@@ -773,9 +936,9 @@
     try {
       const data = await sourceRequest("/api/sources?include_removed=1&all_versions=1");
       state.sources = Array.isArray(data.sources) ? data.sources : [];
-      renderSources(); sourceFeedback("资料库已更新。");
+      renderSources(); sourceFeedback("资料馆已更新。");
     } catch (error) {
-      sourceFeedback(error.message || "无法读取资料库，请确认本地服务正常。", "error");
+      sourceFeedback(error.message || "无法读取资料馆，请确认本地服务正常。", "error");
     }
   }
   function setSourcesBusy(busy, message = "") {
@@ -839,17 +1002,22 @@
     if (file && file.size > 15 * 1024 * 1024) { sourceFeedback("文件超过 15 MiB，请选择更小的文件。", "error"); return; }
     const slot = group?.slot || $("#library-add-slot").value || null;
     const versionLabel = $("#library-add-version").value.trim() || null;
-    const category = slot && model.librarySlotLabels[slot] ? model.librarySlotLabels[slot] : "其他资料";
+    const category = slot && (model.archiveSlotLabels?.[slot] || model.librarySlotLabels[slot]) ? (model.archiveSlotLabels?.[slot] || model.librarySlotLabels[slot]) : "其他资料";
+    const scope = $("#library-add-scope")?.value || (slot === "api_doc" || slot === "architecture" ? "global" : "iteration");
+    const currentIterId = state.selectedIterationId || state.currentIterationId;
+    const iteration_id = scope === "iteration" ? ($("#library-add-iteration")?.value || currentIterId) : null;
     setSourcesBusy(true, file ? `正在添加“${file.name}”…` : "正在添加资料…");
     try {
       if (file) {
         const content_base64 = await encodeFile(file);
         await sourceRequest("/api/sources/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-          filename: file.name, content_base64, category, name: name || file.name, slot, group_id: group?.group_id || null, version_label: versionLabel
+          filename: file.name, content_base64, category, name: name || file.name, slot, group_id: group?.group_id || null, version_label: versionLabel,
+          scope, iteration_id
         }) });
       } else {
         await sourceRequest("/api/sources/link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-          name, url, category, slot, group_id: group?.group_id || null, version_label: versionLabel
+          name, url, category, slot, group_id: group?.group_id || null, version_label: versionLabel,
+          scope, iteration_id
         }) });
       }
       await loadSources();
@@ -1021,6 +1189,13 @@
       }
       head.append(stageChip);
     }
+    if (record.reopen_count > 0) {
+      const rBadge = document.createElement("span");
+      rBadge.className = "reopen-badge";
+      rBadge.textContent = `R${record.reopen_count + 1}`;
+      rBadge.title = `已进行 ${record.reopen_count} 轮二次修改`;
+      head.append(rBadge);
+    }
     const open = document.createElement("button"); open.type = "button"; open.className = "record-title-button"; open.dataset.openRecord = record.id; open.setAttribute("aria-label", `查看详情：${record.title}`);
     const title = document.createElement("span"); title.className = "record-title"; title.textContent = record.title; open.append(title);
     const summary = document.createElement("p"); summary.className = "card-summary"; summary.textContent = record.latest_brief || cardBrief(record);
@@ -1036,6 +1211,18 @@
     complete.dataset.completeId = record.id; complete.textContent = cancelled ? "已取消" : done ? (hasManualCompletion(record) ? "撤销完成" : "✓ 已完成") : "完成";
     complete.disabled = busy || (terminal && (!done || !hasManualCompletion(record))); complete.setAttribute("aria-pressed", String(done));
     const followup = document.createElement("button"); followup.type = "button"; followup.className = "mini-button"; followup.dataset.followupId = record.id; followup.textContent = "跟进"; followup.disabled = busy;
+    if (done) {
+      const it = (state.iterations || []).find(i => i.id === record.iteration_id);
+      if (!it || (it.status !== "released" && it.status !== "archived")) {
+        const reworkBtn = document.createElement("button");
+        reworkBtn.type = "button";
+        reworkBtn.className = "mini-button rework-btn";
+        reworkBtn.dataset.reopenId = record.id;
+        reworkBtn.textContent = record.reopen_count ? `修改(R${record.reopen_count + 1})` : "发起修改";
+        reworkBtn.title = "在迭代发布前发起二次修改";
+        actions.append(reworkBtn);
+      }
+    }
     if (record.transfer_disposition === "transfer_pending") { const transfer = document.createElement("button"); transfer.type = "button"; transfer.className = "transfer-button"; transfer.dataset.transferId = record.id; transfer.textContent = "已转交"; transfer.disabled = busy; actions.append(followup, transfer); }
     else actions.append(followup, complete);
     article.append(actions);
@@ -1084,7 +1271,108 @@
     const completed = records.filter(isTerminal);
     const list = $(group.list);
     $(group.count).textContent = `${records.length} 项`;
-    if (group.key === "work" || group.key === "bug") {
+    if (group.key === "work") {
+      const iterContainer = $("#work-iteration-container");
+      const releasedFold = $("#work-released-fold");
+      const releasedList = $("#work-released-list");
+      const releasedCount = $("#work-released-count");
+      const iterations = state.iterations || [];
+
+      if (iterations.length && model.partitionIterationRecords) {
+        const partition = model.partitionIterationRecords(records, iterations, state.selectedIterationId || state.currentIterationId);
+        const activeCards = [];
+        for (const item of partition.activeIterations) {
+          const section = document.createElement("section");
+          section.className = "iteration-active-block";
+          section.dataset.iterationId = item.iteration.id;
+          const head = document.createElement("header");
+          head.className = "iteration-active-head";
+          const title = document.createElement("h3");
+          title.className = "iteration-active-title";
+          title.textContent = `${item.iteration.version_tag || "未定版"} · ${item.iteration.title}`;
+          const badge = document.createElement("span");
+          badge.className = `iteration-status-pill ${item.iteration.status}`;
+          badge.textContent = item.iteration.status === "active" ? "进行中" : item.iteration.status === "pending_release" ? "待发布" : item.iteration.status;
+          const counter = document.createElement("span");
+          counter.className = "iteration-active-count";
+          counter.textContent = `${item.visibleRecords.length} 项（已完成 ${item.completed.length}）`;
+          head.append(title, badge, counter);
+          const blockList = document.createElement("div");
+          blockList.className = "record-list iteration-task-list";
+          populateMasonryList(blockList, item.visibleRecords.map(makeCard));
+          section.append(head, blockList);
+          activeCards.push(section);
+        }
+        if (iterContainer) {
+          iterContainer.replaceChildren(...activeCards);
+          iterContainer.hidden = activeCards.length === 0;
+        }
+
+        if (releasedFold && releasedList && releasedCount) {
+          if (partition.releasedIterations.length) {
+            releasedFold.hidden = false;
+            const totalReleased = partition.releasedIterations.reduce((sum, item) => sum + item.records.length, 0);
+            releasedCount.textContent = String(totalReleased);
+            releasedList.replaceChildren(...partition.releasedIterations.map(item => {
+              const details = document.createElement("details");
+              details.className = "task-past-batch";
+              const summary = document.createElement("summary");
+              const title = document.createElement("span");
+              title.textContent = `${item.iteration.version_tag || "已归档"} · ${item.iteration.title}`;
+              const count = document.createElement("span");
+              count.className = "fold-count";
+              count.textContent = String(item.records.length);
+              const tag = document.createElement("span");
+              tag.className = "summary-hint";
+              tag.textContent = "已发布";
+              summary.append(title, count, tag);
+              details.append(summary);
+              const dList = document.createElement("div");
+              dList.className = "record-list completed-list";
+              populateMasonryList(dList, item.records.map(makeCard));
+              details.append(dList);
+              return details;
+            }));
+          } else {
+            releasedFold.hidden = true;
+          }
+        }
+
+        const completion = model.partitionTerminalRecords(partition.backlog.completed);
+        populateMasonryList(list, [...partition.backlog.unfinished, ...completion.todayRecords].map(makeCard));
+        $(group.empty).hidden = activeCards.length > 0 || partition.backlog.unfinished.length > 0 || completion.todayRecords.length > 0;
+        const fold = $(group.done); fold.hidden = completion.outerFoldHidden;
+        $(group.doneCount).textContent = String(completion.groups.reduce((count, item) => count + item.records.length, 0));
+        const dateList = $(group.doneList); dateList.className = "completed-date-list";
+        dateList.replaceChildren(...completion.groups.map(({ date, records: rows, open }) => {
+          const section = document.createElement("details"); section.className = "completion-date-group"; section.dataset.preserveKey = `${group.key}-completed-${date}`;
+          section.open = open;
+          const allCancelled = rows.every(isCancelled), allCompleted = rows.every(isCompleted);
+          const dateKind = allCancelled ? "取消日期" : allCompleted ? "完成日期" : "终结日期";
+          const summary = document.createElement("summary"); summary.textContent = date === "unknown" ? `${dateKind}未知 · ${rows.length}` : `${dateKind} ${date} · ${rows.length}`;
+          const doneList = document.createElement("div"); doneList.className = "record-list completed-list"; populateMasonryList(doneList, rows.map(makeCard));
+          section.append(summary, doneList); return section;
+        }));
+      } else {
+        if (iterContainer) iterContainer.hidden = true;
+        if (releasedFold) releasedFold.hidden = true;
+        const completion = model.partitionTerminalRecords(completed);
+        populateMasonryList(list, [...unfinished, ...completion.todayRecords].map(makeCard));
+        $(group.empty).hidden = unfinished.length > 0 || completion.todayRecords.length > 0;
+        const fold = $(group.done); fold.hidden = completion.outerFoldHidden;
+        $(group.doneCount).textContent = String(completion.groups.reduce((count, item) => count + item.records.length, 0));
+        const dateList = $(group.doneList); dateList.className = "completed-date-list";
+        dateList.replaceChildren(...completion.groups.map(({ date, records: rows, open }) => {
+          const section = document.createElement("details"); section.className = "completion-date-group"; section.dataset.preserveKey = `${group.key}-completed-${date}`;
+          section.open = open;
+          const allCancelled = rows.every(isCancelled), allCompleted = rows.every(isCompleted);
+          const dateKind = allCancelled ? "取消日期" : allCompleted ? "完成日期" : "终结日期";
+          const summary = document.createElement("summary"); summary.textContent = date === "unknown" ? `${dateKind}未知 · ${rows.length}` : `${dateKind} ${date} · ${rows.length}`;
+          const doneList = document.createElement("div"); doneList.className = "record-list completed-list"; populateMasonryList(doneList, rows.map(makeCard));
+          section.append(summary, doneList); return section;
+        }));
+      }
+    } else if (group.key === "bug") {
       const completion = model.partitionTerminalRecords(completed);
       populateMasonryList(list, [...unfinished, ...completion.todayRecords].map(makeCard));
       $(group.empty).hidden = unfinished.length > 0 || completion.todayRecords.length > 0;
@@ -1112,6 +1400,76 @@
     const allTasks = sortTaskRecords((state.data?.delegated || [])
       .filter(record => state.showArchived || effectiveStatus(record) !== "archived")
       .filter(matchesSearch));
+    const iterations = state.iterations || [];
+    const iterContainer = $("#task-iteration-container");
+    const releasedFold = $("#task-released-fold");
+    const releasedList = $("#task-released-list");
+    const releasedCount = $("#task-released-count");
+
+    if (iterations.length && model.partitionIterationRecords) {
+      const partition = model.partitionIterationRecords(allTasks, iterations, state.selectedIterationId || state.currentIterationId);
+      const activeBlocks = [];
+      for (const item of partition.activeIterations) {
+        if (!item.records.length) continue;
+        const section = document.createElement("section");
+        section.className = "iteration-active-block";
+        section.dataset.iterationId = item.iteration.id;
+        const head = document.createElement("header");
+        head.className = "iteration-active-head";
+        const title = document.createElement("h3");
+        title.className = "iteration-active-title";
+        title.textContent = `${item.iteration.version_tag || "未定版"} · ${item.iteration.title}`;
+        const badge = document.createElement("span");
+        badge.className = `iteration-status-pill ${item.iteration.status}`;
+        badge.textContent = item.iteration.status === "active" ? "进行中" : item.iteration.status === "pending_release" ? "待发布" : item.iteration.status;
+        const counter = document.createElement("span");
+        counter.className = "iteration-active-count";
+        counter.textContent = `${item.visibleRecords.length} 项（已完成 ${item.completed.length}）`;
+        head.append(title, badge, counter);
+        const blockList = document.createElement("div");
+        blockList.className = "record-list iteration-task-list";
+        populateMasonryList(blockList, item.visibleRecords.map(r => makeTaskCard(r, true)));
+        section.append(head, blockList);
+        activeBlocks.push(section);
+      }
+      if (iterContainer) {
+        iterContainer.replaceChildren(...activeBlocks);
+        iterContainer.hidden = activeBlocks.length === 0;
+      }
+      if (releasedFold && releasedList && releasedCount) {
+        if (partition.releasedIterations.some(it => it.records.length)) {
+          releasedFold.hidden = false;
+          const totalReleased = partition.releasedIterations.reduce((sum, item) => sum + item.records.length, 0);
+          releasedCount.textContent = String(totalReleased);
+          releasedList.replaceChildren(...partition.releasedIterations.filter(it => it.records.length).map(item => {
+            const details = document.createElement("details");
+            details.className = "task-past-batch";
+            const summary = document.createElement("summary");
+            const title = document.createElement("span");
+            title.textContent = `${item.iteration.version_tag || "已归档"} · ${item.iteration.title}`;
+            const count = document.createElement("span");
+            count.className = "fold-count";
+            count.textContent = String(item.records.length);
+            const tag = document.createElement("span");
+            tag.className = "summary-hint";
+            tag.textContent = "已发布";
+            summary.append(title, count, tag);
+            details.append(summary);
+            const dList = document.createElement("div");
+            dList.className = "record-list completed-list";
+            populateMasonryList(dList, item.records.map(r => makeTaskCard(r, false)));
+            details.append(dList);
+            return details;
+          }));
+        } else {
+          releasedFold.hidden = true;
+        }
+      }
+    } else {
+      if (iterContainer) iterContainer.hidden = true;
+      if (releasedFold) releasedFold.hidden = true;
+    }
+
     const batches = Array.isArray(state.data?.batches) ? state.data.batches : [];
     const currentBatchId = state.data?.current_batch_id || batches.find(batch => batch.state === "current")?.id || null;
     const partition = model.partitionTaskBatches(allTasks, batches, currentBatchId, state.data?.legacy_task_ids || []);
@@ -1672,6 +2030,40 @@
     const idButton = document.createElement("button"); idButton.type = "button"; idButton.className = "detail-id-copy"; idButton.textContent = record.display_id || record.id; idButton.title = "点击复制事项 ID";
     idButton.addEventListener("click", async () => { try { await navigator.clipboard.writeText(record.display_id || record.id); showToast("ID 已复制"); } catch (_) { showToast("复制失败，请手动复制", "error"); } });
     head.append(title, pill); detail.append(idButton, head);
+    const it = (state.iterations || []).find(i => i.id === record.iteration_id);
+    const iterAssignWrap = document.createElement("div");
+    iterAssignWrap.className = "detail-iteration-assign";
+    const iterLabel = document.createElement("span");
+    iterLabel.textContent = "所属版本：";
+    const iterSelect = document.createElement("select");
+    iterSelect.className = "detail-iteration-select";
+    iterSelect.setAttribute("aria-label", "调整所属版本");
+    (state.iterations || []).forEach(item => {
+      const opt = document.createElement("option");
+      opt.value = item.id;
+      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
+      opt.textContent = `${item.title} [${statusMap[item.status] || item.status}]`;
+      if (item.id === record.iteration_id) opt.selected = true;
+      iterSelect.append(opt);
+    });
+    iterSelect.addEventListener("change", async (e) => {
+      const newIterId = e.target.value;
+      try {
+        const res = await fetch(`/api/items/${encodeURIComponent(record.id)}/iteration`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ iteration_id: newIterId })
+        });
+        if (!res.ok) throw new Error("版本切换失败");
+        showToast("已更新任务所属版本");
+        record.iteration_id = newIterId;
+        await refresh();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
+    iterAssignWrap.append(iterLabel, iterSelect);
+    head.append(iterAssignWrap);
     const statusLine = document.createElement("p"); statusLine.className = "detail-status-line";
     statusLine.textContent = record.type === "bug" && record.platform_status
       ? `平台上次读取：${statusLabel(record.platform_status)} · ${dateLabel(record.observed_at, "读取时间未记录")}`
@@ -1704,6 +2096,19 @@
     }
     overview.append(overviewTitle, conclusion, overviewGrid);
     detail.append(head, statusLine, makeWorkflowSection(record), overview);
+    if (isCompleted(record) && (!it || (it.status !== "released" && it.status !== "archived"))) {
+      const reworkBar = document.createElement("div");
+      reworkBar.className = "detail-rework-bar";
+      const reworkNotice = document.createElement("span");
+      reworkNotice.textContent = "当前迭代尚未发布，支持针对本任务发起二次修改与再审计。";
+      const reworkBtn = document.createElement("button");
+      reworkBtn.type = "button";
+      reworkBtn.className = "source-action rework-action-btn";
+      reworkBtn.dataset.reopenId = record.id;
+      reworkBtn.textContent = record.reopen_count ? `发起第 ${record.reopen_count + 1} 轮修改` : "发起二次修改 (Reopen)";
+      reworkBar.append(reworkNotice, reworkBtn);
+      detail.append(reworkBar);
+    }
     const followupSummary = model.summarizeFollowups(followups(record));
     if (followupSummary.activeCount) {
       const activeBox = document.createElement("section"); activeBox.className = "active-followup-summary";
@@ -1777,6 +2182,69 @@
     if (record.source) { const original = document.createElement("p"); original.textContent = txt(record.source); source.append(original); }
     if (record.source_ref) { const ref = document.createElement("p"); ref.className = "source-ref"; ref.textContent = txt(record.source_ref); source.append(ref); }
     supplementalBody.append(source);
+    if (record.reopen_count > 0 || (record.reopen_history && record.reopen_history.length)) {
+      const reworkFold = document.createElement("details");
+      reworkFold.className = "detail-history-fold rework-history-fold";
+      reworkFold.open = true;
+      const reworkSummary = document.createElement("summary");
+      reworkSummary.textContent = `二次修改与再审计记录（共 ${record.reopen_count || record.reopen_history.length} 轮）`;
+      reworkSummary.dataset.dialogFocus = "rework-history";
+      const reworkBody = document.createElement("div");
+      reworkBody.className = "detail-history-body";
+      const historyList = (record.reopen_history || []).map((round, idx) => {
+        const modeLabel = round.audit_mode === "lightweight" ? "轻量自审复核" : "全量静态审计";
+        const statusText = round.completed_at ? `已完成（${dateLabel(round.completed_at)}）` : "正在修改中";
+        return `第 ${round.round || idx + 1} 轮 · ${dateLabel(round.reopened_at)} · [${modeLabel}] · ${statusText}\n修改原因：${round.reason || "未填写"}`;
+      });
+      addDetailSection(reworkBody, "修改记录", historyList, true);
+      reworkFold.append(reworkSummary, reworkBody);
+      detail.append(reworkFold);
+    }
+    const attachFold = document.createElement("details");
+    attachFold.className = "detail-history-fold task-attachments-fold";
+    const attachments = Array.isArray(record.attachments) ? record.attachments : [];
+    attachFold.open = attachments.length > 0;
+    const attachSummary = document.createElement("summary");
+    attachSummary.textContent = `补充材料与截图（${attachments.length}）`;
+    attachSummary.dataset.dialogFocus = "attachments";
+    const attachBody = document.createElement("div");
+    attachBody.className = "detail-history-body";
+    if (attachments.length) {
+      const attachGrid = document.createElement("div");
+      attachGrid.className = "supplementary-grid";
+      attachments.forEach(att => {
+        const card = document.createElement("div");
+        card.className = "supplementary-card";
+        const isImg = att.mime_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(att.filename || "");
+        if (isImg && att.download_url) {
+          const img = document.createElement("img");
+          img.src = att.download_url;
+          img.alt = att.summary || att.filename;
+          img.className = "supplementary-thumb";
+          card.append(img);
+        }
+        const fname = document.createElement("a");
+        fname.href = att.download_url || "#";
+        fname.target = "_blank";
+        fname.rel = "noopener noreferrer";
+        fname.className = "supplementary-name";
+        fname.textContent = att.filename;
+        const fsummary = document.createElement("p");
+        fsummary.className = "supplementary-summary";
+        fsummary.textContent = att.summary || "暂无说明";
+        card.append(fname, fsummary);
+        attachGrid.append(card);
+      });
+      attachBody.append(attachGrid);
+    }
+    const addAttachBtn = document.createElement("button");
+    addAttachBtn.type = "button";
+    addAttachBtn.className = "source-action";
+    addAttachBtn.dataset.uploadTaskAttachment = record.id;
+    addAttachBtn.textContent = "+ 上传截图 / 补充文件";
+    attachBody.append(addAttachBtn);
+    attachFold.append(attachSummary, attachBody);
+    detail.append(attachFold);
   }
   function openDetail(id) {
     const record = findRecord(id); if (!record) return;
@@ -1889,6 +2357,12 @@
       if ($("#scopes-dialog")?.open) renderScopeCatalog();
       const changed = !state.data || Number(state.data.revision) !== Number(data.revision) || scopeChanged;
       state.data = data;
+      state.iterations = Array.isArray(data.iterations) ? data.iterations : [];
+      state.currentIterationId = data.current_iteration_id || (state.iterations.find(it => it.status === "active" || it.status === "pending_release")?.id) || null;
+      if (!state.selectedIterationId || !state.iterations.some(it => it.id === state.selectedIterationId)) {
+        state.selectedIterationId = state.currentIterationId;
+      }
+      renderIterationBar();
       const hours = data.preferences?.work_hours;
       if (hours?.start && hours?.end) workHours = { start: hours.start, end: hours.end, timezone: "Asia/Shanghai" };
       renderWorktimeProgress();
@@ -1904,6 +2378,330 @@
       freshness.classList.add("stale"); freshness.lastElementChild.textContent = "连接本地数据服务失败";
       const banner = $("#state-banner"); banner.hidden = false; banner.textContent = "无法读取本地结构化数据；请确认本地服务正在运行。";
     }
+  }
+
+  function renderIterationBar() {
+    const bar = $("#iteration-bar");
+    if (!bar) return;
+    const select = $("#iteration-select");
+    const statusPill = $("#iteration-status-pill");
+    const targetDate = $("#iteration-target-date");
+    const releaseBtn = $("#iteration-release-button");
+
+    const iterations = state.iterations || [];
+    if (!iterations.length) {
+      select.replaceChildren();
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "未配置迭代（全部需求归入未规划需求）";
+      select.append(opt);
+      statusPill.textContent = "无活跃迭代";
+      statusPill.className = "iteration-status-pill on_hold";
+      targetDate.textContent = "";
+      if (releaseBtn) releaseBtn.hidden = true;
+      return;
+    }
+
+    const currentId = state.selectedIterationId || state.currentIterationId;
+    const current = iterations.find(it => it.id === currentId) || iterations[0];
+    state.selectedIterationId = current ? current.id : null;
+
+    select.replaceChildren(...iterations.map(it => {
+      const opt = document.createElement("option");
+      opt.value = it.id;
+      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
+      opt.textContent = `${it.version_tag || "未定版"} · ${it.title} [${statusMap[it.status] || it.status}]`;
+      if (it.id === current?.id) opt.selected = true;
+      return opt;
+    }));
+
+    if (current) {
+      const idBadge = $("#iteration-id-badge");
+      if (idBadge) idBadge.textContent = current.id;
+      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
+      statusPill.textContent = statusMap[current.status] || current.status;
+      statusPill.className = `iteration-status-pill ${current.status}`;
+      targetDate.textContent = current.target_release_date ? `计划发布：${current.target_release_date}` : "";
+      if (releaseBtn) {
+        releaseBtn.hidden = current.status === "released" || current.status === "archived";
+        releaseBtn.disabled = state.iterationBusy;
+      }
+    }
+  }
+
+  function openIterationEditDialog() {
+    const iterations = state.iterations || [];
+    const currentId = state.selectedIterationId || state.currentIterationId;
+    const current = iterations.find(it => it.id === currentId) || iterations[0];
+    if (!current) return;
+    $("#iteration-edit-id").value = current.id;
+    $("#iteration-edit-title-input").value = current.title || "";
+    $("#iteration-edit-tag-input").value = current.version_tag || "";
+    $("#iteration-edit-date-input").value = current.target_release_date || "";
+    $("#iteration-edit-desc-input").value = current.description || "";
+    $("#iteration-edit-feedback").textContent = "";
+    $("#iteration-edit-dialog").showModal();
+  }
+
+  async function submitIterationEditForm(event) {
+    event.preventDefault();
+    const currentId = $("#iteration-edit-id").value;
+    if (!currentId) return;
+    const title = $("#iteration-edit-title-input").value.trim();
+    const version_tag = $("#iteration-edit-tag-input").value.trim();
+    const target_release_date = $("#iteration-edit-date-input").value || null;
+    const description = $("#iteration-edit-desc-input").value.trim();
+
+    const feedback = $("#iteration-edit-feedback");
+    const submitBtn = $("#iteration-edit-submit");
+    submitBtn.disabled = true;
+    feedback.textContent = "正在保存更名…";
+    feedback.className = "source-feedback busy";
+
+    try {
+      const res = await fetch(`/api/iterations/${encodeURIComponent(currentId)}/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, version_tag, target_release_date, description })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || err.error || "更新失败");
+      }
+      $("#iteration-edit-dialog").close();
+      showToast("版本信息已更新");
+      await refresh();
+    } catch (err) {
+      feedback.textContent = err.message;
+      feedback.className = "source-feedback error";
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  function openRelocateDialog(source) {
+    if (!source) return;
+    state.relocateTargetSource = source;
+    const dialog = $("#source-relocate-dialog");
+    if (!dialog) return;
+    $("#relocate-source-title").textContent = `正在调整材料：${source.name || source.filename || source.id}`;
+    const scopeSelect = $("#relocate-scope-select");
+    const iterSelect = $("#relocate-iteration-select");
+    const slotSelect = $("#relocate-slot-select");
+    const iterWrap = $("#relocate-iteration-wrap");
+
+    scopeSelect.value = source.scope || "iteration";
+
+    iterSelect.replaceChildren(...(state.iterations || []).map(it => {
+      const opt = document.createElement("option");
+      opt.value = it.id;
+      opt.textContent = `${it.title} (${it.id})`;
+      if (it.id === (source.iteration_id || state.currentIterationId)) opt.selected = true;
+      return opt;
+    }));
+
+    function syncSlots() {
+      const isGlobal = scopeSelect.value === "global";
+      iterWrap.hidden = isGlobal;
+      slotSelect.replaceChildren();
+      if (isGlobal) {
+        const slots = [
+          { value: "api_doc", label: "接口文档（固定槽位）" },
+          { value: "supplementary", label: "全局补充材料列表" },
+          { value: "", label: "其他来源" }
+        ];
+        slots.forEach(s => {
+          const opt = document.createElement("option");
+          opt.value = s.value;
+          opt.textContent = s.label;
+          if (source.slot === s.value) opt.selected = true;
+          slotSelect.append(opt);
+        });
+      } else {
+        const slots = [
+          { value: "requirement_doc", label: "需求列表（固定槽位）" },
+          { value: "figma", label: "Figma（固定槽位）" },
+          { value: "prototype", label: "高保真（固定槽位）" },
+          { value: "testcase", label: "测试用例（固定槽位）" },
+          { value: "supplementary", label: "补充材料列表" },
+          { value: "", label: "其他来源" }
+        ];
+        slots.forEach(s => {
+          const opt = document.createElement("option");
+          opt.value = s.value;
+          opt.textContent = s.label;
+          if (source.slot === s.value || (s.value === "prototype" && source.slot === "codesign")) opt.selected = true;
+          slotSelect.append(opt);
+        });
+      }
+    }
+
+    scopeSelect.onchange = syncSlots;
+    syncSlots();
+
+    $("#relocate-feedback").textContent = "";
+    dialog.showModal();
+  }
+
+  async function submitRelocateForm(event) {
+    event.preventDefault();
+    const source = state.relocateTargetSource;
+    if (!source) return;
+    const scope = $("#relocate-scope-select").value;
+    const iteration_id = scope === "iteration" ? $("#relocate-iteration-select").value : null;
+    const slot = $("#relocate-slot-select").value || null;
+
+    const feedback = $("#relocate-feedback");
+    const submitBtn = $("#relocate-submit");
+    submitBtn.disabled = true;
+    feedback.textContent = "正在调整材料位置…";
+    feedback.className = "source-feedback busy";
+
+    try {
+      const res = await fetch(`/api/sources/${encodeURIComponent(source.id)}/location`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope, iteration_id, slot })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || err.error || "移动失败");
+      }
+      $("#source-relocate-dialog").close();
+      showToast("材料位置已成功更新");
+      await loadSources();
+      await refresh();
+    } catch (err) {
+      feedback.textContent = err.message;
+      feedback.className = "source-feedback error";
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  function openReopenDialog(id) {
+    const record = findRecord(id);
+    if (!record) return;
+    state.reopenTargetId = id;
+    state.reopenFile = null;
+    $("#reopen-dialog-title").textContent = `发起二次修改 · ${record.display_id || record.id}`;
+    $("#reopen-reason-input").value = "";
+    $("#reopen-audit-mode").value = "lightweight";
+    $("#reopen-file-input").value = "";
+    $("#reopen-file-name").textContent = "未选择图片";
+    $("#reopen-feedback").textContent = "";
+    $("#reopen-feedback").className = "source-feedback";
+    $("#reopen-dialog").showModal();
+    $("#reopen-reason-input").focus();
+  }
+
+  async function submitReopenForm(event) {
+    event.preventDefault();
+    const id = state.reopenTargetId;
+    if (!id) return;
+    const reason = $("#reopen-reason-input").value.trim();
+    const audit_mode = $("#reopen-audit-mode").value;
+    const feedback = $("#reopen-feedback");
+    const submitBtn = $("#reopen-submit");
+    if (!reason) { feedback.textContent = "请填写修改原因。"; feedback.className = "source-feedback error"; return; }
+    submitBtn.disabled = true;
+    feedback.textContent = "正在发起二次修改…";
+    feedback.className = "source-feedback busy";
+    try {
+      await postAction(`/api/items/${encodeURIComponent(id)}/reopen`, { reason, audit_mode });
+      if (state.reopenFile) {
+        feedback.textContent = "正在上传变更截图…";
+        const content_base64 = await encodeFile(state.reopenFile);
+        await postAction(`/api/items/${encodeURIComponent(id)}/attachments`, {
+          filename: state.reopenFile.name,
+          content_base64,
+          summary: reason
+        });
+      }
+      $("#reopen-dialog").close();
+      showToast("已发起二次修改并重新激活流水线");
+      await refresh();
+      if ($("#record-dialog").open) openDetail(id);
+    } catch (error) {
+      feedback.textContent = error.message || "发起修改失败，请重试。";
+      feedback.className = "source-feedback error";
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  async function submitIterationForm(event) {
+    event.preventDefault();
+    const tag = $("#iteration-tag-input").value.trim();
+    const title = $("#iteration-title-input").value.trim();
+    const target_release_date = $("#iteration-date-input").value || null;
+    const description = $("#iteration-desc-input").value.trim() || null;
+    const feedback = $("#iteration-feedback");
+    const submitBtn = $("#iteration-submit");
+    submitBtn.disabled = true;
+    feedback.textContent = "正在创建迭代…";
+    feedback.className = "source-feedback busy";
+    try {
+      const res = await postAction("/api/iterations", { version_tag: tag, title, target_release_date, description });
+      state.selectedIterationId = res.iteration?.id || state.selectedIterationId;
+      $("#iteration-dialog").close();
+      $("#iteration-form").reset();
+      showToast(`已创建迭代：${tag} · ${title}`);
+      await refresh();
+    } catch (error) {
+      feedback.textContent = error.message || "创建迭代失败，请重试。";
+      feedback.className = "source-feedback error";
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  async function handleReleaseIteration() {
+    const currentId = state.selectedIterationId || state.currentIterationId;
+    if (!currentId) return;
+    const it = (state.iterations || []).find(i => i.id === currentId);
+    if (!it) return;
+    if (!window.confirm(`确认将迭代「${it.version_tag} · ${it.title}」标记为已发布？\n发布后该迭代所有需求将整体归档，不再支持直接二次修改。`)) {
+      return;
+    }
+    state.iterationBusy = true;
+    $("#iteration-release-button").disabled = true;
+    try {
+      await postAction(`/api/iterations/${encodeURIComponent(currentId)}/release`, {});
+      showToast(`迭代「${it.version_tag}」已发布并封存归档`);
+      await refresh();
+    } catch (error) {
+      showToast(error.message || "标记发布失败", "error");
+    } finally {
+      state.iterationBusy = false;
+      $("#iteration-release-button").disabled = false;
+    }
+  }
+
+  async function openUploadTaskAttachment(recordId) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*,.pdf,.txt,.md";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const summary = window.prompt(`请为文件「${file.name}」输入简短说明（如 PM 沟通结论）：`, "") || file.name;
+      showToast(`正在上传“${file.name}”…`);
+      try {
+        const content_base64 = await encodeFile(file);
+        await postAction(`/api/items/${encodeURIComponent(recordId)}/attachments`, {
+          filename: file.name,
+          content_base64,
+          summary
+        });
+        showToast(`已上传补充材料“${file.name}”`);
+        await refresh();
+        if ($("#record-dialog").open) openDetail(recordId);
+      } catch (err) {
+        showToast(err.message || "上传失败", "error");
+      }
+    };
+    input.click();
   }
 
   $("#search").addEventListener("input", event => { state.query = event.target.value; render(); });
@@ -1999,7 +2797,80 @@
     const transfer = event.target.closest("[data-transfer-id]"); if (transfer) submitTransfer(transfer);
     const complete = event.target.closest("[data-complete-id]"); if (complete) submitCompletion(complete);
     const followup = event.target.closest("[data-followup-id]"); if (followup) openFollowup(followup.dataset.followupId);
+    const reopen = event.target.closest("[data-reopen-id]"); if (reopen) openReopenDialog(reopen.dataset.reopenId);
+    const uploadTaskAtt = event.target.closest("[data-upload-task-attachment]"); if (uploadTaskAtt) openUploadTaskAttachment(uploadTaskAtt.dataset.uploadTaskAttachment);
   });
+  const iterSelect = $("#iteration-select");
+  if (iterSelect) {
+    iterSelect.addEventListener("change", event => {
+      state.selectedIterationId = event.target.value;
+      render();
+      if ($("#sources-dialog").open) renderSources();
+    });
+  }
+  const iterRelBtn = $("#iteration-release-button");
+  if (iterRelBtn) iterRelBtn.addEventListener("click", handleReleaseIteration);
+  const iterCreateBtn = $("#iteration-create-open");
+  if (iterCreateBtn) iterCreateBtn.addEventListener("click", () => {
+    $("#iteration-feedback").textContent = "";
+    $("#iteration-form").reset();
+    $("#iteration-dialog").showModal();
+  });
+  const iterCloseBtn = $("#iteration-dialog-close");
+  if (iterCloseBtn) iterCloseBtn.addEventListener("click", () => $("#iteration-dialog").close());
+  const iterCancelBtn = $("#iteration-cancel");
+  if (iterCancelBtn) iterCancelBtn.addEventListener("click", () => $("#iteration-dialog").close());
+  const iterForm = $("#iteration-form");
+  if (iterForm) iterForm.addEventListener("submit", submitIterationForm);
+  const iterEditBtn = $("#iteration-edit-open");
+  if (iterEditBtn) iterEditBtn.addEventListener("click", openIterationEditDialog);
+  const iterEditCloseBtn = $("#iteration-edit-close");
+  if (iterEditCloseBtn) iterEditCloseBtn.addEventListener("click", () => $("#iteration-edit-dialog").close());
+  const iterEditCancelBtn = $("#iteration-edit-cancel");
+  if (iterEditCancelBtn) iterEditCancelBtn.addEventListener("click", () => $("#iteration-edit-dialog").close());
+  const iterEditForm = $("#iteration-edit-form");
+  if (iterEditForm) iterEditForm.addEventListener("submit", submitIterationEditForm);
+  const iterEditDialog = $("#iteration-edit-dialog");
+  if (iterEditDialog) iterEditDialog.addEventListener("click", event => { if (event.target === iterEditDialog) iterEditDialog.close(); });
+  const relocateCloseBtn = $("#relocate-dialog-close");
+  if (relocateCloseBtn) relocateCloseBtn.addEventListener("click", () => $("#source-relocate-dialog").close());
+  const relocateCancelBtn = $("#relocate-cancel");
+  if (relocateCancelBtn) relocateCancelBtn.addEventListener("click", () => $("#source-relocate-dialog").close());
+  const relocateForm = $("#relocate-form");
+  if (relocateForm) relocateForm.addEventListener("submit", submitRelocateForm);
+  const relocateDialog = $("#source-relocate-dialog");
+  if (relocateDialog) relocateDialog.addEventListener("click", event => { if (event.target === relocateDialog) relocateDialog.close(); });
+  const reopenCloseBtn = $("#reopen-dialog-close");
+  if (reopenCloseBtn) reopenCloseBtn.addEventListener("click", () => $("#reopen-dialog").close());
+  const reopenCancelBtn = $("#reopen-cancel");
+  if (reopenCancelBtn) reopenCancelBtn.addEventListener("click", () => $("#reopen-dialog").close());
+  const reopenAddFileBtn = $("#reopen-add-file");
+  if (reopenAddFileBtn) reopenAddFileBtn.addEventListener("click", () => $("#reopen-file-input").click());
+  const reopenFileInput = $("#reopen-file-input");
+  if (reopenFileInput) {
+    reopenFileInput.addEventListener("change", event => {
+      state.reopenFile = event.target.files?.[0] || null;
+      $("#reopen-file-name").textContent = state.reopenFile ? state.reopenFile.name : "未选择图片";
+    });
+  }
+  const reopenForm = $("#reopen-form");
+  if (reopenForm) reopenForm.addEventListener("submit", submitReopenForm);
+  const archiveTabs = $("#archive-scope-tabs");
+  if (archiveTabs) {
+    archiveTabs.addEventListener("click", event => {
+      const btn = event.target.closest(".archive-tab-btn");
+      if (btn) {
+        state.archiveScopeTab = btn.dataset.scope;
+        renderSources();
+      }
+    });
+  }
+  const suppUploadTrigger = $("#supplementary-upload-trigger");
+  if (suppUploadTrigger) {
+    suppUploadTrigger.addEventListener("click", () => {
+      openLibraryAdd({ slot: "supplementary", name: "补充材料" });
+    });
+  }
   document.addEventListener("toggle", event => {
     if (event.target.matches("details") && event.target.open) {
       requestAnimationFrame(() => $$(".record-list", event.target).forEach(relayoutMasonryList));

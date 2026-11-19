@@ -19,6 +19,8 @@ If the item has a workflow (or the user asks to start, advance, audit, accept or
 
 Always read `dashboardctl.py dispatch-card <ITEM_ID>` (or `GET /api/items/<ITEM_ID>/dispatch-card`) immediately before dispatching a role. Follow its `next.action` and `next.role`; do not infer the next step from chat memory. Delivery is manual: never close, push or release on the user's behalf.
 
+Before dispatching a code task, read the [parallel Git worktree protocol](../../mcloud-workflow/references/parallel-git-worktree.md). The dispatch prompt must include the task's record ID, branch, base, worktree, code owner and build owner. If any field is missing, the Lead allocates it first; do not send a worker into the main checkout or let two workers share a branch.
+
 ## Start and act
 
 1. Follow the host's current user instructions and repository instructions. Resolve the exact workbench item before resuming; do not create a duplicate when an item already exists.
@@ -32,6 +34,7 @@ Always read `dashboardctl.py dispatch-card <ITEM_ID>` (or `GET /api/items/<ITEM_
 ## References
 
 - Read [workflow contract](references/workflow.md) before starting, advancing, auditing, accepting or delivering a workbench item.
+- Read [parallel Git worktree protocol](../../mcloud-workflow/references/parallel-git-worktree.md) before dispatching or accepting any code task; it defines branch/worktree ownership and the mandatory dispatch context.
 - Read [role and responsibility boundaries](references/role-and-boundaries.md) when establishing scope or coordinating parallel work.
 - Read [BUG workflow](references/bug-workflow.md) for BUG intake, confidence, reproduction, repair, and acceptance.
 - Read [troubleshooting](references/troubleshooting.md) only for matching prior failures; add an experience only when the cause and remedy have evidence.

@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
     <title>知途 Waylume · AI助理工作台</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261117-unslop-2">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261119-archive-1">
   <script src="/assets/markdown.js?v=20261028-cancelled-terminal-1" defer></script>
-  <script src="/assets/dashboard-model.js?v=20261113-library-1" defer></script>
-  <script src="/assets/dashboard.js?v=20261117-unslop-2" defer></script>
+  <script src="/assets/dashboard-model.js?v=20261119-archive-1" defer></script>
+  <script src="/assets/dashboard.js?v=20261119-archive-1" defer></script>
 </head>
 <body data-theme="minimal">
   <svg class="library-logo-sprite" aria-hidden="true" focusable="false" width="0" height="0">
@@ -40,6 +40,26 @@
         <path d="M10.2 13.8a3.2 3.2 0 0 0 4.5 0l2.1-2.1a3.2 3.2 0 0 0-4.5-4.5l-1.2 1.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
         <path d="M13.8 10.2a3.2 3.2 0 0 0-4.5 0l-2.1 2.1a3.2 3.2 0 0 0 4.5 4.5l1.2-1.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
       </symbol>
+      <symbol id="library-logo-prototype" viewBox="0 0 24 24">
+        <rect x="3.5" y="3.5" width="10" height="10" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <rect x="10.5" y="10.5" width="10" height="10" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </symbol>
+      <symbol id="library-logo-architecture" viewBox="0 0 24 24">
+        <path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        <circle cx="8" cy="6" r="2" fill="currentColor"/>
+        <circle cx="16" cy="12" r="2" fill="currentColor"/>
+        <circle cx="10" cy="18" r="2" fill="currentColor"/>
+      </symbol>
+      <symbol id="library-logo-testcase" viewBox="0 0 24 24">
+        <path d="M9 4.5h6m-5-2h4a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-1a1 1 0 0 1 1-1Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="5" y="4" width="14" height="17" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="m8.5 10.5 1.5 1.5 3-3M8.5 15.5 1.5 1.5 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+      <symbol id="library-logo-supplementary" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <circle cx="8.5" cy="9.5" r="1.5" fill="currentColor"/>
+        <path d="M21 15l-5-5L5 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </symbol>
     </defs>
   </svg>
   <main class="shell">
@@ -64,6 +84,23 @@
       <label class="archive-toggle"><input id="show-archived" type="checkbox"><span>显示归档</span></label>
     </section>
 
+    <section class="iteration-bar" id="iteration-bar" aria-label="版本迭代">
+      <div class="iteration-bar-info">
+        <span class="iteration-kicker">当前版本</span>
+        <div class="iteration-select-wrap">
+          <select id="iteration-select" aria-label="选择版本迭代"></select>
+        </div>
+        <span class="iteration-id-badge" id="iteration-id-badge" title="内部版本ID"></span>
+        <span class="iteration-status-pill" id="iteration-status-pill">进行中</span>
+        <span class="iteration-target-date" id="iteration-target-date"></span>
+      </div>
+      <div class="iteration-bar-actions">
+        <button type="button" class="source-action" id="iteration-edit-open">编辑/更名</button>
+        <button type="button" class="source-action" id="iteration-release-button" title="迭代全部需求完成后标记发布">标记迭代发布</button>
+        <button type="button" class="source-open-button" id="iteration-create-open">+ 新建版本</button>
+      </div>
+    </section>
+
     <div class="inspection-tools global-inspection" id="inspection-tools">
       <span class="inspection-plan" id="inspection-plan" role="timer" aria-live="off">巡检时间未同步</span>
       <button type="button" class="inspection-run" id="inspection-run" aria-describedby="inspection-run-status">立即巡检</button>
@@ -75,14 +112,19 @@
     <div class="work-areas">
       <section class="work-area area-work" aria-labelledby="work-title">
         <header class="area-heading">
-          <div class="area-heading-copy"><span class="area-kicker">优先工作</span><h2 id="work-title">工作需求</h2><button type="button" id="sources-open" class="source-open-button" aria-haspopup="dialog">资料库</button><p>公司分工与明确交办的工作进展</p></div>
+          <div class="area-heading-copy"><span class="area-kicker">优先工作</span><h2 id="work-title">工作需求</h2><button type="button" id="sources-open" class="source-open-button" aria-haspopup="dialog">资料馆</button><p>公司分工与明确交办的工作进展</p></div>
           <span class="area-count" id="work-count">— 项</span>
         </header>
+        <div class="iteration-group-section" id="work-iteration-container"></div>
         <div class="record-list" id="work-records"></div>
         <div class="empty-state" id="work-empty" hidden><strong>这里暂时没有待处理的工作</strong><span>已完成的事项会收在下面，可随时回看。</span></div>
         <details class="completed-fold" id="work-completed" hidden>
           <summary><span>已完成工作</span><span class="fold-count" id="work-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
           <div class="record-list completed-list" id="work-completed-list"></div>
+        </details>
+        <details class="completed-fold released-iterations-fold" id="work-released-fold" hidden>
+          <summary><span>已发布迭代需求</span><span class="fold-count" id="work-released-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div id="work-released-list" class="released-iteration-list"></div>
         </details>
       </section>
 
@@ -104,6 +146,7 @@
           <div class="area-heading-copy"><span class="area-kicker">Agent 协作</span><h2 id="task-title">委托任务</h2><p>主动交办给 agent 的执行与验收任务</p></div>
           <span class="area-count" id="task-count">— 项</span>
         </header>
+        <div class="iteration-group-section" id="task-iteration-container"></div>
         <section class="task-batch-section" id="task-current-section" aria-labelledby="task-current-title" hidden>
           <header class="task-batch-heading"><h3 id="task-current-title">本批</h3><span id="task-current-state"></span></header>
           <div class="record-list" id="task-current-records"></div>
@@ -120,6 +163,10 @@
         <details class="completed-fold task-legacy-fold" id="task-legacy-completed" hidden>
           <summary><span>以前已完成的任务</span><span class="fold-count" id="task-legacy-completed-count">0</span><span class="summary-hint">展开查看</span></summary>
           <div class="record-list completed-list" id="task-legacy-completed-list"></div>
+        </details>
+        <details class="completed-fold released-iterations-fold" id="task-released-fold" hidden>
+          <summary><span>已发布迭代任务</span><span class="fold-count" id="task-released-count">0</span><span class="summary-hint">展开查看</span></summary>
+          <div id="task-released-list" class="released-iteration-list"></div>
         </details>
       </section>
     </div>
@@ -183,16 +230,35 @@
   <dialog class="sources-dialog library-dialog" id="sources-dialog" aria-labelledby="sources-title">
     <div class="sources-shell library-shell">
       <div class="dialog-top library-top">
-        <div><span class="dialog-kicker">需求来源与参考资料</span><h2 id="sources-title">资料库</h2></div>
-        <button type="button" class="dialog-close" id="sources-close" aria-label="关闭资料库">×</button>
+        <div><span class="dialog-kicker">需求来源与参考资料</span><h2 id="sources-title">资料馆</h2><span class="library-subtitle">资料馆 · 迭代资产与全局资料</span></div>
+        <button type="button" class="dialog-close" id="sources-close" aria-label="关闭资料馆">×</button>
       </div>
-      <p id="source-feedback" class="source-feedback library-feedback" role="status" aria-live="polite">正在读取资料库…</p>
+      <div class="archive-nav" id="archive-scope-tabs" role="tablist" aria-label="资料范围">
+        <button type="button" class="archive-tab-btn active" role="tab" id="tab-archive-iteration" aria-selected="true" data-scope="iteration">当前版本资料</button>
+        <button type="button" class="archive-tab-btn" role="tab" id="tab-archive-history" aria-selected="false" data-scope="history">历史版本归档</button>
+        <button type="button" class="archive-tab-btn" role="tab" id="tab-archive-global" aria-selected="false" data-scope="global">全局公共材料</button>
+      </div>
+      <p id="source-feedback" class="source-feedback library-feedback" role="status" aria-live="polite">正在读取资料馆…</p>
       <section class="library-fixed" aria-labelledby="library-fixed-title">
         <div class="library-section-head">
           <div><h3 id="library-fixed-title">固定资料</h3><p>需求文档、设计稿与接口契约，每个位置只展示最新版本。</p></div>
           <span class="library-count" id="source-count" aria-label="资料总数">0</span>
         </div>
         <div class="library-slot-grid" id="library-slot-grid"></div>
+      </section>
+      <section class="supplementary-pool-section" id="supplementary-pool-section">
+        <div class="library-section-head">
+          <div><h3 id="supplementary-pool-title">补充材料池</h3><p>PM 聊天截图、需求微调备忘与临时补充参考资料</p></div>
+          <button type="button" class="source-action" id="supplementary-upload-trigger">+ 上传补充截图/材料</button>
+        </div>
+        <div class="supplementary-grid" id="supplementary-grid"></div>
+        <p id="supplementary-empty" class="library-empty" hidden>暂无补充材料截图或便签。</p>
+      </section>
+      <section class="archive-history-section" id="archive-history-section" aria-labelledby="archive-history-title" hidden>
+        <div class="library-section-head">
+          <div><h3 id="archive-history-title">历史版本资料矩阵</h3><p>已发布版本的固定槽位与补充材料，随时展开核对历史依据</p></div>
+        </div>
+        <div class="archive-history-list" id="archive-history-list"></div>
       </section>
       <section class="library-others" aria-labelledby="library-others-title">
         <details class="library-fold" id="library-others-fold" open>
@@ -212,9 +278,11 @@
           <summary><span id="library-add-title">添加资料或新版本</span><span class="library-summary-hint">链接 / 文件</span></summary>
           <p id="library-add-context" class="library-add-context" hidden></p>
           <form id="source-link-form" class="library-add-form">
+            <label>归属范围<select id="library-add-scope" name="scope"><option value="iteration">当前版本专属</option><option value="global">全局通用材料</option></select></label>
+            <label id="library-add-iteration-wrap">所属版本<select id="library-add-iteration" name="iteration_id"></select></label>
             <label>名称<input id="source-link-name" name="name" type="text" maxlength="200" placeholder="例如：需求说明文档" autocomplete="off"></label>
             <label>链接<input id="source-link-url" name="url" type="url" maxlength="4096" placeholder="https://…（选择文件时可留空）" autocomplete="off"></label>
-            <label>资料类型<select id="library-add-slot" name="slot"><option value="">其他来源</option><option value="requirement_doc">需求文档</option><option value="figma">Figma</option><option value="codesign">CoDesign</option><option value="api_doc">接口文档</option></select></label>
+            <label>资料类型<select id="library-add-slot" name="slot"><option value="">其他来源</option><option value="requirement_doc">需求文档</option><option value="figma">Figma</option><option value="codesign">CoDesign</option><option value="api_doc">接口文档</option><option value="prototype">高保真原型</option><option value="testcase">测试用例</option><option value="supplementary">补充材料</option><option value="architecture">公共规范</option></select></label>
             <label>版本说明<input id="library-add-version" name="version_label" type="text" maxlength="80" placeholder="例如：v3、2026-11-13、终版" autocomplete="off"></label>
             <div class="library-file-picker">
               <input id="source-file-input" type="file" hidden>
@@ -230,6 +298,101 @@
           </form>
         </details>
       </section>
+    </div>
+  </dialog>
+  <dialog class="iteration-dialog" id="iteration-dialog" aria-labelledby="iteration-dialog-title">
+    <div class="dialog-shell">
+      <div class="dialog-top">
+        <div><span class="dialog-kicker">版本管理</span><h2 id="iteration-dialog-title">新建版本迭代</h2></div>
+        <button type="button" class="dialog-close" id="iteration-dialog-close" aria-label="关闭新建迭代">×</button>
+      </div>
+      <form id="iteration-form" class="library-add-form">
+        <label>版本号（Version Tag）<input id="iteration-tag-input" name="version_tag" type="text" required placeholder="例如：v13.4.2" autocomplete="off"></label>
+        <label>迭代名称<input id="iteration-title-input" name="title" type="text" required placeholder="例如：13.4.2 智能相册与AI音乐优化" autocomplete="off"></label>
+        <label>计划发布日期<input id="iteration-date-input" name="target_release_date" type="date"></label>
+        <label>迭代描述<textarea id="iteration-desc-input" name="description" rows="2" placeholder="迭代范围与主要变动说明"></textarea></label>
+        <p id="iteration-feedback" class="source-feedback" role="status" aria-live="polite"></p>
+        <div class="followup-dialog-actions">
+          <button type="button" class="quiet-button" id="iteration-cancel">取消</button>
+          <button type="submit" class="followup-submit" id="iteration-submit">创建迭代</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+  <dialog class="reopen-dialog" id="reopen-dialog" aria-labelledby="reopen-dialog-title">
+    <div class="dialog-shell">
+      <div class="dialog-top">
+        <div><span class="dialog-kicker">需求变更</span><h2 id="reopen-dialog-title">发起二次修改</h2></div>
+        <button type="button" class="dialog-close" id="reopen-dialog-close" aria-label="关闭发起修改">×</button>
+      </div>
+      <form id="reopen-form" class="library-add-form">
+        <p class="reopen-hint">本任务已完成。在当前迭代正式发布前，如因 PM 沟通或细节调整需要二次修改，可在此重新激活并记录变更轨迹。</p>
+        <label>修改原因 / 变更说明<textarea id="reopen-reason-input" name="reason" rows="3" required placeholder="例如：PM 确认弹窗取消按钮改为文字链接样式，并补充曝光埋点"></textarea></label>
+        <label>审计模式（由 Agent 自主裁决）
+          <select id="reopen-audit-mode" name="audit_mode">
+            <option value="lightweight">轻量自审复核（仅文案/样式/小改动，开发自审快速通过）</option>
+            <option value="full">全量静态审计（涉及核心逻辑/数据结构/接口变更）</option>
+          </select>
+        </label>
+        <div class="library-file-picker">
+          <input id="reopen-file-input" type="file" accept="image/*,.pdf,.txt,.md" hidden>
+          <button type="button" class="library-file-button" id="reopen-add-file">上传变更截图 / 证据</button>
+          <span class="library-file-name" id="reopen-file-name">未选择图片</span>
+        </div>
+        <p id="reopen-feedback" class="source-feedback" role="status" aria-live="polite"></p>
+        <div class="followup-dialog-actions">
+          <button type="button" class="quiet-button" id="reopen-cancel">取消</button>
+          <button type="submit" class="followup-submit" id="reopen-submit">确认发起修改</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+  <dialog class="iteration-dialog" id="iteration-edit-dialog" aria-labelledby="iteration-edit-title">
+    <div class="dialog-shell">
+      <div class="dialog-top">
+        <div><span class="dialog-kicker">版本管理</span><h2 id="iteration-edit-title">版本更名与设置</h2></div>
+        <button type="button" class="dialog-close" id="iteration-edit-close" aria-label="关闭版本更名">×</button>
+      </div>
+      <form id="iteration-edit-form" class="library-add-form">
+        <label>内部版本ID（唯一标识）<input id="iteration-edit-id" name="id" type="text" readonly disabled class="readonly-input"></label>
+        <label>版本名称（Title）<input id="iteration-edit-title-input" name="title" type="text" required placeholder="例如：13.4.2 迭代二" autocomplete="off"></label>
+        <label>版本标识（Version Tag）<input id="iteration-edit-tag-input" name="version_tag" type="text" required placeholder="例如：13.4.2 迭代二" autocomplete="off"></label>
+        <label>计划发布日期<input id="iteration-edit-date-input" name="target_release_date" type="date"></label>
+        <label>版本描述<textarea id="iteration-edit-desc-input" name="description" rows="2" placeholder="迭代范围与主要变动说明"></textarea></label>
+        <p id="iteration-edit-feedback" class="source-feedback" role="status" aria-live="polite"></p>
+        <div class="followup-dialog-actions">
+          <button type="button" class="quiet-button" id="iteration-edit-cancel">取消</button>
+          <button type="submit" class="followup-submit" id="iteration-edit-submit">保存修改</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+  <dialog class="source-relocate-dialog" id="source-relocate-dialog" aria-labelledby="relocate-dialog-title">
+    <div class="dialog-shell">
+      <div class="dialog-top">
+        <div><span class="dialog-kicker">资料归类</span><h2 id="relocate-dialog-title">调整材料位置</h2></div>
+        <button type="button" class="dialog-close" id="relocate-dialog-close" aria-label="关闭调整位置">×</button>
+      </div>
+      <form id="relocate-form" class="library-add-form">
+        <p class="reopen-hint" id="relocate-source-title"></p>
+        <label>归属范围
+          <select id="relocate-scope-select" name="scope">
+            <option value="iteration">版本专属资料</option>
+            <option value="global">全局公共材料</option>
+          </select>
+        </label>
+        <label id="relocate-iteration-wrap">目标版本
+          <select id="relocate-iteration-select" name="iteration_id"></select>
+        </label>
+        <label>目标槽位
+          <select id="relocate-slot-select" name="slot"></select>
+        </label>
+        <p id="relocate-feedback" class="source-feedback" role="status" aria-live="polite"></p>
+        <div class="followup-dialog-actions">
+          <button type="button" class="quiet-button" id="relocate-cancel">取消</button>
+          <button type="submit" class="followup-submit" id="relocate-submit">确认移动</button>
+        </div>
+      </form>
     </div>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

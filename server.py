@@ -417,6 +417,8 @@ def build_payload() -> dict:
         "store_revision": revision,
         "current_batch_id": db.get("current_batch_id"),
         "batches": batches,
+        "current_iteration_id": db.get("current_iteration_id"),
+        "iterations": db.get("iterations", []),
         "legacy_task_ids": legacy_task_ids,
         "preferences": db.get("preferences", {}),
         **grouped,
@@ -458,6 +460,22 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/preferences":
             db = dashboardctl.load_store()
             self._send_json({"revision": db.get("revision", 0), "preferences": db.get("preferences", {})}); return
+        if route == "/api/iterations":
+            self._send_json(dashboardctl.list_iterations()); return
+        single_iter = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})", route)
+        if single_iter:
+            db = dashboardctl.load_store()
+            it = dashboardctl._find_iteration(db, single_iter.group(1))
+            if not it:
+                self._send_json({"error": "iteration_not_found"}, status=404)
+            else:
+                self._send_json({"iteration": it})
+            return
+        if route == "/api/archive/context":
+            query = parse_qs(urlsplit(self.path).query)
+            it_id = query.get("iteration", [None])[0]
+            task_id = query.get("task", [None])[0]
+            self._send_json(dashboardctl.assemble_archive_context(it_id, task_id)); return
         migration_job = re.fullmatch(r"/api/data-location/migrations/([A-Za-z0-9_-]{12,80})", route)
         if migration_job:
             result = data_location.job(migration_job.group(1))
@@ -674,15 +692,57 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json(max_bytes)
             attachment = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/attachments", route)
             if attachment:
-                self._only_keys(payload, {"filename", "content_base64"})
+                self._only_keys(payload, {"filename", "content_base64", "summary", "actor"})
                 filename, encoded = payload.get("filename"), payload.get("content_base64")
                 if not isinstance(filename, str) or not isinstance(encoded, str): raise ApiError(400, "invalid_record_attachment")
                 try: raw = base64.b64decode(encoded, validate=True)
                 except (binascii.Error, ValueError): raise ApiError(400, "invalid_base64")
                 if len(raw) > MAX_RECORD_IMAGE_BYTES: raise ApiError(413, "record_attachment_too_large")
-                result = dashboardctl.add_record_image(attachment.group(1), filename, raw)
+                summary = payload.get("summary")
+                actor = payload.get("actor", "agent")
+                db = dashboardctl.load_store()
+                rec = dashboardctl._find_record(db, attachment.group(1))
+                if rec.get("type") == "bug" and summary is None:
+                    result = dashboardctl.add_record_image(attachment.group(1), filename, raw)
+                else:
+                    result = dashboardctl.add_record_attachment(attachment.group(1), filename, raw, summary=summary, actor=actor)
                 result["attachment"]["download_url"] = f"/api/items/{attachment.group(1)}/attachments/{filename}"
                 self._send_json(result, status=201); return
+            if route == "/api/iterations":
+                self._only_keys(payload, {"version_tag", "title", "status", "target_release_date", "description", "iteration_id"})
+                version_tag = payload.get("version_tag")
+                title = payload.get("title")
+                if not isinstance(version_tag, str) or not isinstance(title, str):
+                    raise ApiError(400, "invalid_iteration_payload")
+                result = dashboardctl.create_iteration(
+                    version_tag, title,
+                    status=payload.get("status", "active"),
+                    target_release_date=payload.get("target_release_date"),
+                    description=payload.get("description", ""),
+                    iteration_id=payload.get("iteration_id")
+                )
+                self._send_json(result, status=201); return
+            iter_action = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})/(release|switch)", route)
+            if iter_action:
+                it_id, it_act = iter_action.groups()
+                if it_act == "release":
+                    self._only_keys(payload, {"note"})
+                    notes = [payload["note"]] if payload.get("note") else []
+                    self._send_json(dashboardctl.release_iteration(it_id, notes=notes)); return
+                elif it_act == "switch":
+                    self._only_keys(payload, set())
+                    self._send_json(dashboardctl.set_current_iteration(it_id)); return
+            iter_update = re.fullmatch(r"/api/iterations/([A-Za-z0-9_-]{1,80})/update", route)
+            if iter_update:
+                self._only_keys(payload, {"version_tag", "title", "description", "target_release_date", "status", "notes"})
+                self._send_json(dashboardctl.update_iteration(iter_update.group(1), payload)); return
+            item_iteration = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/iteration", route)
+            if item_iteration:
+                self._only_keys(payload, {"iteration_id"})
+                it_id = payload.get("iteration_id")
+                if not isinstance(it_id, str):
+                    raise ApiError(400, "invalid_iteration_id")
+                self._send_json(dashboardctl.assign_record_iteration(item_iteration.group(1), it_id)); return
             workflow_action = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/workflow/(start|submit|advance|rework|block|unblock|close|claim|heartbeat|release)", route)
             if workflow_action:
                 record_id, action = workflow_action.group(1), workflow_action.group(2)
@@ -822,17 +882,20 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "inspection_dispatch_failed"}, status=503)
                 return
             if route == "/api/sources/link":
-                self._only_keys(payload, {"url", "name", "category", "purpose", "primary", "slot", "group_id", "version_label"})
+                self._only_keys(payload, {"url", "name", "category", "purpose", "primary", "slot", "group_id", "version_label", "scope", "iteration_id"})
                 url, name, category = payload.get("url"), payload.get("name"), payload.get("category", "需求资料")
                 purpose, primary = payload.get("purpose"), payload.get("primary")
                 slot, group_id, version_label = payload.get("slot"), payload.get("group_id"), payload.get("version_label")
+                scope, iteration_id = payload.get("scope"), payload.get("iteration_id")
                 if (not isinstance(url, str) or (name is not None and not isinstance(name, str)) or not isinstance(category, str)
                         or (purpose is not None and not isinstance(purpose, str)) or (primary is not None and not isinstance(primary, bool))
                         or (slot is not None and not isinstance(slot, str)) or (group_id is not None and not isinstance(group_id, str))
-                        or (version_label is not None and not isinstance(version_label, str))):
+                        or (version_label is not None and not isinstance(version_label, str))
+                        or (scope is not None and not isinstance(scope, str)) or (iteration_id is not None and not isinstance(iteration_id, str))):
                     raise ApiError(400, "invalid_source_payload")
                 result = dashboardctl.add_source_link(url, name, category, "dashboard", purpose=purpose, primary=primary,
-                                                      slot=slot, group_id=group_id, version_label=version_label)
+                                                      slot=slot, group_id=group_id, version_label=version_label,
+                                                      scope=scope, iteration_id=iteration_id)
                 self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])}, status=201)
                 return
             source_inspection = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/inspection", route)
@@ -850,6 +913,20 @@ class Handler(BaseHTTPRequestHandler):
                 if "slot" not in payload or (payload["slot"] is not None and not isinstance(payload["slot"], str)):
                     raise ApiError(400, "invalid_source_slot")
                 result = dashboardctl.set_source_slot(source_slot.group(1), payload["slot"])
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
+                return
+            source_location = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/location", route)
+            if source_location:
+                self._only_keys(payload, {"scope", "iteration_id", "slot"})
+                scope = payload.get("scope")
+                if scope not in {"global", "iteration"}:
+                    raise ApiError(400, "invalid_source_scope")
+                result = dashboardctl.set_source_location(
+                    source_location.group(1),
+                    scope=scope,
+                    iteration_id=payload.get("iteration_id"),
+                    slot=payload.get("slot")
+                )
                 self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             override = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/override", route)
@@ -908,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "invalid_claim_parameters")
                 self._send_json(dashboardctl.claim_followups(ids, limit, claimed_by))
                 return
-            match = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/(complete|followups|transfer)", route)
+            match = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/(complete|followups|transfer|reopen)", route)
             if match:
                 record_id, action = match.groups()
                 if action == "complete":
@@ -920,6 +997,21 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "transfer":
                     self._only_keys(payload, set())
                     self._send_json(dashboardctl.confirm_bug_transfer(record_id))
+                    return
+                if action == "reopen":
+                    self._only_keys(payload, {"reason", "audit_mode", "actor", "actor_role", "evidence", "expected_revision"})
+                    reason = payload.get("reason")
+                    if not isinstance(reason, str) or not reason.strip():
+                        raise ApiError(400, "invalid_reopen_reason")
+                    res = dashboardctl.reopen_record(
+                        record_id, reason=reason,
+                        audit_mode=payload.get("audit_mode", "lightweight"),
+                        actor=payload.get("actor", "agent"),
+                        actor_role=payload.get("actor_role", "lead"),
+                        evidence=payload.get("evidence"),
+                        expected_store_revision=payload.get("expected_revision")
+                    )
+                    self._send_json(res)
                     return
                 self._only_keys(payload, {"prompt"})
                 if not isinstance(payload.get("prompt"), str):

@@ -697,6 +697,8 @@ def submit(record: dict[str, Any], outputs: Any, *, actor_role: str, actor: str,
     for substep in stage.get("substeps") or []:
         for key in substep.get("outputs") or []:
             if key in cleaned_outputs and role != substep.get("role"):
+                if workflow.get("audit_mode") == "lightweight" and stage.get("id") == "audit_response" and role == "dev":
+                    continue
                 raise WorkflowError("invalid_role",
                                     f"输出 {key} 只能由 {substep.get('role')} 提交，当前角色是 {role}")
     note = _clean_note(note)
@@ -835,6 +837,52 @@ def rework(record: dict[str, Any], to: str, *, actor_role: str, actor: str, note
     _sync_summary(record)
     record["updated_at"] = at
     return workflow
+
+
+def reopen(record: dict[str, Any], *, actor_role: str = "lead", actor: str = "agent", reason: str = "",
+           audit_mode: str = "lightweight", to_stage: str = "development",
+           evidence: Any = None, now: Any = None) -> dict[str, Any]:
+    workflow = record.get("workflow")
+    at = _now(now)
+    actor = _clean_actor(actor)
+    reason = _clean_note(reason)
+    evidence = _clean_evidence(evidence)
+    audit_mode = audit_mode if audit_mode in {"lightweight", "full"} else "lightweight"
+
+    if workflow and isinstance(workflow, dict):
+        template = _template_for(workflow)
+        target, _ = stage_definition(template, to_stage)
+        if workflow.get("lock"):
+            _clear_lock(record, workflow, at=at, action="reopen_release", actor=actor, role=actor_role, note="重开释放锁")
+        new_gate = _reset_gate(workflow, target["id"], actor=actor, role=actor_role, at=at, note=reason, evidence=evidence)
+        workflow["stage"] = target["id"]
+        workflow["stage_status"] = "active"
+        workflow["substage"] = _substage_for(target, new_gate)
+        workflow["rework_count"] = int(workflow.get("rework_count") or 0) + 1
+        workflow["audit_mode"] = audit_mode
+        workflow["updated_at"] = at
+
+        _append_history(workflow, at=at, action="reopen", stage=target["id"], actor=actor, role=actor_role,
+                        note=f"发起修改(第{record.get('reopen_count', 1)}轮): {reason}",
+                        evidence=evidence, audit_mode=audit_mode)
+        _sync_summary(record)
+
+    desired = status_for_stage(to_stage, record.get("type"), "in_progress") if (workflow and isinstance(workflow, dict)) else "in_progress"
+    record["status"] = desired
+    record["effective_status"] = desired
+    record["manual_status"] = None
+    record["manual_completed_at"] = None
+    record["manual_completed_by"] = None
+    record["completed_at"] = None
+    record["updated_at"] = at
+    record.setdefault("history", []).append({
+        "at": at,
+        "from_status": "completed",
+        "to_status": desired,
+        "status": desired,
+        "note": f"发起修改 (第{record.get('reopen_count', 1)}轮): {reason} [审计模式: {audit_mode}]"
+    })
+    return workflow or {}
 
 
 def block(record: dict[str, Any], *, actor_role: str, actor: str, note: Any, now: Any = None) -> dict[str, Any]:

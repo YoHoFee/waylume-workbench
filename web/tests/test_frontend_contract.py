@@ -222,9 +222,9 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('path.endswith("/workflow")', FIXTURE)
 
     def test_library_dialog_exposes_fixed_slots_versions_and_inspection(self):
-        self.assertIn('<h2 id="sources-title">资料库</h2>', HTML)
+        self.assertIn('<h2 id="sources-title">资料馆</h2>', HTML)
         self.assertIn('需求来源与参考资料', HTML)
-        self.assertIn('aria-label="关闭资料库"', HTML)
+        self.assertIn('aria-label="关闭资料馆"', HTML)
         self.assertIn('id="library-slot-grid"', HTML)
         self.assertIn('id="library-other-list"', HTML)
         self.assertIn('id="library-add-slot"', HTML)

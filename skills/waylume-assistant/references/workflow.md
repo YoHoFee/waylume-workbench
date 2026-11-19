@@ -124,6 +124,27 @@ Rules:
 6. If a role binding is missing, bind it (or report the blocker) before dispatch.
 7. The card's `channel` value, when present, is an opaque host label. The host decides what it means.
 
+### 5.1 Parallel Git workspace block
+
+Before dispatching a code task, read the [parallel Git worktree protocol](../../mcloud-workflow/references/parallel-git-worktree.md) and include this block in the worker prompt/context:
+
+```markdown
+## Git 工作区（必读）
+- record_id: <ITEM_ID>
+- branch: local/...
+- base: origin/mCloud_13.4.2_develop@<sha>
+- worktree: ~/.codex/worktrees/mcloud-...
+- owner: <dev/session>
+- build_owner: <build/test owner>
+- shared_files: <none|project.pbxproj|Podfile|...>
+- integration_owner: lead
+```
+
+- If branch/worktree fields are missing, allocate them first; do not dispatch a code worker into the main checkout.
+- One branch belongs to one worktree and one code writer. Other agents may audit read-only.
+- Do not dispatch two workers that both need `project.pbxproj`, `Podfile` or the same device; the Lead serializes shared-file/device ownership.
+- The worker must report branch, commit, worktree path and verification back to the item.
+
 ## 6. Bind fixed roles
 
 Bindings are task metadata, not workflow gates:

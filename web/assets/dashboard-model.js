@@ -74,6 +74,66 @@
   }
   function partitionTerminalRecords(records, today) { return partitionDailyCompletions(records, today); }
   function partitionCompletedRecords(records, today) { return partitionTerminalRecords(records, today); }
+  function partitionIterationRecords(records, iterations, currentIterationId, today) {
+    const list = Array.isArray(records) ? records : [];
+    const iterList = Array.isArray(iterations) ? iterations : [];
+    const iterMap = new Map(iterList.map(it => [it.id, it]));
+    const current = iterMap.get(currentIterationId) || iterList.find(it => it.status === "active" || it.status === "pending_release") || null;
+    const groupedByIter = new Map();
+    const backlog = [];
+
+    for (const record of list) {
+      const iterId = record.iteration_id;
+      if (iterId && iterMap.has(iterId)) {
+        if (!groupedByIter.has(iterId)) groupedByIter.set(iterId, []);
+        groupedByIter.get(iterId).push(record);
+      } else {
+        backlog.push(record);
+      }
+    }
+
+    const activeIterations = [];
+    const releasedIterations = [];
+
+    for (const it of iterList) {
+      const iterRecords = groupedByIter.get(it.id) || [];
+      const isReleased = it.status === "released" || it.status === "archived";
+      const unfinished = iterRecords.filter(r => !["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
+      const completed = iterRecords.filter(r => ["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
+      const isCurrent = current ? current.id === it.id : false;
+
+      const item = {
+        iteration: it,
+        records: iterRecords,
+        unfinished,
+        completed,
+        isReleased,
+        isCurrent,
+        // Zero-collapse rule: In unreleased iterations, all records remain visible in the active list (never folded)
+        visibleRecords: isReleased ? [] : iterRecords,
+        foldedRecords: isReleased ? iterRecords : []
+      };
+
+      if (isReleased) releasedIterations.push(item);
+      else activeIterations.push(item);
+    }
+
+    const backlogUnfinished = backlog.filter(r => !["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
+    const backlogCompleted = backlog.filter(r => ["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
+    const backlogCompletion = partitionDailyCompletions(backlogCompleted, today);
+
+    return {
+      currentIteration: current,
+      activeIterations,
+      releasedIterations,
+      backlog: {
+        records: backlog,
+        unfinished: backlogUnfinished,
+        completed: backlogCompleted,
+        completion: backlogCompletion
+      }
+    };
+  }
   function sortTaskRecords(items) {
     const rank = item => item.effective_status === "completed" ? 2 : ["in_progress", "developing", "testing"].includes(item.effective_status) ? 0 : 1;
     return [...items].sort((a, b) => rank(a) - rank(b) || String(b.created_at || "").localeCompare(String(a.created_at || "")) || String(a.id || "").localeCompare(String(b.id || "")));
@@ -121,7 +181,7 @@
     pm_acceptance: "PM 验收", delivery_evidence: "交付证据"
   };
   const workflowStatusLabels = { done: "已完成", active: "进行中", pending: "待开始", blocked: "已阻塞", rework: "已退回" };
-  const workflowActionLabels = { start: "启动流程", submit: "提交输出", advance: "推进阶段", rework: "退回修改", block: "标记阻塞", unblock: "解除阻塞", close: "关闭流程" };
+  const workflowActionLabels = { start: "启动流程", submit: "提交输出", advance: "推进阶段", rework: "退回修改", block: "标记阻塞", unblock: "解除阻塞", close: "关闭流程", reopen: "发起二次修改", release: "迭代发布" };
 
   function workflowRoleLabel(role) {
     const value = String(role || "").trim();
@@ -208,6 +268,7 @@
       templateVersion: (workflow && workflow.template_version) ?? (template && template.version) ?? null,
       stageId: null, stageIndex: null, stageCount: stages.length,
       stageStatus: null, statusLabel: "未启用", blocked: false, reworkCount: 0, lock: null,
+      reopenCount: 0, reopenHistory: [], auditMode: null,
       steps: [], history: [], historyCount: 0, current: null, summaryOnly: detailState !== "loaded"
     };
     if (!stageId) return base;
@@ -270,6 +331,9 @@
     });
     const currentStep = currentIndex >= 0 ? steps[currentIndex] : null;
     const history = workflowHistoryEntries(workflow, stages);
+    const reopenCount = Number((workflow && workflow.reopen_count) ?? summary.reopen_count ?? 0) || 0;
+    const reopenHistory = Array.isArray(workflow && workflow.reopen_history) ? workflow.reopen_history : Array.isArray(summary.reopen_history) ? summary.reopen_history : [];
+    const auditMode = (workflow && workflow.audit_mode) || (summary.workflow && summary.workflow.audit_mode) || (reopenHistory.length ? reopenHistory[reopenHistory.length - 1].audit_mode : null) || "full";
     return Object.assign(base, {
       enabled: true,
       stageId,
@@ -279,6 +343,9 @@
       blocked: status === "blocked",
       reworkCount,
       lock,
+      reopenCount,
+      reopenHistory,
+      auditMode,
       steps,
       history,
       historyCount: history.length,
@@ -410,8 +477,132 @@
     const others = groups.filter(group => !selectedGroups.has(group.group_id));
     return { slots, others, removed, activeCount: active.length, groups };
   }
-  const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, sortTaskRecords, workPeriodProgress,
+  const globalArchiveSlots = Object.freeze([
+    Object.freeze({ id: "api_doc", label: "接口文档", hint: "跨版本共享接口契约与定义" })
+  ]);
+  const iterationArchiveSlots = Object.freeze([
+    Object.freeze({ id: "requirement_doc", label: "需求列表", hint: "交付依据与功能清单" }),
+    Object.freeze({ id: "figma", label: "Figma", hint: "界面与交互视觉设计主稿" }),
+    Object.freeze({ id: "prototype", label: "高保真", hint: "CoDesign / 交互原型" }),
+    Object.freeze({ id: "testcase", label: "测试用例", hint: "QA冒烟与验收用例参考" })
+  ]);
+  const archiveSlotLabels = Object.freeze({
+    requirement_doc: "需求列表",
+    figma: "Figma",
+    prototype: "高保真",
+    codesign: "高保真",
+    testcase: "测试用例",
+    supplementary: "补充材料",
+    api_doc: "接口文档",
+    architecture: "公共规范",
+    other: "其他资料"
+  });
+  function archiveView(sources, iterations, selectedIterationId) {
+    const list = Array.isArray(sources) ? sources.filter(item => item && typeof item === "object") : [];
+    const iterList = Array.isArray(iterations) ? iterations.filter(item => item && typeof item === "object") : [];
+    const active = list.filter(libraryActive);
+    const removed = list.filter(source => !libraryActive(source)).map(source => ({ ...source }));
+    const iterMap = new Map(iterList.map(it => [it.id, it]));
+    const currentIteration = iterMap.get(selectedIterationId)
+      || iterList.find(it => it.status === "active" || it.status === "pending_release")
+      || iterList[0]
+      || null;
+    const currentId = currentIteration ? currentIteration.id : null;
+
+    // Build Global section
+    const globalSources = active.filter(s => s.scope === "global" || (!s.scope && (s.slot === "api_doc" || s.slot === "architecture")));
+    const globalGroupView = libraryView(globalSources);
+    const globalSelected = new Map();
+    for (const def of globalArchiveSlots) {
+      const candidates = globalGroupView.groups.filter(g => g.slot === def.id);
+      globalSelected.set(def.id, candidates[0] || null);
+    }
+    const globalSlots = globalArchiveSlots.map(def => {
+      const group = globalSelected.get(def.id);
+      return {
+        slot: def.id, label: def.label, hint: def.hint,
+        group, card: group?.card || null, versions: group?.versions || [],
+        version_count: group?.version_count || 0, history_count: group?.history_count || 0,
+        empty: !group
+      };
+    });
+    const globalSupplementary = [];
+    for (const s of globalSources) {
+      if (s.slot !== "api_doc") globalSupplementary.push(s);
+      if (Array.isArray(s.attachments)) {
+        for (const att of s.attachments) globalSupplementary.push(att);
+      }
+    }
+
+    // Build per-iteration matrix sections
+    const iterationSections = iterList.map(it => {
+      const itSources = active.filter(s => {
+        if (s.scope === "iteration") return s.iteration_id === it.id;
+        if (s.scope === "global") return false;
+        if (s.slot === "api_doc" || s.slot === "architecture") return false;
+        return s.iteration_id === it.id;
+      });
+      const itGroupView = libraryView(itSources);
+      const itSelected = new Map();
+      for (const def of iterationArchiveSlots) {
+        const candidates = itGroupView.groups.filter(g => {
+          if (def.id === "prototype") return g.slot === "prototype" || g.slot === "codesign";
+          return g.slot === def.id;
+        });
+        itSelected.set(def.id, candidates[0] || null);
+      }
+      const slots = iterationArchiveSlots.map(def => {
+        const group = itSelected.get(def.id);
+        return {
+          slot: def.id, label: def.label, hint: def.hint,
+          group, card: group?.card || null, versions: group?.versions || [],
+          version_count: group?.version_count || 0, history_count: group?.history_count || 0,
+          empty: !group
+        };
+      });
+      const supplementary = [];
+      const fixedGroupIds = new Set([...itSelected.values()].filter(Boolean).map(g => g.group_id));
+      for (const s of itSources) {
+        if (s.slot === "supplementary" || !fixedGroupIds.has(libraryGroupId(s))) {
+          supplementary.push(s);
+        }
+        if (Array.isArray(s.attachments)) {
+          for (const att of s.attachments) supplementary.push(att);
+        }
+      }
+      return {
+        iteration: it,
+        isCurrent: it.id === currentId,
+        slots,
+        supplementary,
+        groups: itGroupView.groups,
+        others: itGroupView.others
+      };
+    });
+
+    const activeSection = iterationSections.find(s => s.isCurrent) || iterationSections[0] || null;
+
+    return {
+      currentIteration,
+      iterations: iterationSections,
+      rawIterations: iterList,
+      globalSection: {
+        slots: globalSlots,
+        supplementary: globalSupplementary,
+        groups: globalGroupView.groups,
+        others: globalGroupView.others
+      },
+      globalSlots,
+      iterationSlots: activeSection ? activeSection.slots : [],
+      supplementaryItems: activeSection ? activeSection.supplementary : [],
+      others: activeSection ? activeSection.others.concat(globalGroupView.others) : globalGroupView.others,
+      removed,
+      activeCount: active.length
+    };
+  }
+  const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionIterationRecords, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, sortTaskRecords, workPeriodProgress,
     librarySlots, librarySlotLabels, libraryActive, libraryView,
+    globalArchiveSlots, iterationArchiveSlots, archiveSlotLabels, archiveView,
     workflowView, workflowChip, workflowStageDefinitions, workflowStatusLabel, workflowRoleLabel, workflowOutputLabel, workflowStagesFallback };
   if (typeof module !== "undefined" && module.exports) module.exports = model;
   if (typeof window !== "undefined") window.dashboardModel = model;

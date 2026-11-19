@@ -99,10 +99,20 @@ records += [
     item("fixture-workflow-rework", "work", "Fixture workflow · 退回", None, status="in_progress",
          workflow_stage="development", workflow_stage_status="rework", workflow_stage_index=3, workflow_stage_label="开发", workflow_stage_short="开发", workflow_rework_count=2),
     item("fixture-workflow-audit", "work", "Fixture workflow · 审计与回应", None, status="in_progress",
-         workflow_stage="audit_response", workflow_stage_status="active", workflow_stage_index=4, workflow_stage_label="静态审计与开发回应", workflow_stage_short="审计"),
+         workflow_stage="audit_response", workflow_stage_status="active", workflow_stage_index=4, workflow_stage_label="静态审计与开发回应", workflow_stage_short="审计", iteration_id="iter-fixture-1"),
     item("fixture-workflow-legacy", "work", "Fixture workflow · 旧记录未启用", None, status="in_progress"),
     item("fixture-workflow-unavailable", "work", "Fixture workflow · 详情接口失败", None, status="in_progress",
-         workflow_stage="acceptance", workflow_stage_status="active", workflow_stage_index=5, workflow_stage_label="PM验收", workflow_stage_short="验收")
+         workflow_stage="acceptance", workflow_stage_status="active", workflow_stage_index=5, workflow_stage_label="PM验收", workflow_stage_short="验收"),
+    item("fixture-work-completed-in-active-iter", "work", "已完成但未发布迭代的需求 (零折叠常驻展示)", datetime.now().astimezone().isoformat(), status="completed",
+         iteration_id="iter-fixture-1", reopen_count=1,
+         reopen_history=[{"round": 1, "reopened_at": f"{TODAY}T10:00:00+08:00", "reason": "PM微调需求样式", "audit_mode": "lightweight"}])
+]
+
+FIXTURE_ITERATIONS = [
+    {"id": "iter-fixture-1", "version_tag": "v13.4.2", "title": "13.4.2 智能相册与AI音乐优化", "status": "active",
+     "target_release_date": "2026-11-30", "description": "包含 Wan3.0 适配、本地音乐列表滚动优化及埋点修复"},
+    {"id": "iter-fixture-old", "version_tag": "v13.4.1", "title": "13.4.1 历史已发布迭代", "status": "released",
+     "target_release_date": "2026-10-31", "description": "历史迭代"}
 ]
 
 
@@ -119,7 +129,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/dashboard":
             payload = {"requirements": [r for r in records if r["type"] == "work"], "bugs": [r for r in records if r["type"] == "bug"],
                        "delegated": [r for r in records if r["type"] == "task"], "sources": sources, "revision": 1, "generated_at": datetime.now().astimezone().isoformat(),
-                       "current_batch_id": "batch-current", "batches": [{"id":"batch-current","state":"current","task_ids":["fixture-current-done"]}, {"id":"batch-old","state":"past","task_ids":["fixture-old-task"]}], "inspection": {}}
+                       "current_batch_id": "batch-current", "batches": [{"id":"batch-current","state":"current","task_ids":["fixture-current-done"]}, {"id":"batch-old","state":"past","task_ids":["fixture-old-task"]}],
+                       "iterations": FIXTURE_ITERATIONS, "current_iteration_id": "iter-fixture-1", "inspection": {}}
             return self.respond(payload)
         if path.startswith("/api/items/") and path.endswith("/context"):
             rid = path.split("/")[3]

@@ -475,7 +475,14 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(urlsplit(self.path).query)
             it_id = query.get("iteration", [None])[0]
             task_id = query.get("task", [None])[0]
-            self._send_json(dashboardctl.assemble_archive_context(it_id, task_id)); return
+            try:
+                result = dashboardctl.assemble_archive_context(it_id, task_id)
+            except ValueError as exc:
+                code = dashboardctl.error_code(exc)
+                status = 404 if code in {"iteration_not_found", "record_not_found"} else 400
+                self._send_json({"error": code}, status=status)
+                return
+            self._send_json(result); return
         migration_job = re.fullmatch(r"/api/data-location/migrations/([A-Za-z0-9_-]{12,80})", route)
         if migration_job:
             result = data_location.job(migration_job.group(1))

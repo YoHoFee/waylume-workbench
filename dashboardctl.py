@@ -1606,21 +1606,36 @@ def migrate_iteration_archive(*, default_tag: str = "v13.4.2", default_title: st
 def assemble_archive_context(iteration_id: str | None = None, task_id: str | None = None) -> dict[str, Any]:
     db = load_store()
     all_sources = enrich_source_records(_source_store_list(db))
+
+    task_record = None
+    if task_id is not None:
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("invalid_record_id")
+        task_record = next((r for r in db.get("records", []) if r.get("id") == task_id), None)
+        if task_record is None:
+            raise ValueError("record_not_found")
+
     target_iteration = None
-    if iteration_id:
-        target_iteration = _find_iteration(db, iteration_id)
-    elif task_id:
-        rec = next((r for r in db.get("records", []) if r.get("id") == task_id), None)
-        if rec and rec.get("iteration_id"):
-            target_iteration = _find_iteration(db, rec["iteration_id"])
-    if not target_iteration and db.get("current_iteration_id"):
+    if iteration_id is not None:
+        if not isinstance(iteration_id, str) or not iteration_id.strip():
+            raise ValueError("invalid_iteration_id")
+        target_iteration = _find_iteration(db, iteration_id.strip())
+        if not target_iteration:
+            raise ValueError("iteration_not_found")
+    elif task_record is not None:
+        # An explicit task fixes the context. If it has no version we stay on
+        # public material; never silently fall back to current_iteration_id.
+        if task_record.get("iteration_id"):
+            target_iteration = _find_iteration(db, task_record["iteration_id"])
+            if not target_iteration:
+                raise ValueError("iteration_not_found")
+    elif db.get("current_iteration_id"):
         target_iteration = _find_iteration(db, db["current_iteration_id"])
 
     target_iter_id = target_iteration.get("id") if target_iteration else None
 
     global_materials = [s for s in all_sources if s.get("scope") == "global" and s.get("active")]
     iteration_materials = [s for s in all_sources if s.get("scope") == "iteration" and s.get("iteration_id") == target_iter_id and s.get("active")] if target_iter_id else []
-    task_record = next((r for r in db.get("records", []) if r.get("id") == task_id), None) if task_id else None
 
     lines = [f"# 研发工作上下文基线（版本：{target_iteration.get('title') if target_iteration else '全局公共'} · 内部ID: {target_iter_id or 'GLOBAL'}）", ""]
     if target_iteration:
@@ -1638,6 +1653,8 @@ def assemble_archive_context(iteration_id: str | None = None, task_id: str | Non
         for item in global_materials:
             slot_name = SOURCE_SLOT_LABELS.get(item.get("slot"), item.get("slot") or "资料")
             lines.append(f"- **[{slot_name}]** {item.get('name')} ({item.get('url') or item.get('filename')}) [版本: {item.get('version_label', 'v1')}]")
+            for att in item.get("attachments", []):
+                lines.append(f"  - 补充材料: {att.get('summary') or att.get('filename')} ({att.get('download_url')})")
     else:
         lines.append("- （暂无全局公共材料）")
     lines.append("")

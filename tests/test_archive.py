@@ -246,6 +246,46 @@ class ArchiveStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
             dashboardctl.set_source_location(global_api["id"], scope="iteration", iteration_id=first["id"], slot="bogus")
 
+    def test_archive_context_rejects_missing_ids_and_includes_global_attachments(self):
+        first = dashboardctl.create_iteration("13.4.0", "13.4.0")["iteration"]
+        current = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        dashboardctl.add_source_link(
+            "https://example.com/current", "当前版本资料", slot="supplementary",
+            scope="iteration", iteration_id=current["id"]
+        )
+        global_api = dashboardctl.add_source_link(
+            "https://example.com/api", "公共接口", slot="api_doc", scope="global",
+            attachments=[{"filename": "api-note.txt", "summary": "全局附件说明", "download_url": "/api-note.txt"}]
+        )["source"]
+
+        with self.assertRaisesRegex(ValueError, "iteration_not_found"):
+            dashboardctl.assemble_archive_context(iteration_id="ITER-missing")
+        with self.assertRaisesRegex(ValueError, "record_not_found"):
+            dashboardctl.assemble_archive_context(task_id="ZT-T-MISSING")
+
+        task = dashboardctl.normalize_record({
+            "id": "ZT-T-NO-VERSION", "type": "task", "title": "无版本任务", "status": "in_progress"
+        })
+        db = dashboardctl.load_store()
+        db["records"].append(task)
+        dashboardctl.atomic_write(db)
+        context = dashboardctl.assemble_archive_context(task_id=task["id"])
+        self.assertIsNone(context["iteration"])
+        self.assertEqual(context["iteration_materials"], [])
+        self.assertIn("无版本任务", context["summary_markdown"])
+        self.assertNotIn("当前版本资料", context["summary_markdown"])
+
+        dangling = dict(task, id="ZT-T-DANGLING", iteration_id="ITER-missing")
+        db = dashboardctl.load_store()
+        db["records"].append(dangling)
+        dashboardctl.atomic_write(db)
+        with self.assertRaisesRegex(ValueError, "iteration_not_found"):
+            dashboardctl.assemble_archive_context(task_id="ZT-T-DANGLING")
+
+        context = dashboardctl.assemble_archive_context(iteration_id=first["id"])
+        self.assertIn(global_api["id"], {item["id"] for item in context["global_materials"]})
+        self.assertIn("全局附件说明", context["summary_markdown"])
+
     def test_migrate_iteration_archive(self):
         # Setup legacy store with records and sources without iteration/scope
         db = dashboardctl.load_store()
@@ -434,6 +474,23 @@ class ArchiveApiTests(unittest.TestCase):
         self.assertEqual(data["source"]["slot"], "requirement_doc")
         self.assertTrue(data["source"]["inspection_enabled"])
         self.assertEqual(data["source"]["inspection_mode"], "auto")
+
+    def test_archive_context_api_rejects_missing_explicit_ids(self):
+        status, data = self.request("GET", "/api/archive/context?iteration=ITER-missing")
+        self.assertEqual(status, 404)
+        self.assertEqual(data["error"], "iteration_not_found")
+
+        status, data = self.request("GET", "/api/archive/context?task=ZT-T-MISSING")
+        self.assertEqual(status, 404)
+        self.assertEqual(data["error"], "record_not_found")
+
+        status, data = self.request("POST", "/api/iterations", {
+            "version_tag": "13.4.0 埋点", "title": "13.4.0 埋点", "iteration_id": "ITER-13.4.0-ANALYTICS"
+        })
+        self.assertEqual(status, 201)
+        status, data = self.request("GET", "/api/archive/context?iteration=ITER-13.4.0-ANALYTICS")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["iteration"]["id"], "ITER-13.4.0-ANALYTICS")
 
     def test_record_iteration_can_be_cleared(self):
         iteration = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]

@@ -83,6 +83,10 @@ class ArchiveUIContractTests(unittest.TestCase):
         self.assertIn("releasedGroups: groups.filter", MODEL)
         for selector in ("work-released-section", "work-released-toggle", "work-released-list"):
             self.assertIn(f'id="{selector}"', HTML)
+        # Active versions stay above the released entry; the released list is
+        # nested after the active container so expanded cards render below it.
+        self.assertLess(HTML.index('id="work-iteration-container"'), HTML.index('id="work-released-section"'))
+        self.assertLess(HTML.index('id="work-iteration-container"'), HTML.index('id="work-released-list"'))
         for marker in ("查看已发布版本", "state.workReleasedOpen", "state.workReleasedExpanded",
                        "state.archiveReleasedExpanded", "makeArchiveSection(section, { released: true })",
                        "archive-block-released"):

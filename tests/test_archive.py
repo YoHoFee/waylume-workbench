@@ -209,6 +209,43 @@ class ArchiveStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
             dashboardctl.set_source_location(group["id"], scope="iteration", iteration_id=second["id"], slot="api_doc")
 
+    def test_source_location_preserves_slot_and_syncs_inspection(self):
+        first = dashboardctl.create_iteration("13.4.0", "13.4.0")["iteration"]
+        second = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        prd = dashboardctl.add_source_link(
+            "https://example.com/prd", "需求列表", slot="requirement_doc",
+            scope="iteration", iteration_id=first["id"]
+        )["source"]
+        self.assertTrue(prd["inspection_enabled"])
+        self.assertEqual(prd["inspection_mode"], "auto")
+
+        preserved = dashboardctl.set_source_location(prd["id"], scope="iteration", iteration_id=second["id"])
+        self.assertEqual(preserved["slot"], "requirement_doc")
+        stored = next(item for item in dashboardctl._source_store_list(dashboardctl.load_store()) if item["id"] == prd["id"])
+        self.assertEqual(stored["iteration_id"], second["id"])
+        self.assertTrue(stored["inspection_enabled"])
+        self.assertEqual(stored["inspection_mode"], "auto")
+
+        moved_out = dashboardctl.set_source_location(prd["id"], scope="iteration", iteration_id=first["id"], slot="supplementary")
+        stored = next(item for item in dashboardctl._source_store_list(dashboardctl.load_store()) if item["id"] == prd["id"])
+        self.assertEqual(moved_out["slot"], "supplementary")
+        self.assertFalse(stored["inspection_enabled"])
+        self.assertEqual(stored["inspection_mode"], "manual")
+
+        moved_back = dashboardctl.set_source_location(prd["id"], scope="iteration", iteration_id=second["id"], slot="requirement_doc")
+        stored = next(item for item in dashboardctl._source_store_list(dashboardctl.load_store()) if item["id"] == prd["id"])
+        self.assertEqual(moved_back["slot"], "requirement_doc")
+        self.assertTrue(stored["inspection_enabled"])
+        self.assertEqual(stored["inspection_mode"], "auto")
+
+        global_api = dashboardctl.add_source_link(
+            "https://example.com/api", "公共接口", slot="api_doc", scope="global"
+        )["source"]
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.set_source_location(global_api["id"], scope="iteration", iteration_id=first["id"])
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.set_source_location(global_api["id"], scope="iteration", iteration_id=first["id"], slot="bogus")
+
     def test_migrate_iteration_archive(self):
         # Setup legacy store with records and sources without iteration/scope
         db = dashboardctl.load_store()
@@ -385,6 +422,18 @@ class ArchiveApiTests(unittest.TestCase):
             "slot": "figma", "scope": "global"
         })
         self.assertEqual(status, 400)
+
+        prd = dashboardctl.add_source_link(
+            "https://example.com/prd-api", "API 需求列表", slot="requirement_doc",
+            scope="iteration", iteration_id=second_id
+        )["source"]
+        status, data = self.request("POST", f"/api/sources/{prd['id']}/location", {
+            "scope": "iteration", "iteration_id": first_id
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["source"]["slot"], "requirement_doc")
+        self.assertTrue(data["source"]["inspection_enabled"])
+        self.assertEqual(data["source"]["inspection_mode"], "auto")
 
     def test_record_iteration_can_be_cleared(self):
         iteration = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]

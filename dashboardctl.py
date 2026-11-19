@@ -3171,6 +3171,21 @@ def set_source_inspection(source_id: str, enabled: bool) -> dict[str, Any]:
     return with_lock(update)
 
 
+def _apply_source_slot(member: dict[str, Any], previous_slot: str | None, slot: str | None) -> None:
+    """Write a slot and keep the inspection defaults consistent with it."""
+    member["slot"] = slot
+    if slot == "requirement_doc":
+        # Assigning a material to the requirement slot auto-includes it. A
+        # version that was already a requirement doc keeps an explicit removal.
+        if previous_slot != "requirement_doc" or "inspection_enabled" not in member:
+            member["inspection_enabled"] = True
+        member["inspection_mode"] = "auto"
+    else:
+        if member.get("inspection_mode") == "auto" and "inspection_enabled" in member:
+            member["inspection_enabled"] = False
+        member["inspection_mode"] = "manual"
+
+
 def set_source_slot(source_id: str, slot: Any) -> dict[str, Any]:
     slot = _source_slot_value(slot)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", source_id):
@@ -3185,20 +3200,8 @@ def set_source_slot(source_id: str, slot: Any) -> dict[str, Any]:
         members = [item for item in sources if _source_group_id(item) == group_id]
         at = timestamp()
         for member in members:
-            previous_slot = _source_effective_slot(member)
+            _apply_source_slot(member, _source_effective_slot(member), slot)
             member["group_id"] = group_id
-            member["slot"] = slot
-            if slot == "requirement_doc":
-                # Assigning a material to the requirement slot auto-includes it.
-                # A version that was already a requirement doc keeps any explicit
-                # removal made by the user.
-                if previous_slot != "requirement_doc" or "inspection_enabled" not in member:
-                    member["inspection_enabled"] = True
-                member["inspection_mode"] = "auto"
-            else:
-                if member.get("inspection_mode") == "auto" and "inspection_enabled" in member:
-                    member["inspection_enabled"] = False
-                member["inspection_mode"] = "manual"
             member["updated_at"] = at
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
@@ -3214,8 +3217,12 @@ def set_source_location(source_id: str, scope: str, iteration_id: str | None = N
         raise ValueError("invalid_source_scope")
     if scope == "iteration" and (not iteration_id or not isinstance(iteration_id, str) or not iteration_id.strip()):
         raise ValueError("missing_iteration_id")
-    clean_slot = _source_slot_value(slot)
-    _validate_scope_slot(scope, clean_slot)
+    slot_provided = slot is not None
+    clean_slot = _source_slot_value(slot) if slot_provided else None
+    if slot_provided and clean_slot is None and slot != "":
+        raise ValueError("invalid_source_slot")
+    if slot_provided:
+        _validate_scope_slot(scope, clean_slot)
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -3229,20 +3236,26 @@ def set_source_location(source_id: str, scope: str, iteration_id: str | None = N
             if not it:
                 raise ValueError("iteration_not_found")
             target_iteration_id = it["id"]
+        # Omitting the slot preserves the current one. A cross-scope move that
+        # would keep an invalid fixed slot is rejected instead of silently
+        # clearing the group's slot.
+        target_slot = clean_slot if slot_provided else _source_effective_slot(source)
+        _validate_scope_slot(scope, target_slot)
         # A material group shares one location. Moving one row moves every
         # version so fixed-slot history cannot leak across versions.
         group_id = _source_group_id(source)
         members = [item for item in sources if _source_group_id(item) == group_id]
         at = timestamp()
         for member in members:
+            previous_slot = _source_effective_slot(member)
             member["scope"] = scope
             member["iteration_id"] = target_iteration_id
-            member["slot"] = clean_slot
+            _apply_source_slot(member, previous_slot, target_slot)
             member["updated_at"] = at
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         _source_event("source_location_updated", source, db["revision"])
-        return {"revision": db["revision"], "source": source, "group_size": len(members)}
+        return {"revision": db["revision"], "source": source, "group_size": len(members), "slot": target_slot}
 
     return with_lock(update)
 

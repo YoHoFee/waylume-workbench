@@ -20,58 +20,99 @@ assert.equal(taskPartition.legacyDone[0].id, "task-cancelled");
 assert.deepEqual(taskPartition.legacyOpen, []);
 console.log("dashboard model cancellation date checks passed");
 
-// Test partitionIterationRecords zero-collapse rule
+// Version ordering: explicit order wins; missing order falls back to creation time.
 const iterations = [
-  { id: "ITER-v1342", version_tag: "v13.4.2", title: "13.4.2迭代", status: "active" },
-  { id: "ITER-v1341", version_tag: "v13.4.1", title: "13.4.1迭代", status: "released" }
+  { id: "ITER-v1340", version_tag: "13.4.0", title: "13.4.0", status: "released", order: 0, created_at: "2026-10-15T00:00:00+08:00" },
+  { id: "ITER-v1342", version_tag: "13.4.2 迭代二", title: "13.4.2 迭代二", status: "active", order: 1, created_at: "2026-11-05T00:00:00+08:00" },
+  { id: "ITER-v1341", version_tag: "13.4.1", title: "13.4.1", status: "released", order: 2, created_at: "2026-10-20T00:00:00+08:00" }
 ];
+assert.deepEqual(model.orderedIterations(iterations).map(it => it.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
+const legacyIterations = [
+  { id: "ITER-b", title: "B", created_at: "2026-11-02T00:00:00+08:00" },
+  { id: "ITER-a", title: "A", created_at: "2026-11-01T00:00:00+08:00" }
+];
+assert.deepEqual(model.orderedIterations(legacyIterations).map(it => it.id), ["ITER-a", "ITER-b"]);
+
+// One readable version name; version_tag is a compatibility field only.
+assert.equal(model.iterationName({ id: "X", title: "13.4.2 迭代二", version_tag: "13.4.2 迭代二" }), "13.4.2 迭代二");
+assert.equal(model.iterationSecondaryTag({ id: "X", title: "13.4.2 迭代二", version_tag: "13.4.2 迭代二" }), "");
+assert.equal(model.iterationName({ id: "X", title: "版本标题", version_tag: "v1" }), "版本标题");
+assert.equal(model.iterationSecondaryTag({ id: "X", title: "版本标题", version_tag: "v1" }), "v1");
+
+// Work grouping: every version stays flat; tasks never join a version group.
 const iterRecords = [
-  { id: "task-1", title: "需求1", status: "in_progress", iteration_id: "ITER-v1342" },
-  { id: "task-2", title: "需求2(已完成但未发布)", status: "completed", iteration_id: "ITER-v1342" },
-  { id: "task-3", title: "老需求", status: "completed", iteration_id: "ITER-v1341" },
-  { id: "task-backlog", title: "待规划需求", status: "in_progress", iteration_id: null }
+  { id: "work-1", type: "work", title: "需求1", status: "in_progress", iteration_id: "ITER-v1342" },
+  { id: "work-2", type: "work", title: "需求2(已完成但未发布)", status: "completed", iteration_id: "ITER-v1342" },
+  { id: "work-3", type: "work", title: "老需求", status: "completed", iteration_id: "ITER-v1340" },
+  { id: "work-backlog", type: "work", title: "待规划需求", status: "in_progress", iteration_id: null },
+  { id: "task-should-not-group", type: "task", title: "委托任务", status: "completed", iteration_id: "ITER-v1342" }
 ];
 
-const iterPartition = model.partitionIterationRecords(iterRecords, iterations, "ITER-v1342");
-assert.equal(iterPartition.activeIterations.length, 1);
-assert.equal(iterPartition.releasedIterations.length, 1);
+const iterPartition = model.partitionIterationRecords(iterRecords, iterations);
+assert.deepEqual(iterPartition.groups.map(group => group.iteration.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
 
-// Active iteration: ZERO-COLLAPSE RULE
-const activeGroup = iterPartition.activeIterations[0];
-assert.equal(activeGroup.iteration.id, "ITER-v1342");
-assert.equal(activeGroup.visibleRecords.length, 2, "Both in-progress and completed tasks MUST remain visible before release");
-assert.deepEqual(activeGroup.visibleRecords.map(r => r.id), ["task-1", "task-2"]);
-assert.equal(activeGroup.foldedRecords.length, 0, "No tasks folded in unreleased iteration");
+const activeGroup = iterPartition.groups.find(group => group.iteration.id === "ITER-v1342");
+assert.equal(activeGroup.visibleRecords.length, 2, "Both in-progress and completed records remain visible before release");
+assert.deepEqual(activeGroup.visibleRecords.map(r => r.id), ["work-1", "work-2"]);
+assert.equal(activeGroup.foldedRecords.length, 0, "Nothing is folded in an unreleased version");
 
-// Released iteration: folded
-const releasedGroup = iterPartition.releasedIterations[0];
-assert.equal(releasedGroup.iteration.id, "ITER-v1341");
+const releasedGroup = iterPartition.groups.find(group => group.iteration.id === "ITER-v1340");
 assert.equal(releasedGroup.visibleRecords.length, 0);
 assert.equal(releasedGroup.foldedRecords.length, 1);
-assert.equal(releasedGroup.foldedRecords[0].id, "task-3");
+assert.equal(releasedGroup.foldedRecords[0].id, "work-3");
 
-// Backlog
 assert.equal(iterPartition.backlog.unfinished.length, 1);
-assert.equal(iterPartition.backlog.unfinished[0].id, "task-backlog");
+assert.equal(iterPartition.backlog.unfinished[0].id, "work-backlog");
+assert.ok(!JSON.stringify(iterPartition).includes("task-should-not-group"), "Delegated tasks must not participate in version grouping");
 
-// Test archiveView
+// Archive matrix: strict isolation between versions and public material.
 const sources = [
   { id: "s-global-api", scope: "global", slot: "api_doc", name: "全局接口文档", active: true },
-  { id: "s-iter-prd", scope: "iteration", iteration_id: "ITER-v1342", slot: "requirement_doc", name: "13.4.2 PRD", active: true },
-  { id: "s-iter-codesign", scope: "iteration", iteration_id: "ITER-v1342", slot: "codesign", name: "CoDesign原型", active: true },
-  { id: "s-iter-supp", scope: "iteration", iteration_id: "ITER-v1342", slot: "supplementary", name: "PM截图", attachments: [{ filename: "chat.png" }], active: true }
+  { id: "s-global-supp", scope: "global", slot: "supplementary", name: "公共补充", active: true },
+  { id: "s-1342-prd", scope: "iteration", iteration_id: "ITER-v1342", slot: "requirement_doc", name: "13.4.2 PRD", active: true },
+  { id: "s-1342-codesign", scope: "iteration", iteration_id: "ITER-v1342", slot: "codesign", name: "CoDesign原型", active: true },
+  { id: "s-1342-qa", scope: "iteration", iteration_id: "ITER-v1342", slot: "testcase", name: "13.4.2 测试用例", active: true },
+  { id: "s-1342-supp", scope: "iteration", iteration_id: "ITER-v1342", slot: "supplementary", name: "PM截图", active: true, attachments: [{ filename: "chat.png", download_url: "/x" }] },
+  { id: "s-1340-figma", scope: "iteration", iteration_id: "ITER-v1340", slot: "figma", name: "13.4.0 Figma", active: true }
 ];
 
-const archive = model.archiveView(sources, iterations, "ITER-v1342");
-assert.equal(archive.currentIteration.id, "ITER-v1342");
-assert.equal(archive.globalSlots.find(s => s.slot === "api_doc").card.name, "全局接口文档");
-assert.equal(archive.iterationSlots.find(s => s.slot === "requirement_doc").card.name, "13.4.2 PRD");
-// Check prototype slot correctly aliases codesign
-const protoSlot = archive.iterationSlots.find(s => s.slot === "prototype");
+const archive = model.archiveView(sources, iterations);
+assert.deepEqual(archive.iterations.map(section => section.iteration.id), ["ITER-v1340", "ITER-v1342", "ITER-v1341"]);
+assert.equal(archive.global.slots.find(slot => slot.slot === "api_doc").card.name, "全局接口文档");
+const section1342 = archive.iterations.find(section => section.iteration.id === "ITER-v1342");
+const section1340 = archive.iterations.find(section => section.iteration.id === "ITER-v1340");
+assert.equal(section1342.slots.find(slot => slot.slot === "requirement_doc").card.name, "13.4.2 PRD");
+const protoSlot = section1342.slots.find(slot => slot.slot === "prototype");
 assert.ok(protoSlot && protoSlot.card);
 assert.equal(protoSlot.card.name, "CoDesign原型");
-// Check supplementary items
-assert.equal(archive.supplementaryItems.length, 2); // s-iter-supp + chat.png
+const testcaseSlot = section1342.slots.find(slot => slot.slot === "testcase");
+assert.ok(testcaseSlot && testcaseSlot.card, "testcase must occupy its own fixed slot");
+assert.equal(testcaseSlot.card.name, "13.4.2 测试用例");
+
+// Isolation: a version's materials never appear in another version or in public material.
+const names1340 = [...section1340.groups.map(g => g.card.name), ...section1340.supplementaryGroups.map(g => g.card.name)];
+assert.ok(!names1340.includes("13.4.2 PRD"));
+assert.ok(!names1340.includes("PM截图"));
+const publicNames = archive.global.groups.map(group => group.card.name);
+assert.ok(!publicNames.includes("13.4.2 PRD"));
+assert.ok(!publicNames.includes("13.4.0 Figma"));
+
+// The group that owns a fixed slot is not repeated as supplementary material.
+assert.deepEqual(section1342.supplementaryGroups.map(group => group.card.name), ["PM截图"]);
+assert.equal(section1342.supplementaryCount, 2); // PM截图 + its attachment
+assert.equal(archive.global.supplementaryGroups.map(group => group.card.name).join(","), "公共补充");
+
+// A group whose versions sit in different versions is flagged for cleanup; each
+// version still only sees its own members.
+const splitArchive = model.archiveView([
+  { id: "split-a", group_id: "split-group", scope: "iteration", iteration_id: "ITER-v1342", slot: "supplementary", name: "分工表 v1", active: true },
+  { id: "split-b", group_id: "split-group", scope: "iteration", iteration_id: "ITER-v1340", slot: "supplementary", name: "分工表 v2", active: true }
+], iterations);
+assert.ok(splitArchive.mixedGroups.has("split-group"));
+const split1342 = splitArchive.iterations.find(section => section.iteration.id === "ITER-v1342");
+const split1340 = splitArchive.iterations.find(section => section.iteration.id === "ITER-v1340");
+assert.deepEqual(split1342.supplementaryGroups.flatMap(group => group.versions.map(v => v.id)), ["split-a"]);
+assert.deepEqual(split1340.supplementaryGroups.flatMap(group => group.versions.map(v => v.id)), ["split-b"]);
 
 // Test workflowView reopen
 const reopenedRecord = {

@@ -1,7 +1,8 @@
 (() => {
   const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
     workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set(),
-    iterations: [], currentIterationId: null, selectedIterationId: null, archiveScopeTab: "iteration", reopenTargetId: null, reopenFile: null, iterationBusy: false };
+    iterations: [], currentIterationId: null, archiveScopeTab: "iteration", libraryAddContext: null, libraryHighlight: null,
+    iterationEditId: null, reopenTargetId: null, reopenFile: null, iterationBusy: false };
   const inspectionClock = { schedule: null, serverEpoch: null, syncedAt: null, nextRunAt: null };
   const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…" };
   const themeStorage = (() => { try { return window.localStorage; } catch (_) { return { getItem: () => null, setItem: () => {} }; } })();
@@ -483,7 +484,8 @@
   }
   function makeSourceLogo(sourceOrKind) {
     const kind = typeof sourceOrKind === "string" ? sourceOrKind : sourceLogoKind(sourceOrKind);
-    const safeKind = ["requirement_doc", "figma", "codesign", "api_doc", "file", "link"].includes(kind) ? kind : "link";
+    const safeKind = ["requirement_doc", "figma", "codesign", "prototype", "testcase", "supplementary",
+      "api_doc", "architecture", "file", "link"].includes(kind) ? kind : "link";
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("class", "library-logo-icon");
     svg.setAttribute("viewBox", "0 0 24 24");
@@ -569,18 +571,62 @@
     button.dataset.sourceAction = "inspection";
     button.dataset.sourceId = source.id;
     button.textContent = source.inspection_active ? "移出巡检" : "加入巡检";
-    button.title = source.slot === "requirement_doc" ? "仅影响当前版本；需求文档只巡检最新与上一版。" : "将当前资料加入或移出巡检。";
+    button.title = source.slot === "requirement_doc" ? "仅影响这条资料所在的版本；需求文档只巡检最新与上一版。" : "将这条资料加入或移出巡检。";
     return button;
   }
-  function libraryHistoryId(groupId) {
-    return `library-history-${cssSafe(groupId)}`;
+  function iterationName(iteration) { return model.iterationName(iteration); }
+  function iterationStatusLabel(status) { return model.iterationStatusLabel(status); }
+  function iterationStatusPill(iteration) {
+    const pill = document.createElement("span");
+    pill.className = `iteration-status-pill ${escClass(iteration?.status || "unknown")}`;
+    pill.textContent = iterationStatusLabel(iteration?.status);
+    return pill;
   }
-  function makeVersionToggle(group, historyId) {
+  function orderedIterations() { return model.orderedIterations(state.iterations || []); }
+  function iterationById(id) { return (state.iterations || []).find(item => item.id === id) || null; }
+  function slotDefinitions(scope) {
+    return scope === "global" ? model.globalArchiveSlots : model.iterationArchiveSlots;
+  }
+  function slotLabel(slot) { return model.archiveSlotLabels[slot] || "补充材料"; }
+  function scopeLabel(scope) { return scope === "global" ? "公共材料" : "版本资料"; }
+  function sourceLocationText(source) {
+    const scope = model.sourceScope(source);
+    if (scope === "global") {
+      return `公共材料 · ${source.slot === "api_doc" ? "接口文档" : slotLabel(source.slot)}`;
+    }
+    const iteration = iterationById(source.iteration_id);
+    return `${iteration ? iterationName(iteration) : "未归入版本"} · ${slotLabel(source.slot)}`;
+  }
+  function appendMixedGroupBadge(parent, group, context = {}) {
+    if (!group || !context.mixedGroups?.has(group.group_id)) return;
+    const badge = document.createElement("span");
+    badge.className = "archive-warning-pill";
+    badge.textContent = "跨版本组";
+    badge.title = "同一资料组的不同版本目前分布在多个版本；移动任意一条会整组移动并修正归属。";
+    parent.append(badge);
+  }
+  function makeTextButton(label, className = "library-text-button") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = label;
+    return button;
+  }
+  function groupHistoryKey(groupId, context = {}) {
+    const scope = context.scope || "iteration";
+    const iterationId = context.iteration?.id || context.iterationId || (scope === "global" ? "global" : "");
+    return `${scope}:${iterationId}:${groupId}`;
+  }
+  function libraryHistoryId(historyKey) {
+    return `library-history-${cssSafe(historyKey)}`;
+  }
+  function makeVersionToggle(group, historyId, historyKey) {
+    if (!group || !(group.history_count > 0)) return null;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "library-version-toggle";
-    button.dataset.libraryVersions = group.group_id;
-    button.setAttribute("aria-expanded", String(state.libraryExpanded.has(group.group_id)));
+    button.dataset.libraryVersions = historyKey;
+    button.setAttribute("aria-expanded", String(state.libraryExpanded.has(historyKey)));
     button.setAttribute("aria-controls", historyId);
     button.textContent = `还有 ${group.history_count} 个版本`;
     return button;
@@ -601,23 +647,27 @@
     row.append(open, meta);
     return row;
   }
-  function makeVersionHistory(group) {
-    const historyId = libraryHistoryId(group.group_id);
+  function makeVersionHistory(group, historyKey) {
+    const historyId = libraryHistoryId(historyKey);
     const wrapper = document.createElement("div");
     wrapper.className = "library-history";
     wrapper.id = historyId;
-    wrapper.hidden = !state.libraryExpanded.has(group.group_id);
+    wrapper.hidden = !state.libraryExpanded.has(historyKey);
     const list = document.createElement("ol");
     list.className = "library-version-list";
     list.append(...group.versions.map(source => makeVersionRow(source, group.group_id)));
     wrapper.append(list);
     return wrapper;
   }
-  function makeSlotCard(slot) {
+  function makeSlotCard(slot, context = {}) {
+    const scope = context.scope || "iteration";
+    const iterationId = context.iteration?.id || null;
     const article = document.createElement("article");
     article.className = `library-card${slot.empty ? " is-empty" : ""}`;
     article.dataset.slot = slot.slot;
-    const titleId = `library-slot-title-${slot.slot}`;
+    if (iterationId) article.dataset.iterationId = iterationId;
+    article.dataset.scope = scope;
+    const titleId = `library-slot-title-${scope}-${iterationId || "global"}-${slot.slot}`;
     article.setAttribute("aria-labelledby", titleId);
     const head = document.createElement("div"); head.className = "library-card-head";
     const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo(slot.card || slot.slot));
@@ -630,33 +680,43 @@
     if (!slot.empty && slot.card.is_latest) {
       const latest = document.createElement("span"); latest.className = "library-latest-mark"; latest.textContent = "最新"; head.append(latest);
     }
+    if (!slot.empty) appendMixedGroupBadge(head, slot.group, context);
     article.append(head);
     if (slot.empty) {
       const name = document.createElement("h4"); name.className = "library-card-name is-empty"; name.textContent = `尚未添加${slot.label}`;
       const hint = document.createElement("p"); hint.className = "library-card-hint"; hint.textContent = "添加后在这里展示最新版本，历史版本仍会完整保留。";
       const actions = document.createElement("div"); actions.className = "library-card-actions";
-      const add = document.createElement("button"); add.type = "button"; add.className = "library-card-add"; add.dataset.sourceAction = "add-slot"; add.dataset.slot = slot.slot; add.textContent = `添加${slot.label}`;
+      const add = makeTextButton(`添加${slot.label}`, "library-card-add");
+      add.dataset.sourceAction = "add-slot"; add.dataset.slot = slot.slot;
+      add.dataset.scope = scope; add.dataset.iterationId = iterationId || "";
       actions.append(add); article.append(name, hint, actions);
       return article;
     }
     const card = slot.card;
+    article.dataset.groupId = card.group_id;
     const name = document.createElement("h4"); name.className = "library-card-name"; name.textContent = sourceDisplayName(card);
     const link = makeSourceOpenLink(card, sourceLinkText(card), "library-card-link");
-    const historyId = libraryHistoryId(card.group_id);
-    const subtitle = makeVersionToggle(slot.group, historyId);
+    const historyKey = groupHistoryKey(card.group_id, context);
+    const historyId = libraryHistoryId(historyKey);
+    const subtitle = makeVersionToggle(slot.group, historyId, historyKey);
     const inspection = document.createElement("div"); inspection.className = "library-inspection";
     inspection.append(makeInspectionStatus(card, false, slot.group.last_inspection_success_at));
     const inspectionToggle = makeInspectionToggle(card); if (inspectionToggle) inspection.append(inspectionToggle);
     const actions = document.createElement("div"); actions.className = "library-card-actions";
-    const addVersion = document.createElement("button"); addVersion.type = "button"; addVersion.className = "library-text-button"; addVersion.dataset.sourceAction = "add-version"; addVersion.dataset.groupId = card.group_id; addVersion.dataset.slot = slot.slot; addVersion.dataset.name = sourceDisplayName(card); addVersion.textContent = "添加新版本";
+    const addVersion = makeTextButton("添加新版本");
+    addVersion.dataset.sourceAction = "add-version";
+    addVersion.dataset.groupId = card.group_id; addVersion.dataset.slot = slot.slot; addVersion.dataset.name = sourceDisplayName(card);
+    addVersion.dataset.scope = scope; addVersion.dataset.iterationId = iterationId || "";
     const open = makeSourceOpenLink(card, "打开", "library-text-button");
-    const lifecycle = document.createElement("button"); lifecycle.type = "button"; lifecycle.className = "library-text-button";
-    lifecycle.textContent = card.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
+    const lifecycle = makeTextButton(card.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃");
     lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = card.id;
-    const relocate = document.createElement("button"); relocate.type = "button"; relocate.className = "library-text-button source-relocate-btn";
-    relocate.textContent = "移动位置"; relocate.addEventListener("click", () => openRelocateDialog(card));
+    const relocate = makeTextButton("移动", "library-text-button source-relocate-btn");
+    relocate.title = "把整组材料移动到另一个版本或公共材料";
+    relocate.addEventListener("click", () => openRelocateDialog(card));
     actions.append(addVersion, open, lifecycle, relocate);
-    article.append(name, link, subtitle, inspection, actions, makeVersionHistory(slot.group));
+    article.append(name, link);
+    if (subtitle) article.append(subtitle);
+    article.append(inspection, actions, makeVersionHistory(slot.group, historyKey));
     return article;
   }
   function sourceMetaLine(source) {
@@ -670,54 +730,71 @@
     line.textContent = parts.join(" · ");
     return line;
   }
-  function makeSlotSelect(group) {
-    const select = document.createElement("select");
-    select.className = "library-slot-select";
-    select.dataset.sourceSlot = "true";
-    select.dataset.sourceId = group.card.id;
-    select.title = "设为固定资料";
-    select.setAttribute("aria-label", `设为固定资料：${sourceDisplayName(group.card)}`);
-    const options = [{ value: "", label: "其他来源" }, ...model.librarySlots.map(slot => ({ value: slot.id, label: slot.label }))];
-    for (const option of options) {
-      const node = document.createElement("option"); node.value = option.value; node.textContent = option.label; select.append(node);
-    }
-    select.value = model.librarySlotLabels[group.slot] ? group.slot : "";
-    return select;
-  }
-  function makeOtherRow(group) {
+  function makeMaterialRow(group, context = {}) {
     const source = group.card;
+    const scope = context.scope || model.sourceScope(source);
+    const iterationId = context.iteration?.id || source.iteration_id || "";
     const row = document.createElement("li");
-    row.className = "library-row";
+    row.className = "library-row archive-material-row";
     row.dataset.groupId = group.group_id;
+    row.dataset.scope = scope;
+    if (iterationId) row.dataset.iterationId = iterationId;
     const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo(source));
     const info = document.createElement("div"); info.className = "library-row-info";
     const titleLine = document.createElement("div"); titleLine.className = "library-row-title";
     const name = document.createElement("strong"); name.className = "library-row-name"; name.textContent = sourceDisplayName(source);
-    const type = document.createElement("span"); type.className = "library-type-pill"; type.textContent = group.slot ? model.librarySlotLabels[group.slot] : "其他来源";
+    const type = document.createElement("span"); type.className = "library-type-pill";
+    type.textContent = source.slot === "supplementary" || !source.slot ? "补充材料" : slotLabel(source.slot);
     titleLine.append(name, type);
+    appendMixedGroupBadge(titleLine, group, context);
     const link = makeSourceOpenLink(source, sourceLinkText(source), "library-row-link");
     const meta = document.createElement("div"); meta.className = "library-row-meta-line";
     meta.append(sourceMetaLine(source), makeInspectionStatus(source, true, group.last_inspection_success_at));
-    const historyId = libraryHistoryId(group.group_id);
-    const subtitle = makeVersionToggle(group, historyId);
-    const history = makeVersionHistory(group);
-    info.append(titleLine, link, meta, subtitle, history);
+    const historyKey = groupHistoryKey(group.group_id, context);
+    const historyId = libraryHistoryId(historyKey);
+    const subtitle = makeVersionToggle(group, historyId, historyKey);
+    const history = makeVersionHistory(group, historyKey);
+    info.append(titleLine, link, meta);
+    if (subtitle) info.append(subtitle);
+    info.append(history);
     const actions = document.createElement("div"); actions.className = "library-row-actions";
     actions.append(makeSourceOpenLink(source, "打开", "library-text-button"));
-    const addVersion = document.createElement("button"); addVersion.type = "button"; addVersion.className = "library-text-button";
-    addVersion.textContent = "添加新版本"; addVersion.dataset.sourceAction = "add-version";
-    addVersion.dataset.groupId = group.group_id; addVersion.dataset.slot = group.slot || ""; addVersion.dataset.name = sourceDisplayName(source);
+    const addVersion = makeTextButton("添加新版本");
+    addVersion.dataset.sourceAction = "add-version";
+    addVersion.dataset.groupId = group.group_id; addVersion.dataset.slot = group.slot || "";
+    addVersion.dataset.name = sourceDisplayName(source);
+    addVersion.dataset.scope = scope; addVersion.dataset.iterationId = String(iterationId || "");
     actions.append(addVersion);
     const inspectionToggle = makeInspectionToggle(source); if (inspectionToggle) actions.append(inspectionToggle);
-    const lifecycleOverride = document.createElement("button"); lifecycleOverride.type = "button"; lifecycleOverride.className = "library-text-button";
-    lifecycleOverride.textContent = source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
+    const lifecycleOverride = makeTextButton(source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃");
     lifecycleOverride.dataset.sourceAction = "nondeprecated"; lifecycleOverride.dataset.sourceId = source.id;
-    const remove = document.createElement("button"); remove.type = "button"; remove.className = "library-text-button is-muted";
-    remove.textContent = "移出资料"; remove.title = "移出后可随时恢复"; remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = source.id;
-    const relocate = document.createElement("button"); relocate.type = "button"; relocate.className = "library-text-button source-relocate-btn";
-    relocate.textContent = "移动位置"; relocate.addEventListener("click", () => openRelocateDialog(source));
-    actions.append(lifecycleOverride, remove, relocate, makeSlotSelect(group));
+    const remove = makeTextButton("移出资料", "library-text-button is-muted");
+    remove.title = "移出后可随时恢复"; remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = source.id;
+    const relocate = makeTextButton("移动", "library-text-button source-relocate-btn");
+    relocate.title = "把整组材料移动到另一个版本或公共材料";
+    relocate.addEventListener("click", () => openRelocateDialog(source));
+    actions.append(lifecycleOverride, remove, relocate);
     row.append(logo, info, actions);
+    return row;
+  }
+  function makeAttachmentRow(item, context = {}) {
+    const row = document.createElement("li");
+    row.className = "library-row archive-material-row is-attachment";
+    const logo = document.createElement("span"); logo.className = "library-logo"; logo.append(makeSourceLogo({ slot: "supplementary" }));
+    const info = document.createElement("div"); info.className = "library-row-info";
+    const titleLine = document.createElement("div"); titleLine.className = "library-row-title";
+    const name = document.createElement("strong"); name.className = "library-row-name"; name.textContent = item.filename || item.name || "补充附件";
+    const type = document.createElement("span"); type.className = "library-type-pill"; type.textContent = "附件";
+    titleLine.append(name, type);
+    const href = item.download_url || item.url || "#";
+    const link = document.createElement("a");
+    link.className = "library-row-link"; link.textContent = item.download_url ? "打开附件" : "打开";
+    link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer";
+    if (href === "#") link.setAttribute("aria-disabled", "true");
+    const summary = document.createElement("p"); summary.className = "library-row-meta";
+    summary.textContent = item.summary || item.notes || `附件位于「${item.source_name || "材料"}」下，随所属材料移动。`;
+    info.append(titleLine, link, summary);
+    row.append(logo, info);
     return row;
   }
   function makeRemovedRow(source) {
@@ -739,174 +816,193 @@
     row.append(logo, info, actions);
     return row;
   }
+  function makeArchiveAddButton(scope, iterationId, slot, label) {
+    const button = makeTextButton(label || "添加资料");
+    button.dataset.sourceAction = "add-context";
+    button.dataset.scope = scope;
+    button.dataset.iterationId = iterationId || "";
+    button.dataset.slot = slot || "supplementary";
+    return button;
+  }
+  function makeArchiveSection(section) {
+    const scope = section.scope;
+    const iteration = section.iteration;
+    const block = document.createElement("section");
+    block.className = `archive-block${scope === "global" ? " archive-block-global" : ""}`;
+    block.dataset.scope = scope;
+    if (iteration) block.dataset.iterationId = iteration.id;
+
+    const head = document.createElement("header");
+    head.className = "archive-block-head";
+    const copy = document.createElement("div");
+    copy.className = "archive-block-copy";
+    const kicker = document.createElement("span");
+    kicker.className = "archive-block-kicker";
+    kicker.textContent = scope === "global" ? "跨版本共享" : "版本资料";
+    const titleLine = document.createElement("div");
+    titleLine.className = "archive-block-title-line";
+    const title = document.createElement("h3");
+    title.className = "archive-block-title";
+    title.textContent = scope === "global" ? "公共材料" : iterationName(iteration);
+    titleLine.append(title);
+    if (iteration) titleLine.append(iterationStatusPill(iteration));
+    const tag = iteration ? model.iterationSecondaryTag(iteration) : "";
+    if (tag) title.title = `版本标识：${tag}`;
+    const meta = document.createElement("p");
+    meta.className = "archive-block-meta";
+    meta.textContent = scope === "global"
+      ? `接口文档 1 个固定位置 · 补充材料 ${section.supplementaryCount} 项`
+      : `4 个固定位置 · 已填 ${section.fixedCount} 个 · 补充材料 ${section.supplementaryCount} 项`;
+    copy.append(kicker, titleLine, meta);
+    const actions = document.createElement("div");
+    actions.className = "archive-block-actions";
+    if (scope === "iteration" && iteration) {
+      actions.append(makeArchiveAddButton("iteration", iteration.id, "supplementary", "添加资料"));
+    } else {
+      actions.append(makeArchiveAddButton("global", null, "supplementary", "添加资料"));
+    }
+    head.append(copy, actions);
+
+    const slotGrid = document.createElement("div");
+    slotGrid.className = "library-slot-grid";
+    slotGrid.append(...section.slots.map(slot => makeSlotCard(slot, { scope, iteration, mixedGroups: section.mixedGroups })));
+
+    const supplementary = document.createElement("section");
+    supplementary.className = "archive-supplementary";
+    const suppHead = document.createElement("header");
+    suppHead.className = "archive-supplementary-head";
+    const suppTitle = document.createElement("h4");
+    suppTitle.textContent = "补充材料";
+    const suppCount = document.createElement("span");
+    suppCount.className = "library-count";
+    suppCount.textContent = String(section.supplementaryCount);
+    const suppGrow = document.createElement("div");
+    suppGrow.className = "archive-supplementary-title";
+    suppGrow.append(suppTitle, suppCount);
+    const suppActions = document.createElement("div");
+    suppActions.className = "archive-block-actions";
+    suppActions.append(makeArchiveAddButton(scope, iteration?.id || null, "supplementary", "添加补充材料"));
+    suppHead.append(suppGrow, suppActions);
+    const list = document.createElement("ul");
+    list.className = "library-list archive-material-list";
+    const rows = [
+      ...section.supplementaryGroups.map(group => makeMaterialRow(group, { scope, iteration, mixedGroups: section.mixedGroups })),
+      ...section.attachments.map(item => makeAttachmentRow(item, { scope, iteration }))
+    ];
+    list.append(...rows);
+    supplementary.append(suppHead, list);
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "library-empty archive-supplementary-empty";
+      empty.textContent = scope === "global" ? "公共材料暂无补充材料。" : "这个版本暂无补充材料。";
+      supplementary.append(empty);
+    }
+
+    block.append(head, slotGrid, supplementary);
+
+    if (section.removed.length) {
+      const removed = document.createElement("details");
+      removed.className = "library-fold archive-removed-fold";
+      const summary = document.createElement("summary");
+      const label = document.createElement("span");
+      label.textContent = "已移出";
+      const count = document.createElement("span");
+      count.className = "library-count";
+      count.textContent = String(section.removed.length);
+      const hint = document.createElement("span");
+      hint.className = "library-summary-hint";
+      hint.textContent = "数据仍保留，可随时恢复";
+      summary.append(label, count, hint);
+      const removedList = document.createElement("ul");
+      removedList.className = "library-list";
+      removedList.append(...section.removed.map(makeRemovedRow));
+      removed.append(summary, removedList);
+      block.append(removed);
+    }
+    return block;
+  }
+  function defaultAddContext(scope) {
+    if (scope === "global") return { scope: "global", iterationId: null, slot: "supplementary" };
+    const first = orderedIterations()[0] || null;
+    return { scope: "iteration", iterationId: first?.id || null, slot: "supplementary" };
+  }
+  function renderLibraryAddSlotOptions() {
+    const select = $("#library-add-slot");
+    if (!select) return;
+    const context = state.libraryAddContext || defaultAddContext(state.archiveScopeTab);
+    const definitions = slotDefinitions(context.scope);
+    const options = definitions.map(definition => ({ value: definition.id, label: definition.label }));
+    options.push({ value: "supplementary", label: "补充材料" });
+    select.replaceChildren(...options.map(option => {
+      const node = document.createElement("option");
+      node.value = option.value;
+      node.textContent = option.label;
+      return node;
+    }));
+    const rawPreferred = state.libraryGroup?.slot || context.slot || "supplementary";
+    const preferred = rawPreferred === "codesign" ? "prototype" : rawPreferred;
+    select.value = options.some(option => option.value === preferred) ? preferred : "supplementary";
+    select.dataset.scope = context.scope;
+    select.disabled = !!state.libraryGroup;
+  }
+  function updateLibraryAddContext() {
+    const node = $("#library-add-context");
+    if (!node) return;
+    const context = state.libraryAddContext || defaultAddContext(state.archiveScopeTab);
+    const slot = state.libraryGroup?.slot || $("#library-add-slot")?.value || context.slot || "supplementary";
+    if (state.libraryGroup) {
+      const where = context.scope === "global"
+        ? "公共材料"
+        : (iterationById(state.libraryGroup.iterationId || context.iterationId)?.title ? iterationName(iterationById(state.libraryGroup.iterationId || context.iterationId)) : "未归入版本");
+      node.textContent = `为「${state.libraryGroup.name}」添加新版本；归属保持为：${where} · ${slotLabel(slot)}。`;
+      return;
+    }
+    if (context.scope === "global") {
+      node.textContent = `添加到：公共材料 · ${slotLabel(slot)}。`;
+    } else {
+      const iteration = iterationById(context.iterationId);
+      node.textContent = iteration
+        ? `添加到：${iterationName(iteration)} · ${slotLabel(slot)}。`
+        : "还没有版本可添加资料；请先在「编辑迭代」中新建版本。";
+    }
+  }
   function renderSources() {
-    const view = model.libraryView(state.sources);
-    const currentIterId = state.selectedIterationId || state.currentIterationId;
-    const archive = model.archiveView ? model.archiveView(state.sources, state.iterations, currentIterId) : null;
-    const activeScope = state.archiveScopeTab || "iteration";
-
-    $("#source-count").textContent = String(view.activeCount);
-    $("#other-source-count").textContent = String(view.others.length);
-    $("#removed-source-count").textContent = String(view.removed.length);
-
+    const archive = model.archiveView(state.sources, state.iterations);
+    const activeScope = state.archiveScopeTab === "global" ? "global" : "iteration";
     $$(".archive-tab-btn").forEach(btn => {
       const isActive = btn.dataset.scope === activeScope;
       btn.classList.toggle("active", isActive);
       btn.setAttribute("aria-selected", String(isActive));
     });
 
-    const fixedSection = $(".library-fixed");
-    const suppSection = $("#supplementary-pool-section");
-    const historySection = $("#archive-history-section");
-    const othersSection = $(".library-others");
+    const body = $("#archive-body");
+    const blocks = activeScope === "global"
+      ? [makeArchiveSection(archive.global)]
+      : archive.iterations.map(makeArchiveSection);
+    body.replaceChildren(...blocks);
 
-    if (activeScope === "iteration") {
-      if (fixedSection) fixedSection.hidden = false;
-      $("#library-slot-grid").replaceChildren(...(archive?.iterationSlots || view.slots).map(makeSlotCard));
-      if (suppSection) {
-        suppSection.hidden = false;
-        renderSupplementaryPool(archive?.supplementaryItems || []);
-      }
-      if (historySection) historySection.hidden = true;
-      if (othersSection) othersSection.hidden = false;
-    } else if (activeScope === "history") {
-      if (fixedSection) fixedSection.hidden = true;
-      if (suppSection) suppSection.hidden = true;
-      if (historySection) {
-        historySection.hidden = false;
-        renderArchiveHistoryList(archive?.iterations || []);
-      }
-      if (othersSection) othersSection.hidden = true;
-    } else if (activeScope === "global") {
-      if (fixedSection) fixedSection.hidden = false;
-      $("#library-slot-grid").replaceChildren(...(archive?.globalSlots || []).map(makeSlotCard));
-      if (suppSection) {
-        suppSection.hidden = false;
-        renderSupplementaryPool(archive?.globalSection?.supplementary || []);
-      }
-      if (historySection) historySection.hidden = true;
-      if (othersSection) othersSection.hidden = false;
+    const empty = $("#archive-empty");
+    const noVersions = activeScope === "iteration" && archive.iterations.length === 0;
+    empty.hidden = !noVersions;
+    if (noVersions) empty.textContent = "还没有版本。请先在「编辑迭代」中新建版本，再把资料按版本归档。";
+
+    if (!state.libraryAddContext || (state.libraryAddContext.scope !== activeScope)) {
+      state.libraryAddContext = defaultAddContext(activeScope);
     }
-
-    $("#library-other-list").replaceChildren(...view.others.map(makeOtherRow));
-    $("#library-others-empty").hidden = view.others.length > 0;
-    $("#removed-sources-section").hidden = view.removed.length === 0;
-    $("#source-removed-list").replaceChildren(...view.removed.map(makeRemovedRow));
-
-    const iterSelect = $("#library-add-iteration");
-    if (iterSelect) {
-      iterSelect.replaceChildren(...(state.iterations || []).map(it => {
-        const opt = document.createElement("option");
-        opt.value = it.id;
-        opt.textContent = `${it.version_tag || ""} · ${it.title}`;
-        if (it.id === currentIterId) opt.selected = true;
-        return opt;
-      }));
+    if (state.libraryAddContext.scope === "iteration" && !iterationById(state.libraryAddContext.iterationId)) {
+      state.libraryAddContext = defaultAddContext("iteration");
     }
-  }
+    renderLibraryAddSlotOptions();
+    updateLibraryAddContext();
 
-  function renderArchiveHistoryList(iterationSections) {
-    const list = $("#archive-history-list");
-    if (!list) return;
-    const historySections = (iterationSections || []).filter(s => !s.isCurrent);
-    if (!historySections.length) {
-      const empty = document.createElement("p");
-      empty.className = "library-empty";
-      empty.textContent = "暂无其他历史版本。";
-      list.replaceChildren(empty);
-      return;
+    if (state.libraryHighlight) {
+      const target = body.querySelector(`[data-group-id="${CSS.escape(state.libraryHighlight)}"]`);
+      if (target) {
+        target.classList.add("is-highlighted");
+        target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+      state.libraryHighlight = null;
     }
-    list.replaceChildren(...historySections.map(s => {
-      const card = document.createElement("details");
-      card.className = "archive-history-card";
-      card.open = true;
-      const summary = document.createElement("summary");
-      const titleSpan = document.createElement("span");
-      titleSpan.textContent = `📦 ${s.iteration.title} [ID: ${s.iteration.id}] · ${s.iteration.status === "released" ? "已发布" : "历史"}`;
-      const countSpan = document.createElement("span");
-      countSpan.className = "fold-count";
-      countSpan.textContent = `${s.slots.filter(x => !x.empty).length} / 4 固定槽 · ${s.supplementary.length} 补充项`;
-      summary.append(titleSpan, countSpan);
-
-      const body = document.createElement("div");
-      body.className = "archive-history-body";
-      const slotGrid = document.createElement("div");
-      slotGrid.className = "library-slot-grid";
-      slotGrid.append(...s.slots.map(makeSlotCard));
-      body.append(slotGrid);
-
-      if (s.supplementary.length) {
-        const suppTitle = document.createElement("h4");
-        suppTitle.style.cssText = "font-size: 13px; font-weight: 600; margin: 16px 0 8px; color: #636366;";
-        suppTitle.textContent = "版本补充材料：";
-        const suppGrid = document.createElement("div");
-        suppGrid.className = "supplementary-grid";
-        s.supplementary.forEach(item => {
-          const suppCard = document.createElement("div");
-          suppCard.className = "supplementary-card";
-          const titleLink = document.createElement("a");
-          titleLink.href = item.download_url || item.url || "#";
-          titleLink.target = "_blank";
-          titleLink.className = "supplementary-name";
-          titleLink.textContent = item.name || item.filename || "材料";
-          const relBtn = document.createElement("button");
-          relBtn.type = "button";
-          relBtn.className = "source-relocate-btn";
-          relBtn.textContent = "移动";
-          relBtn.onclick = () => openRelocateDialog(item);
-          suppCard.append(titleLink, relBtn);
-          suppGrid.append(suppCard);
-        });
-        body.append(suppTitle, suppGrid);
-      }
-      card.append(summary, body);
-      return card;
-    }));
-  }
-
-  function renderSupplementaryPool(items) {
-    const grid = $("#supplementary-grid");
-    const empty = $("#supplementary-empty");
-    if (!grid) return;
-    if (!items.length) {
-      grid.replaceChildren();
-      if (empty) empty.hidden = false;
-      return;
-    }
-    if (empty) empty.hidden = true;
-    grid.replaceChildren(...items.map(item => {
-      const card = document.createElement("div");
-      card.className = "supplementary-card";
-      const isImg = item.mime_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(item.filename || item.name || "");
-      const downloadUrl = item.download_url || item.url || (item.id ? `/api/sources/${encodeURIComponent(item.id)}/download` : "#");
-      if (isImg && downloadUrl && downloadUrl !== "#") {
-        const img = document.createElement("img");
-        img.src = downloadUrl;
-        img.alt = item.summary || item.filename || item.name || "图片材料";
-        img.className = "supplementary-thumb";
-        card.append(img);
-      }
-      const titleLink = document.createElement("a");
-      titleLink.href = downloadUrl;
-      titleLink.target = "_blank";
-      titleLink.rel = "noopener noreferrer";
-      titleLink.className = "supplementary-name";
-      titleLink.textContent = item.filename || item.name || "补充材料";
-      const summaryText = document.createElement("p");
-      summaryText.className = "supplementary-summary";
-      summaryText.textContent = item.summary || item.notes || "PM 沟通/补充材料";
-      card.append(titleLink, summaryText);
-
-      if (item.id) {
-        const relocate = document.createElement("button");
-        relocate.type = "button";
-        relocate.className = "source-relocate-btn";
-        relocate.textContent = "移动位置";
-        relocate.addEventListener("click", () => openRelocateDialog(item));
-        card.append(relocate);
-      }
-      return card;
-    }));
   }
   function sourceFeedback(message, kind = "") {
     const feedback = $("#source-feedback"); feedback.textContent = message; feedback.className = `source-feedback library-feedback${kind ? ` ${kind}` : ""}`;
@@ -922,6 +1018,8 @@
       source_file_unavailable: "托管文件暂时不可用。", payload_too_large: "文件超过上传请求大小限制。",
       invalid_source_slot: "资料类型无效。", invalid_source_group: "资料版本组无效。", invalid_source_version: "版本说明无效。",
       source_group_not_found: "找不到要追加版本的资料组，请刷新后重试。", source_group_slot_conflict: "该资料组已属于其他固定资料位。",
+      source_group_location_conflict: "同一资料组的版本必须归属同一个版本或公共材料，请整组移动。",
+      invalid_iteration_id: "目标版本无效，请刷新后重试。",
       invalid_source_inspection: "巡检状态无效。"
     };
     return payload.message || errors[payload.error] || `操作失败，请重试（${payload.error || status}）`;
@@ -961,21 +1059,25 @@
     $("#library-file-name").textContent = file ? file.name : "未选择文件";
     $("#library-file-clear").hidden = !file;
   }
-  function openLibraryAdd({ slot = "", group = null, name = "" } = {}) {
-    state.libraryGroup = group ? { group_id: group.group_id, slot: group.slot || slot, name: group.name || name } : null;
+  function openLibraryAdd({ slot = "", group = null, name = "", scope = null, iterationId = null } = {}) {
+    const card = group?.card || null;
+    const resolvedScope = scope || (card ? model.sourceScope(card) : null) || state.archiveScopeTab || "iteration";
+    const resolvedIterationId = iterationId || card?.iteration_id || (resolvedScope === "iteration" ? defaultAddContext("iteration").iterationId : null);
+    const groupSlot = group?.slot || (card && card.slot) || slot || "supplementary";
+    state.libraryGroup = group ? {
+      group_id: group.group_id, slot: groupSlot, name: group.name || card?.name || name,
+      scope: resolvedScope, iterationId: resolvedIterationId
+    } : null;
+    state.libraryAddContext = { scope: resolvedScope === "global" ? "global" : "iteration", iterationId: resolvedIterationId, slot: groupSlot };
     const displayName = state.libraryGroup?.name || name || "";
     selectLibraryFile(null);
     $("#source-file-input").value = "";
     $("#source-link-name").value = displayName;
     $("#source-link-url").value = "";
     $("#library-add-version").value = "";
-    $("#library-add-slot").value = state.libraryGroup?.slot || slot || "";
-    $("#library-add-slot").disabled = !!state.libraryGroup;
-    const context = $("#library-add-context");
-    context.hidden = !state.libraryGroup;
-    context.textContent = state.libraryGroup
-      ? `新版本将加入「${displayName || "当前资料"}」，资料类型保持为${model.librarySlotLabels[state.libraryGroup.slot] || "其他来源"}。`
-      : "";
+    renderLibraryAddSlotOptions();
+    $("#library-add-slot").value = groupSlot;
+    updateLibraryAddContext();
     $("#library-add-fold").open = true;
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     $("#library-add-fold").scrollIntoView({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
@@ -986,26 +1088,28 @@
     selectLibraryFile(null);
     $("#source-link-form").reset();
     $("#library-add-slot").disabled = false;
-    $("#library-add-context").hidden = true;
     if (close) $("#library-add-fold").open = false;
+    renderLibraryAddSlotOptions();
+    updateLibraryAddContext();
   }
   async function submitLibraryEntry(event) {
     event.preventDefault();
     if (state.sourcesBusy) return;
     const file = state.libraryFile;
     const group = state.libraryGroup;
+    const context = state.libraryAddContext || defaultAddContext(state.archiveScopeTab);
     const name = $("#source-link-name").value.trim();
     const url = $("#source-link-url").value.trim();
     if (!file && !name) { sourceFeedback("请填写资料名称。", "error"); return; }
     if (!file && !url) { sourceFeedback("请填写资料链接，或选择一个文件。", "error"); return; }
     if (!file && !safeHttpUrl(url)) { sourceFeedback("链接格式无效，请使用 http 或 https 地址。", "error"); return; }
     if (file && file.size > 15 * 1024 * 1024) { sourceFeedback("文件超过 15 MiB，请选择更小的文件。", "error"); return; }
-    const slot = group?.slot || $("#library-add-slot").value || null;
+    const scope = context.scope === "global" ? "global" : "iteration";
+    const iteration_id = scope === "iteration" ? context.iterationId : null;
+    if (scope === "iteration" && !iteration_id) { sourceFeedback("请先在「编辑迭代」中新建版本，再添加版本资料。", "error"); return; }
+    const slot = group?.slot || $("#library-add-slot").value || "supplementary";
     const versionLabel = $("#library-add-version").value.trim() || null;
-    const category = slot && (model.archiveSlotLabels?.[slot] || model.librarySlotLabels[slot]) ? (model.archiveSlotLabels?.[slot] || model.librarySlotLabels[slot]) : "其他资料";
-    const scope = $("#library-add-scope")?.value || (slot === "api_doc" || slot === "architecture" ? "global" : "iteration");
-    const currentIterId = state.selectedIterationId || state.currentIterationId;
-    const iteration_id = scope === "iteration" ? ($("#library-add-iteration")?.value || currentIterId) : null;
+    const category = model.archiveSlotLabels[slot] || "补充材料";
     setSourcesBusy(true, file ? `正在添加“${file.name}”…` : "正在添加资料…");
     try {
       if (file) {
@@ -1041,15 +1145,6 @@
     } catch (error) { sourceFeedback(error.message || "巡检状态更新失败，请重试。", "error"); }
     finally { setSourcesBusy(false); }
   }
-  async function changeSourceSlot(sourceId, slot) {
-    if (state.sourcesBusy) return;
-    setSourcesBusy(true, "正在更新资料类型…");
-    try {
-      await sourceRequest(`/api/sources/${encodeURIComponent(sourceId)}/slot`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slot: slot || null }) });
-      await loadSources(); sourceFeedback(slot ? "资料已归入固定资料位。" : "资料已移到其他来源。");
-    } catch (error) { sourceFeedback(error.message || "资料类型更新失败，请重试。", "error"); }
-    finally { setSourcesBusy(false); }
-  }
   async function changeSourceActive(sourceId, action) {
     if (state.sourcesBusy) return;
     const route = `/api/sources/${encodeURIComponent(sourceId)}${action === "restore" ? "/restore" : ""}`;
@@ -1077,10 +1172,28 @@
     if (button.dataset.sourceAction === "nondeprecated") return setSourceLifecycle(button.dataset.sourceId);
     if (button.dataset.sourceAction === "inspection") return toggleSourceInspection(button.dataset.sourceId);
     if (button.dataset.sourceAction === "remove" || button.dataset.sourceAction === "restore") return changeSourceActive(button.dataset.sourceId, button.dataset.sourceAction);
-    if (button.dataset.sourceAction === "add-slot") return openLibraryAdd({ slot: button.dataset.slot || "" });
-    if (button.dataset.sourceAction === "add-version") return openLibraryAdd({
-      slot: button.dataset.slot || "", group: { group_id: button.dataset.groupId, slot: button.dataset.slot || null, name: button.dataset.name || "" }
-    });
+    if (button.dataset.sourceAction === "add-context" || button.dataset.sourceAction === "add-slot") {
+      return openLibraryAdd({
+        slot: button.dataset.slot || "supplementary",
+        scope: button.dataset.scope || state.archiveScopeTab,
+        iterationId: button.dataset.iterationId || null
+      });
+    }
+    if (button.dataset.sourceAction === "add-version") {
+      const card = state.sources.find(source => source.id === button.dataset.sourceId)
+        || state.sources.find(source => (source.group_id || source.id) === button.dataset.groupId);
+      return openLibraryAdd({
+        slot: button.dataset.slot || "",
+        scope: button.dataset.scope || null,
+        iterationId: button.dataset.iterationId || null,
+        group: {
+          group_id: button.dataset.groupId,
+          slot: button.dataset.slot || null,
+          name: button.dataset.name || "",
+          card
+        }
+      });
+    }
   }
   function handleLibraryClick(event) {
     const versionToggle = event.target.closest("[data-library-versions]");
@@ -1094,10 +1207,6 @@
       return;
     }
     handleSourceAction(event.target.closest("[data-source-action]"));
-  }
-  function handleLibrarySlotChange(event) {
-    const select = event.target.closest("[data-source-slot]");
-    if (select) changeSourceSlot(select.dataset.sourceId, select.value || null);
   }
   function updateThemeButton() {
     const theme = document.body.dataset.theme || "minimal";
@@ -1265,6 +1374,77 @@
   }
   document.fonts?.ready?.then(() => $$(".record-list").forEach(relayoutMasonryList));
 
+  function renderCompletedGroups(group, completion) {
+    const fold = $(group.done);
+    fold.hidden = completion.outerFoldHidden;
+    $(group.doneCount).textContent = String(completion.groups.reduce((count, item) => count + item.records.length, 0));
+    const dateList = $(group.doneList);
+    dateList.className = "completed-date-list";
+    dateList.replaceChildren(...completion.groups.map(({ date, records: rows, open }) => {
+      const section = document.createElement("details");
+      section.className = "completion-date-group";
+      section.dataset.preserveKey = `${group.key}-completed-${date}`;
+      section.open = open;
+      const allCancelled = rows.every(isCancelled), allCompleted = rows.every(isCompleted);
+      const dateKind = allCancelled ? "取消日期" : allCompleted ? "完成日期" : "终结日期";
+      const summary = document.createElement("summary");
+      summary.textContent = date === "unknown" ? `${dateKind}未知 · ${rows.length}` : `${dateKind} ${date} · ${rows.length}`;
+      const doneList = document.createElement("div");
+      doneList.className = "record-list completed-list";
+      populateMasonryList(doneList, rows.map(makeCard));
+      section.append(summary, doneList);
+      return section;
+    }));
+  }
+  function makeWorkIterationBlock(item) {
+    const iteration = item.iteration;
+    const section = document.createElement("section");
+    section.className = "iteration-work-block";
+    section.dataset.iterationId = iteration.id;
+    const titleId = `iteration-work-title-${cssSafe(iteration.id)}`;
+    section.setAttribute("aria-labelledby", titleId);
+    const head = document.createElement("header");
+    head.className = "iteration-work-head";
+    const copy = document.createElement("div");
+    copy.className = "iteration-work-copy";
+    const title = document.createElement("h3");
+    title.className = "iteration-work-title";
+    title.id = titleId;
+    title.textContent = iterationName(iteration);
+    const tag = model.iterationSecondaryTag(iteration);
+    if (tag) title.title = `版本标识：${tag}`;
+    copy.append(title, iterationStatusPill(iteration));
+    const meta = document.createElement("span");
+    meta.className = "iteration-work-meta";
+    const date = iteration.target_release_date ? ` · 计划发布 ${iteration.target_release_date}` : "";
+    meta.textContent = `${item.records.length} 项 · 已完成 ${item.completed.length}${date}`;
+    head.append(copy, meta);
+    const blockList = document.createElement("div");
+    blockList.className = "record-list iteration-work-list";
+    populateMasonryList(blockList, item.visibleRecords.map(makeCard));
+    section.append(head, blockList);
+    if (item.isReleased && item.foldedRecords.length) {
+      const fold = document.createElement("details");
+      fold.className = "completed-fold iteration-inner-fold";
+      fold.dataset.preserveKey = `iteration-completed-${iteration.id}`;
+      const summary = document.createElement("summary");
+      const label = document.createElement("span");
+      label.textContent = "本版本已完成";
+      const count = document.createElement("span");
+      count.className = "fold-count";
+      count.textContent = String(item.foldedRecords.length);
+      const hint = document.createElement("span");
+      hint.className = "summary-hint";
+      hint.textContent = "展开查看";
+      summary.append(label, count, hint);
+      const doneList = document.createElement("div");
+      doneList.className = "record-list completed-list";
+      populateMasonryList(doneList, item.foldedRecords.map(makeCard));
+      fold.append(summary, doneList);
+      section.append(fold);
+    }
+    return section;
+  }
   function renderGroup(group) {
     const records = sortRecords(groupRecords(group));
     const unfinished = records.filter(record => !isTerminal(record));
@@ -1273,104 +1453,28 @@
     $(group.count).textContent = `${records.length} 项`;
     if (group.key === "work") {
       const iterContainer = $("#work-iteration-container");
-      const releasedFold = $("#work-released-fold");
-      const releasedList = $("#work-released-list");
-      const releasedCount = $("#work-released-count");
-      const iterations = state.iterations || [];
+      const iterations = orderedIterations();
 
       if (iterations.length && model.partitionIterationRecords) {
-        const partition = model.partitionIterationRecords(records, iterations, state.selectedIterationId || state.currentIterationId);
-        const activeCards = [];
-        for (const item of partition.activeIterations) {
-          const section = document.createElement("section");
-          section.className = "iteration-active-block";
-          section.dataset.iterationId = item.iteration.id;
-          const head = document.createElement("header");
-          head.className = "iteration-active-head";
-          const title = document.createElement("h3");
-          title.className = "iteration-active-title";
-          title.textContent = `${item.iteration.version_tag || "未定版"} · ${item.iteration.title}`;
-          const badge = document.createElement("span");
-          badge.className = `iteration-status-pill ${item.iteration.status}`;
-          badge.textContent = item.iteration.status === "active" ? "进行中" : item.iteration.status === "pending_release" ? "待发布" : item.iteration.status;
-          const counter = document.createElement("span");
-          counter.className = "iteration-active-count";
-          counter.textContent = `${item.visibleRecords.length} 项（已完成 ${item.completed.length}）`;
-          head.append(title, badge, counter);
-          const blockList = document.createElement("div");
-          blockList.className = "record-list iteration-task-list";
-          populateMasonryList(blockList, item.visibleRecords.map(makeCard));
-          section.append(head, blockList);
-          activeCards.push(section);
-        }
+        const partition = model.partitionIterationRecords(records, iterations);
+        const blocks = partition.groups
+          .filter(item => item.records.length)
+          .map(item => makeWorkIterationBlock(item));
         if (iterContainer) {
-          iterContainer.replaceChildren(...activeCards);
-          iterContainer.hidden = activeCards.length === 0;
-        }
-
-        if (releasedFold && releasedList && releasedCount) {
-          if (partition.releasedIterations.length) {
-            releasedFold.hidden = false;
-            const totalReleased = partition.releasedIterations.reduce((sum, item) => sum + item.records.length, 0);
-            releasedCount.textContent = String(totalReleased);
-            releasedList.replaceChildren(...partition.releasedIterations.map(item => {
-              const details = document.createElement("details");
-              details.className = "task-past-batch";
-              const summary = document.createElement("summary");
-              const title = document.createElement("span");
-              title.textContent = `${item.iteration.version_tag || "已归档"} · ${item.iteration.title}`;
-              const count = document.createElement("span");
-              count.className = "fold-count";
-              count.textContent = String(item.records.length);
-              const tag = document.createElement("span");
-              tag.className = "summary-hint";
-              tag.textContent = "已发布";
-              summary.append(title, count, tag);
-              details.append(summary);
-              const dList = document.createElement("div");
-              dList.className = "record-list completed-list";
-              populateMasonryList(dList, item.records.map(makeCard));
-              details.append(dList);
-              return details;
-            }));
-          } else {
-            releasedFold.hidden = true;
-          }
+          iterContainer.replaceChildren(...blocks);
+          iterContainer.hidden = blocks.length === 0;
         }
 
         const completion = model.partitionTerminalRecords(partition.backlog.completed);
         populateMasonryList(list, [...partition.backlog.unfinished, ...completion.todayRecords].map(makeCard));
-        $(group.empty).hidden = activeCards.length > 0 || partition.backlog.unfinished.length > 0 || completion.todayRecords.length > 0;
-        const fold = $(group.done); fold.hidden = completion.outerFoldHidden;
-        $(group.doneCount).textContent = String(completion.groups.reduce((count, item) => count + item.records.length, 0));
-        const dateList = $(group.doneList); dateList.className = "completed-date-list";
-        dateList.replaceChildren(...completion.groups.map(({ date, records: rows, open }) => {
-          const section = document.createElement("details"); section.className = "completion-date-group"; section.dataset.preserveKey = `${group.key}-completed-${date}`;
-          section.open = open;
-          const allCancelled = rows.every(isCancelled), allCompleted = rows.every(isCompleted);
-          const dateKind = allCancelled ? "取消日期" : allCompleted ? "完成日期" : "终结日期";
-          const summary = document.createElement("summary"); summary.textContent = date === "unknown" ? `${dateKind}未知 · ${rows.length}` : `${dateKind} ${date} · ${rows.length}`;
-          const doneList = document.createElement("div"); doneList.className = "record-list completed-list"; populateMasonryList(doneList, rows.map(makeCard));
-          section.append(summary, doneList); return section;
-        }));
+        $(group.empty).hidden = blocks.length > 0 || partition.backlog.unfinished.length > 0 || completion.todayRecords.length > 0;
+        renderCompletedGroups(group, completion);
       } else {
         if (iterContainer) iterContainer.hidden = true;
-        if (releasedFold) releasedFold.hidden = true;
         const completion = model.partitionTerminalRecords(completed);
         populateMasonryList(list, [...unfinished, ...completion.todayRecords].map(makeCard));
         $(group.empty).hidden = unfinished.length > 0 || completion.todayRecords.length > 0;
-        const fold = $(group.done); fold.hidden = completion.outerFoldHidden;
-        $(group.doneCount).textContent = String(completion.groups.reduce((count, item) => count + item.records.length, 0));
-        const dateList = $(group.doneList); dateList.className = "completed-date-list";
-        dateList.replaceChildren(...completion.groups.map(({ date, records: rows, open }) => {
-          const section = document.createElement("details"); section.className = "completion-date-group"; section.dataset.preserveKey = `${group.key}-completed-${date}`;
-          section.open = open;
-          const allCancelled = rows.every(isCancelled), allCompleted = rows.every(isCompleted);
-          const dateKind = allCancelled ? "取消日期" : allCompleted ? "完成日期" : "终结日期";
-          const summary = document.createElement("summary"); summary.textContent = date === "unknown" ? `${dateKind}未知 · ${rows.length}` : `${dateKind} ${date} · ${rows.length}`;
-          const doneList = document.createElement("div"); doneList.className = "record-list completed-list"; populateMasonryList(doneList, rows.map(makeCard));
-          section.append(summary, doneList); return section;
-        }));
+        renderCompletedGroups(group, completion);
       }
     } else if (group.key === "bug") {
       const completion = model.partitionTerminalRecords(completed);
@@ -1400,76 +1504,7 @@
     const allTasks = sortTaskRecords((state.data?.delegated || [])
       .filter(record => state.showArchived || effectiveStatus(record) !== "archived")
       .filter(matchesSearch));
-    const iterations = state.iterations || [];
-    const iterContainer = $("#task-iteration-container");
-    const releasedFold = $("#task-released-fold");
-    const releasedList = $("#task-released-list");
-    const releasedCount = $("#task-released-count");
-
-    if (iterations.length && model.partitionIterationRecords) {
-      const partition = model.partitionIterationRecords(allTasks, iterations, state.selectedIterationId || state.currentIterationId);
-      const activeBlocks = [];
-      for (const item of partition.activeIterations) {
-        if (!item.records.length) continue;
-        const section = document.createElement("section");
-        section.className = "iteration-active-block";
-        section.dataset.iterationId = item.iteration.id;
-        const head = document.createElement("header");
-        head.className = "iteration-active-head";
-        const title = document.createElement("h3");
-        title.className = "iteration-active-title";
-        title.textContent = `${item.iteration.version_tag || "未定版"} · ${item.iteration.title}`;
-        const badge = document.createElement("span");
-        badge.className = `iteration-status-pill ${item.iteration.status}`;
-        badge.textContent = item.iteration.status === "active" ? "进行中" : item.iteration.status === "pending_release" ? "待发布" : item.iteration.status;
-        const counter = document.createElement("span");
-        counter.className = "iteration-active-count";
-        counter.textContent = `${item.visibleRecords.length} 项（已完成 ${item.completed.length}）`;
-        head.append(title, badge, counter);
-        const blockList = document.createElement("div");
-        blockList.className = "record-list iteration-task-list";
-        populateMasonryList(blockList, item.visibleRecords.map(r => makeTaskCard(r, true)));
-        section.append(head, blockList);
-        activeBlocks.push(section);
-      }
-      if (iterContainer) {
-        iterContainer.replaceChildren(...activeBlocks);
-        iterContainer.hidden = activeBlocks.length === 0;
-      }
-      if (releasedFold && releasedList && releasedCount) {
-        if (partition.releasedIterations.some(it => it.records.length)) {
-          releasedFold.hidden = false;
-          const totalReleased = partition.releasedIterations.reduce((sum, item) => sum + item.records.length, 0);
-          releasedCount.textContent = String(totalReleased);
-          releasedList.replaceChildren(...partition.releasedIterations.filter(it => it.records.length).map(item => {
-            const details = document.createElement("details");
-            details.className = "task-past-batch";
-            const summary = document.createElement("summary");
-            const title = document.createElement("span");
-            title.textContent = `${item.iteration.version_tag || "已归档"} · ${item.iteration.title}`;
-            const count = document.createElement("span");
-            count.className = "fold-count";
-            count.textContent = String(item.records.length);
-            const tag = document.createElement("span");
-            tag.className = "summary-hint";
-            tag.textContent = "已发布";
-            summary.append(title, count, tag);
-            details.append(summary);
-            const dList = document.createElement("div");
-            dList.className = "record-list completed-list";
-            populateMasonryList(dList, item.records.map(r => makeTaskCard(r, false)));
-            details.append(dList);
-            return details;
-          }));
-        } else {
-          releasedFold.hidden = true;
-        }
-      }
-    } else {
-      if (iterContainer) iterContainer.hidden = true;
-      if (releasedFold) releasedFold.hidden = true;
-    }
-
+    // Delegated tasks keep their original batch model. Versions never apply here.
     const batches = Array.isArray(state.data?.batches) ? state.data.batches : [];
     const currentBatchId = state.data?.current_batch_id || batches.find(batch => batch.state === "current")?.id || null;
     const partition = model.partitionTaskBatches(allTasks, batches, currentBatchId, state.data?.legacy_task_ids || []);
@@ -2030,40 +2065,46 @@
     const idButton = document.createElement("button"); idButton.type = "button"; idButton.className = "detail-id-copy"; idButton.textContent = record.display_id || record.id; idButton.title = "点击复制事项 ID";
     idButton.addEventListener("click", async () => { try { await navigator.clipboard.writeText(record.display_id || record.id); showToast("ID 已复制"); } catch (_) { showToast("复制失败，请手动复制", "error"); } });
     head.append(title, pill); detail.append(idButton, head);
-    const it = (state.iterations || []).find(i => i.id === record.iteration_id);
-    const iterAssignWrap = document.createElement("div");
-    iterAssignWrap.className = "detail-iteration-assign";
-    const iterLabel = document.createElement("span");
-    iterLabel.textContent = "所属版本：";
-    const iterSelect = document.createElement("select");
-    iterSelect.className = "detail-iteration-select";
-    iterSelect.setAttribute("aria-label", "调整所属版本");
-    (state.iterations || []).forEach(item => {
-      const opt = document.createElement("option");
-      opt.value = item.id;
-      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
-      opt.textContent = `${item.title} [${statusMap[item.status] || item.status}]`;
-      if (item.id === record.iteration_id) opt.selected = true;
-      iterSelect.append(opt);
-    });
-    iterSelect.addEventListener("change", async (e) => {
-      const newIterId = e.target.value;
-      try {
-        const res = await fetch(`/api/items/${encodeURIComponent(record.id)}/iteration`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ iteration_id: newIterId })
-        });
-        if (!res.ok) throw new Error("版本切换失败");
-        showToast("已更新任务所属版本");
-        record.iteration_id = newIterId;
-        await refresh();
-      } catch (err) {
-        showToast(err.message, "error");
-      }
-    });
-    iterAssignWrap.append(iterLabel, iterSelect);
-    head.append(iterAssignWrap);
+    if (record.type !== "task") {
+      const iterAssignWrap = document.createElement("div");
+      iterAssignWrap.className = "detail-iteration-assign";
+      const iterLabel = document.createElement("span");
+      iterLabel.textContent = "所属版本：";
+      const iterSelect = document.createElement("select");
+      iterSelect.className = "detail-iteration-select";
+      iterSelect.setAttribute("aria-label", "调整所属版本");
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "未归入版本";
+      iterSelect.append(none);
+      orderedIterations().forEach(item => {
+        const opt = document.createElement("option");
+        opt.value = item.id;
+        opt.textContent = `${iterationName(item)} · ${iterationStatusLabel(item.status)}`;
+        if (item.id === record.iteration_id) opt.selected = true;
+        iterSelect.append(opt);
+      });
+      if (!iterationById(record.iteration_id)) iterSelect.value = "";
+      iterSelect.addEventListener("change", async (e) => {
+        const newIterId = e.target.value || null;
+        try {
+          const res = await fetch(`/api/items/${encodeURIComponent(record.id)}/iteration`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ iteration_id: newIterId })
+          });
+          if (!res.ok) throw new Error("版本切换失败");
+          showToast("已更新需求所属版本");
+          record.iteration_id = newIterId;
+          await refresh();
+        } catch (err) {
+          showToast(err.message, "error");
+          iterSelect.value = record.iteration_id || "";
+        }
+      });
+      iterAssignWrap.append(iterLabel, iterSelect);
+      head.append(iterAssignWrap);
+    }
     const statusLine = document.createElement("p"); statusLine.className = "detail-status-line";
     statusLine.textContent = record.type === "bug" && record.platform_status
       ? `平台上次读取：${statusLabel(record.platform_status)} · ${dateLabel(record.observed_at, "读取时间未记录")}`
@@ -2282,9 +2323,26 @@
     state.contextRequests.set(requestKey, operation);
     return operation;
   }
-  function showToast(message, kind = "success") {
-    const toast = $("#toast"); toast.textContent = message; toast.className = `toast ${kind}`; toast.hidden = false;
-    clearTimeout(state.toastTimer); state.toastTimer = window.setTimeout(() => { toast.hidden = true; }, 3400);
+  function showToast(message, kind = "success", action = null) {
+    const toast = $("#toast");
+    const text = document.createElement("span");
+    text.textContent = message;
+    toast.replaceChildren(text);
+    if (action?.label && typeof action.onClick === "function") {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "toast-action";
+      button.textContent = action.label;
+      button.addEventListener("click", () => {
+        toast.hidden = true;
+        action.onClick();
+      });
+      toast.append(button);
+    }
+    toast.className = `toast ${kind}`;
+    toast.hidden = false;
+    clearTimeout(state.toastTimer);
+    state.toastTimer = window.setTimeout(() => { toast.hidden = true; }, action ? 8000 : 3400);
   }
 
   async function postAction(path, body) {
@@ -2357,12 +2415,9 @@
       if ($("#scopes-dialog")?.open) renderScopeCatalog();
       const changed = !state.data || Number(state.data.revision) !== Number(data.revision) || scopeChanged;
       state.data = data;
-      state.iterations = Array.isArray(data.iterations) ? data.iterations : [];
-      state.currentIterationId = data.current_iteration_id || (state.iterations.find(it => it.status === "active" || it.status === "pending_release")?.id) || null;
-      if (!state.selectedIterationId || !state.iterations.some(it => it.id === state.selectedIterationId)) {
-        state.selectedIterationId = state.currentIterationId;
-      }
-      renderIterationBar();
+      state.iterations = model.orderedIterations(Array.isArray(data.iterations) ? data.iterations : []);
+      state.currentIterationId = data.current_iteration_id || null;
+      if (changed || !$("#iteration-manager-dialog")?.open) renderIterationManager();
       const hours = data.preferences?.work_hours;
       if (hours?.start && hours?.end) workHours = { start: hours.start, end: hours.end, timezone: "Asia/Shanghai" };
       renderWorktimeProgress();
@@ -2380,199 +2435,347 @@
     }
   }
 
-  function renderIterationBar() {
-    const bar = $("#iteration-bar");
-    if (!bar) return;
-    const select = $("#iteration-select");
-    const statusPill = $("#iteration-status-pill");
-    const targetDate = $("#iteration-target-date");
-    const releaseBtn = $("#iteration-release-button");
-
-    const iterations = state.iterations || [];
-    if (!iterations.length) {
-      select.replaceChildren();
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "未配置迭代（全部需求归入未规划需求）";
-      select.append(opt);
-      statusPill.textContent = "无活跃迭代";
-      statusPill.className = "iteration-status-pill on_hold";
-      targetDate.textContent = "";
-      if (releaseBtn) releaseBtn.hidden = true;
-      return;
-    }
-
-    const currentId = state.selectedIterationId || state.currentIterationId;
-    const current = iterations.find(it => it.id === currentId) || iterations[0];
-    state.selectedIterationId = current ? current.id : null;
-
-    select.replaceChildren(...iterations.map(it => {
-      const opt = document.createElement("option");
-      opt.value = it.id;
-      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
-      opt.textContent = `${it.version_tag || "未定版"} · ${it.title} [${statusMap[it.status] || it.status}]`;
-      if (it.id === current?.id) opt.selected = true;
-      return opt;
-    }));
-
-    if (current) {
-      const idBadge = $("#iteration-id-badge");
-      if (idBadge) idBadge.textContent = current.id;
-      const statusMap = { active: "进行中", pending_release: "待发布", released: "已发布", planning: "规划中", archived: "已归档" };
-      statusPill.textContent = statusMap[current.status] || current.status;
-      statusPill.className = `iteration-status-pill ${current.status}`;
-      targetDate.textContent = current.target_release_date ? `计划发布：${current.target_release_date}` : "";
-      if (releaseBtn) {
-        releaseBtn.hidden = current.status === "released" || current.status === "archived";
-        releaseBtn.disabled = state.iterationBusy;
+  function iterationDemandCount(iterationId) {
+    return (state.data?.requirements || []).filter(record => record.iteration_id === iterationId).length;
+  }
+  function makeManagerAction(label, action, iterationId, extra = {}) {
+    const button = makeTextButton(label, `iteration-manager-action${extra.className ? ` ${extra.className}` : ""}`);
+    button.dataset.iterationAction = action;
+    button.dataset.iterationId = iterationId;
+    if (extra.disabled) button.disabled = true;
+    if (extra.title) button.title = extra.title;
+    return button;
+  }
+  function renderIterationManager() {
+    const list = $("#iteration-manager-list");
+    if (!list) return;
+    const iterations = orderedIterations();
+    const empty = $("#iteration-manager-empty");
+    if (empty) empty.hidden = iterations.length > 0;
+    list.replaceChildren(...iterations.map((iteration, index) => {
+      const row = document.createElement("li");
+      row.className = "iteration-manager-row";
+      row.dataset.iterationId = iteration.id;
+      const position = document.createElement("span");
+      position.className = "iteration-manager-index";
+      position.textContent = String(index + 1);
+      const copy = document.createElement("div");
+      copy.className = "iteration-manager-copy";
+      const titleLine = document.createElement("div");
+      titleLine.className = "iteration-manager-title-line";
+      const name = document.createElement("strong");
+      name.className = "iteration-manager-name";
+      name.textContent = iterationName(iteration);
+      titleLine.append(name, iterationStatusPill(iteration));
+      const tag = model.iterationSecondaryTag(iteration);
+      if (tag) name.title = `版本标识：${tag}`;
+      const meta = document.createElement("span");
+      meta.className = "iteration-manager-meta";
+      const date = iteration.target_release_date ? ` · 计划发布 ${iteration.target_release_date}` : "";
+      meta.textContent = `${iterationDemandCount(iteration.id)} 个需求${date}`;
+      copy.append(titleLine, meta);
+      const actions = document.createElement("div");
+      actions.className = "iteration-manager-actions";
+      actions.append(
+        makeManagerAction("上移", "up", iteration.id, { disabled: index === 0, title: "上移版本" }),
+        makeManagerAction("下移", "down", iteration.id, { disabled: index === iterations.length - 1, title: "下移版本" }),
+        makeManagerAction("编辑", "edit", iteration.id, { title: "修改版本名、日期或描述" })
+      );
+      if (!model.iterationIsReleased(iteration)) {
+        actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", title: "发布后该版本需求不再支持直接二次修改" }));
       }
+      row.append(position, copy, actions);
+      return row;
+    }));
+    renderIterationAssignments();
+  }
+  function renderIterationAssignments() {
+    const list = $("#iteration-assign-list");
+    if (!list) return;
+    const requirements = (state.data?.requirements || []).slice().sort((a, b) => String(a.display_id || a.id).localeCompare(String(b.display_id || b.id)));
+    const empty = $("#iteration-assign-empty");
+    if (empty) empty.hidden = requirements.length > 0;
+    const iterations = orderedIterations();
+    list.replaceChildren(...requirements.map(record => {
+      const row = document.createElement("li");
+      row.className = "iteration-assign-row";
+      const copy = document.createElement("div");
+      copy.className = "iteration-assign-copy";
+      const id = document.createElement("span");
+      id.className = "iteration-assign-id";
+      id.textContent = record.display_id || record.id;
+      const title = document.createElement("strong");
+      title.className = "iteration-assign-title";
+      title.textContent = record.title;
+      copy.append(id, title);
+      const select = document.createElement("select");
+      select.className = "iteration-assign-select";
+      select.dataset.assignIteration = record.id;
+      select.setAttribute("aria-label", `调整「${record.title}」所属版本`);
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "未归入版本";
+      select.append(none);
+      for (const iteration of iterations) {
+        const option = document.createElement("option");
+        option.value = iteration.id;
+        option.textContent = iterationName(iteration);
+        select.append(option);
+      }
+      select.value = iterations.some(iteration => iteration.id === record.iteration_id) ? record.iteration_id : "";
+      row.append(copy, select);
+      return row;
+    }));
+  }
+  async function reorderIteration(iterationId, direction) {
+    if (state.iterationBusy) return;
+    const ids = orderedIterations().map(iteration => iteration.id);
+    const index = ids.indexOf(iterationId);
+    const target = direction === "up" ? index - 1 : index + 1;
+    if (index < 0 || target < 0 || target >= ids.length) return;
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    state.iterationBusy = true;
+    try {
+      await postAction("/api/iterations/order", { ids });
+      await refresh();
+      showToast("版本顺序已更新");
+    } catch (error) {
+      showToast(error.message || "版本顺序更新失败", "error");
+    } finally {
+      state.iterationBusy = false;
     }
   }
-
-  function openIterationEditDialog() {
-    const iterations = state.iterations || [];
-    const currentId = state.selectedIterationId || state.currentIterationId;
-    const current = iterations.find(it => it.id === currentId) || iterations[0];
-    if (!current) return;
-    $("#iteration-edit-id").value = current.id;
-    $("#iteration-edit-title-input").value = current.title || "";
-    $("#iteration-edit-tag-input").value = current.version_tag || "";
-    $("#iteration-edit-date-input").value = current.target_release_date || "";
-    $("#iteration-edit-desc-input").value = current.description || "";
-    $("#iteration-edit-feedback").textContent = "";
-    $("#iteration-edit-dialog").showModal();
+  async function assignRecordIteration(recordId, iterationId) {
+    try {
+      await postAction(`/api/items/${encodeURIComponent(recordId)}/iteration`, { iteration_id: iterationId || null });
+      const record = (state.data?.requirements || []).find(item => item.id === recordId);
+      if (record) record.iteration_id = iterationId || null;
+      showToast("已更新需求所属版本");
+      await refresh();
+    } catch (error) {
+      showToast(error.message || "所属版本更新失败", "error");
+      renderIterationAssignments();
+    }
   }
-
+  function iterationError(payload, fallback) {
+    const errors = {
+      iteration_duplicate: "已存在同名版本，请换一个版本名。",
+      iteration_not_found: "找不到这个版本，请刷新后重试。",
+      invalid_iteration_title: "请填写有效的版本名。",
+      invalid_iteration_version_tag: "请填写有效的版本名。",
+      invalid_iteration_order: "版本顺序无效，请刷新后重试。",
+      iteration_order_mismatch: "版本列表已变化，请刷新后重试。",
+      missing_iteration_id: "请选择目标版本。"
+    };
+    return errors[payload.error] || payload.message || fallback;
+  }
+  async function iterationRequest(path, body) {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(iterationError(payload, "操作失败，请重试。"));
+    return payload;
+  }
+  function openIterationEditDialog(iterationId) {
+    const iteration = iterationById(iterationId) || orderedIterations()[0];
+    if (!iteration) return;
+    state.iterationEditId = iteration.id;
+    $("#iteration-edit-id").value = iteration.id;
+    $("#iteration-edit-title-input").value = iterationName(iteration);
+    $("#iteration-edit-date-input").value = iteration.target_release_date || "";
+    $("#iteration-edit-desc-input").value = iteration.description || "";
+    $("#iteration-edit-feedback").textContent = "";
+    $("#iteration-edit-feedback").className = "source-feedback";
+    $("#iteration-edit-dialog").showModal();
+    $("#iteration-edit-title-input").focus();
+  }
   async function submitIterationEditForm(event) {
     event.preventDefault();
-    const currentId = $("#iteration-edit-id").value;
-    if (!currentId) return;
+    const iterationId = $("#iteration-edit-id").value;
+    if (!iterationId) return;
     const title = $("#iteration-edit-title-input").value.trim();
-    const version_tag = $("#iteration-edit-tag-input").value.trim();
     const target_release_date = $("#iteration-edit-date-input").value || null;
     const description = $("#iteration-edit-desc-input").value.trim();
-
     const feedback = $("#iteration-edit-feedback");
     const submitBtn = $("#iteration-edit-submit");
+    if (!title) { feedback.textContent = "请填写版本名。"; feedback.className = "source-feedback error"; return; }
     submitBtn.disabled = true;
-    feedback.textContent = "正在保存更名…";
+    feedback.textContent = "正在保存版本信息…";
     feedback.className = "source-feedback busy";
-
     try {
-      const res = await fetch(`/api/iterations/${encodeURIComponent(currentId)}/update`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, version_tag, target_release_date, description })
+      // One editable name: version_tag stays as the compatible identifier.
+      await iterationRequest(`/api/iterations/${encodeURIComponent(iterationId)}/update`, {
+        title, version_tag: title, target_release_date, description
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || err.error || "更新失败");
-      }
       $("#iteration-edit-dialog").close();
       showToast("版本信息已更新");
       await refresh();
-    } catch (err) {
-      feedback.textContent = err.message;
+      if ($("#sources-dialog").open) await loadSources();
+    } catch (error) {
+      feedback.textContent = error.message;
       feedback.className = "source-feedback error";
     } finally {
       submitBtn.disabled = false;
     }
   }
-
+  function openIterationCreateDialog() {
+    const iterations = orderedIterations();
+    $("#iteration-feedback").textContent = "";
+    $("#iteration-feedback").className = "source-feedback";
+    $("#iteration-form").reset();
+    const select = $("#iteration-order-select");
+    const options = iterations.map((iteration, index) => ({ value: String(index), label: `插入到「${iterationName(iteration)}」之前` }));
+    options.push({ value: String(iterations.length), label: "放在最后" });
+    select.replaceChildren(...options.map(option => {
+      const node = document.createElement("option");
+      node.value = option.value;
+      node.textContent = option.label;
+      return node;
+    }));
+    select.value = String(iterations.length);
+    $("#iteration-dialog").showModal();
+    $("#iteration-title-input").focus();
+  }
+  async function submitIterationForm(event) {
+    event.preventDefault();
+    const title = $("#iteration-title-input").value.trim();
+    const order = Number($("#iteration-order-select").value || 0);
+    const target_release_date = $("#iteration-date-input").value || null;
+    const description = $("#iteration-desc-input").value.trim() || null;
+    const feedback = $("#iteration-feedback");
+    const submitBtn = $("#iteration-submit");
+    if (!title) { feedback.textContent = "请填写版本名。"; feedback.className = "source-feedback error"; return; }
+    submitBtn.disabled = true;
+    feedback.textContent = "正在创建版本…";
+    feedback.className = "source-feedback busy";
+    try {
+      await iterationRequest("/api/iterations", {
+        version_tag: title, title, target_release_date, description, order
+      });
+      $("#iteration-dialog").close();
+      $("#iteration-form").reset();
+      showToast(`已创建版本：${title}`);
+      await refresh();
+      if ($("#sources-dialog").open) await loadSources();
+    } catch (error) {
+      feedback.textContent = error.message || "创建版本失败，请重试。";
+      feedback.className = "source-feedback error";
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+  async function handleReleaseIteration(iterationId) {
+    if (state.iterationBusy) return;
+    const iteration = iterationById(iterationId);
+    if (!iteration) return;
+    if (!window.confirm(`确认将版本「${iterationName(iteration)}」标记为已发布？\n发布后该版本需求不再支持直接二次修改。`)) return;
+    state.iterationBusy = true;
+    try {
+      await iterationRequest(`/api/iterations/${encodeURIComponent(iteration.id)}/release`, {});
+      showToast(`版本「${iterationName(iteration)}」已标记发布`);
+      await refresh();
+    } catch (error) {
+      showToast(error.message || "标记发布失败", "error");
+    } finally {
+      state.iterationBusy = false;
+    }
+  }
+  function relocateSlotOptions(scope) {
+    const definitions = slotDefinitions(scope).map(definition => ({ value: definition.id, label: definition.label }));
+    definitions.push({ value: "supplementary", label: "补充材料" });
+    return definitions;
+  }
   function openRelocateDialog(source) {
     if (!source) return;
     state.relocateTargetSource = source;
     const dialog = $("#source-relocate-dialog");
     if (!dialog) return;
-    $("#relocate-source-title").textContent = `正在调整材料：${source.name || source.filename || source.id}`;
+    const groupId = source.group_id || source.id;
+    const groupSize = state.sources.filter(item => (item.group_id || item.id) === groupId).length;
+    $("#relocate-source-title").textContent = `移动材料：${source.name || source.filename || source.id}`;
+    $("#relocate-current-location").textContent = `当前位置：${sourceLocationText(source)}`;
+    const groupHint = $("#relocate-group-hint");
+    groupHint.hidden = groupSize <= 1;
+    groupHint.textContent = groupSize > 1
+      ? `这条材料共有 ${groupSize} 个版本，移动会把整组一起移到目标位置。`
+      : "";
     const scopeSelect = $("#relocate-scope-select");
     const iterSelect = $("#relocate-iteration-select");
     const slotSelect = $("#relocate-slot-select");
     const iterWrap = $("#relocate-iteration-wrap");
-
-    scopeSelect.value = source.scope || "iteration";
-
-    iterSelect.replaceChildren(...(state.iterations || []).map(it => {
-      const opt = document.createElement("option");
-      opt.value = it.id;
-      opt.textContent = `${it.title} (${it.id})`;
-      if (it.id === (source.iteration_id || state.currentIterationId)) opt.selected = true;
-      return opt;
+    const currentScope = model.sourceScope(source);
+    scopeSelect.value = currentScope;
+    iterSelect.replaceChildren(...orderedIterations().map(iteration => {
+      const option = document.createElement("option");
+      option.value = iteration.id;
+      option.textContent = iterationName(iteration);
+      return option;
     }));
+    if (source.iteration_id && iterationById(source.iteration_id)) iterSelect.value = source.iteration_id;
 
     function syncSlots() {
       const isGlobal = scopeSelect.value === "global";
       iterWrap.hidden = isGlobal;
-      slotSelect.replaceChildren();
-      if (isGlobal) {
-        const slots = [
-          { value: "api_doc", label: "接口文档（固定槽位）" },
-          { value: "supplementary", label: "全局补充材料列表" },
-          { value: "", label: "其他来源" }
-        ];
-        slots.forEach(s => {
-          const opt = document.createElement("option");
-          opt.value = s.value;
-          opt.textContent = s.label;
-          if (source.slot === s.value) opt.selected = true;
-          slotSelect.append(opt);
-        });
-      } else {
-        const slots = [
-          { value: "requirement_doc", label: "需求列表（固定槽位）" },
-          { value: "figma", label: "Figma（固定槽位）" },
-          { value: "prototype", label: "高保真（固定槽位）" },
-          { value: "testcase", label: "测试用例（固定槽位）" },
-          { value: "supplementary", label: "补充材料列表" },
-          { value: "", label: "其他来源" }
-        ];
-        slots.forEach(s => {
-          const opt = document.createElement("option");
-          opt.value = s.value;
-          opt.textContent = s.label;
-          if (source.slot === s.value || (s.value === "prototype" && source.slot === "codesign")) opt.selected = true;
-          slotSelect.append(opt);
-        });
-      }
+      const options = relocateSlotOptions(isGlobal ? "global" : "iteration");
+      slotSelect.replaceChildren(...options.map(option => {
+        const node = document.createElement("option");
+        node.value = option.value;
+        node.textContent = option.label;
+        return node;
+      }));
+      const preferred = source.slot === "codesign" ? "prototype" : source.slot;
+      slotSelect.value = options.some(option => option.value === preferred) ? preferred : "supplementary";
     }
-
     scopeSelect.onchange = syncSlots;
     syncSlots();
-
     $("#relocate-feedback").textContent = "";
+    $("#relocate-feedback").className = "source-feedback";
     dialog.showModal();
+    iterSelect.focus({ preventScroll: true });
   }
-
   async function submitRelocateForm(event) {
     event.preventDefault();
     const source = state.relocateTargetSource;
     if (!source) return;
     const scope = $("#relocate-scope-select").value;
-    const iteration_id = scope === "iteration" ? $("#relocate-iteration-select").value : null;
-    const slot = $("#relocate-slot-select").value || null;
-
+    const iterationId = scope === "iteration" ? $("#relocate-iteration-select").value : null;
+    const slot = $("#relocate-slot-select").value || "supplementary";
     const feedback = $("#relocate-feedback");
     const submitBtn = $("#relocate-submit");
+    if (scope === "iteration" && !iterationId) {
+      feedback.textContent = "请先选择目标版本。";
+      feedback.className = "source-feedback error";
+      return;
+    }
+    const previous = { scope: model.sourceScope(source), iteration_id: source.iteration_id || null, slot: source.slot || "supplementary" };
     submitBtn.disabled = true;
-    feedback.textContent = "正在调整材料位置…";
+    feedback.textContent = "正在移动材料…";
     feedback.className = "source-feedback busy";
-
     try {
-      const res = await fetch(`/api/sources/${encodeURIComponent(source.id)}/location`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scope, iteration_id, slot })
+      await iterationRequest(`/api/sources/${encodeURIComponent(source.id)}/location`, {
+        scope, iteration_id: iterationId, slot
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || err.error || "移动失败");
-      }
       $("#source-relocate-dialog").close();
-      showToast("材料位置已成功更新");
+      state.archiveScopeTab = scope;
+      state.libraryHighlight = source.group_id || source.id;
       await loadSources();
       await refresh();
-    } catch (err) {
-      feedback.textContent = err.message;
+      const target = scope === "global" ? "公共材料" : `${iterationName(iterationById(iterationId))} · ${slotLabel(slot)}`;
+      showToast(`已移动到${target}`, "success", {
+        label: "撤销",
+        onClick: async () => {
+          try {
+            await iterationRequest(`/api/sources/${encodeURIComponent(source.id)}/location`, {
+              scope: previous.scope, iteration_id: previous.iteration_id, slot: previous.slot
+            });
+            await loadSources();
+            showToast("已撤销移动");
+          } catch (error) {
+            showToast(error.message || "撤销失败", "error");
+          }
+        }
+      });
+    } catch (error) {
+      feedback.textContent = error.message;
       feedback.className = "source-feedback error";
     } finally {
       submitBtn.disabled = false;
@@ -2627,54 +2830,6 @@
       feedback.className = "source-feedback error";
     } finally {
       submitBtn.disabled = false;
-    }
-  }
-
-  async function submitIterationForm(event) {
-    event.preventDefault();
-    const tag = $("#iteration-tag-input").value.trim();
-    const title = $("#iteration-title-input").value.trim();
-    const target_release_date = $("#iteration-date-input").value || null;
-    const description = $("#iteration-desc-input").value.trim() || null;
-    const feedback = $("#iteration-feedback");
-    const submitBtn = $("#iteration-submit");
-    submitBtn.disabled = true;
-    feedback.textContent = "正在创建迭代…";
-    feedback.className = "source-feedback busy";
-    try {
-      const res = await postAction("/api/iterations", { version_tag: tag, title, target_release_date, description });
-      state.selectedIterationId = res.iteration?.id || state.selectedIterationId;
-      $("#iteration-dialog").close();
-      $("#iteration-form").reset();
-      showToast(`已创建迭代：${tag} · ${title}`);
-      await refresh();
-    } catch (error) {
-      feedback.textContent = error.message || "创建迭代失败，请重试。";
-      feedback.className = "source-feedback error";
-    } finally {
-      submitBtn.disabled = false;
-    }
-  }
-
-  async function handleReleaseIteration() {
-    const currentId = state.selectedIterationId || state.currentIterationId;
-    if (!currentId) return;
-    const it = (state.iterations || []).find(i => i.id === currentId);
-    if (!it) return;
-    if (!window.confirm(`确认将迭代「${it.version_tag} · ${it.title}」标记为已发布？\n发布后该迭代所有需求将整体归档，不再支持直接二次修改。`)) {
-      return;
-    }
-    state.iterationBusy = true;
-    $("#iteration-release-button").disabled = true;
-    try {
-      await postAction(`/api/iterations/${encodeURIComponent(currentId)}/release`, {});
-      showToast(`迭代「${it.version_tag}」已发布并封存归档`);
-      await refresh();
-    } catch (error) {
-      showToast(error.message || "标记发布失败", "error");
-    } finally {
-      state.iterationBusy = false;
-      $("#iteration-release-button").disabled = false;
     }
   }
 
@@ -2776,10 +2931,8 @@
   $("#library-add-cancel").addEventListener("click", () => resetLibraryAdd(true));
   $("#source-link-form").addEventListener("submit", submitLibraryEntry);
   $("#source-link-form").addEventListener("reset", () => { selectLibraryFile(null); });
-  $("#library-slot-grid").addEventListener("click", handleLibraryClick);
-  $("#library-other-list").addEventListener("click", handleLibraryClick);
-  $("#source-removed-list").addEventListener("click", handleLibraryClick);
-  $("#library-other-list").addEventListener("change", handleLibrarySlotChange);
+  $("#archive-body").addEventListener("click", handleLibraryClick);
+  $("#library-add-slot").addEventListener("change", updateLibraryAddContext);
   $("#dialog-close").addEventListener("click", () => $("#record-dialog").close());
   $("#followup-close").addEventListener("click", closeFollowup);
   $("#followup-cancel").addEventListener("click", closeFollowup);
@@ -2800,30 +2953,35 @@
     const reopen = event.target.closest("[data-reopen-id]"); if (reopen) openReopenDialog(reopen.dataset.reopenId);
     const uploadTaskAtt = event.target.closest("[data-upload-task-attachment]"); if (uploadTaskAtt) openUploadTaskAttachment(uploadTaskAtt.dataset.uploadTaskAttachment);
   });
-  const iterSelect = $("#iteration-select");
-  if (iterSelect) {
-    iterSelect.addEventListener("change", event => {
-      state.selectedIterationId = event.target.value;
-      render();
-      if ($("#sources-dialog").open) renderSources();
-    });
-  }
-  const iterRelBtn = $("#iteration-release-button");
-  if (iterRelBtn) iterRelBtn.addEventListener("click", handleReleaseIteration);
-  const iterCreateBtn = $("#iteration-create-open");
-  if (iterCreateBtn) iterCreateBtn.addEventListener("click", () => {
-    $("#iteration-feedback").textContent = "";
-    $("#iteration-form").reset();
-    $("#iteration-dialog").showModal();
+  $("#iteration-manager-open").addEventListener("click", () => {
+    renderIterationManager();
+    $("#iteration-manager-dialog").showModal();
   });
+  const managerClose = $("#iteration-manager-close");
+  if (managerClose) managerClose.addEventListener("click", () => $("#iteration-manager-dialog").close());
+  const managerDialog = $("#iteration-manager-dialog");
+  if (managerDialog) managerDialog.addEventListener("click", event => { if (event.target === managerDialog) managerDialog.close(); });
+  $("#iteration-manager-list").addEventListener("click", event => {
+    const button = event.target.closest("[data-iteration-action]");
+    if (!button || button.disabled) return;
+    const iterationId = button.dataset.iterationId;
+    const action = button.dataset.iterationAction;
+    if (action === "up" || action === "down") return reorderIteration(iterationId, action);
+    if (action === "edit") return openIterationEditDialog(iterationId);
+    if (action === "release") return handleReleaseIteration(iterationId);
+  });
+  $("#iteration-assign-list").addEventListener("change", event => {
+    const select = event.target.closest("[data-assign-iteration]");
+    if (select) assignRecordIteration(select.dataset.assignIteration, select.value);
+  });
+  const iterCreateBtn = $("#iteration-create-open");
+  if (iterCreateBtn) iterCreateBtn.addEventListener("click", openIterationCreateDialog);
   const iterCloseBtn = $("#iteration-dialog-close");
   if (iterCloseBtn) iterCloseBtn.addEventListener("click", () => $("#iteration-dialog").close());
   const iterCancelBtn = $("#iteration-cancel");
   if (iterCancelBtn) iterCancelBtn.addEventListener("click", () => $("#iteration-dialog").close());
   const iterForm = $("#iteration-form");
   if (iterForm) iterForm.addEventListener("submit", submitIterationForm);
-  const iterEditBtn = $("#iteration-edit-open");
-  if (iterEditBtn) iterEditBtn.addEventListener("click", openIterationEditDialog);
   const iterEditCloseBtn = $("#iteration-edit-close");
   if (iterEditCloseBtn) iterEditCloseBtn.addEventListener("click", () => $("#iteration-edit-dialog").close());
   const iterEditCancelBtn = $("#iteration-edit-cancel");
@@ -2863,12 +3021,6 @@
         state.archiveScopeTab = btn.dataset.scope;
         renderSources();
       }
-    });
-  }
-  const suppUploadTrigger = $("#supplementary-upload-trigger");
-  if (suppUploadTrigger) {
-    suppUploadTrigger.addEventListener("click", () => {
-      openLibraryAdd({ slot: "supplementary", name: "补充材料" });
     });
   }
   document.addEventListener("toggle", event => {

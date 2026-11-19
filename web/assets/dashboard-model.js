@@ -74,11 +74,54 @@
   }
   function partitionTerminalRecords(records, today) { return partitionDailyCompletions(records, today); }
   function partitionCompletedRecords(records, today) { return partitionTerminalRecords(records, today); }
-  function partitionIterationRecords(records, iterations, currentIterationId, today) {
-    const list = Array.isArray(records) ? records : [];
-    const iterList = Array.isArray(iterations) ? iterations : [];
+  const iterationStatusLabels = Object.freeze({
+    planning: "规划中", active: "进行中", pending_release: "待发布", released: "已发布", archived: "已归档"
+  });
+  function iterationStatusLabel(status) { return iterationStatusLabels[status] || String(status || "未设置"); }
+  function iterationIsReleased(iteration) {
+    return !!iteration && (iteration.status === "released" || iteration.status === "archived");
+  }
+  // A version has exactly one readable name. `title` wins; `version_tag` is kept
+  // only for backward compatibility and never becomes a second visible name.
+  function iterationName(iteration) {
+    if (!iteration || typeof iteration !== "object") return "未命名版本";
+    const title = String(iteration.title || "").trim();
+    const tag = String(iteration.version_tag || "").trim();
+    const id = String(iteration.id || "").trim();
+    return title || tag || id || "未命名版本";
+  }
+  function iterationSecondaryTag(iteration) {
+    if (!iteration || typeof iteration !== "object") return "";
+    const title = String(iteration.title || "").trim();
+    const tag = String(iteration.version_tag || "").trim();
+    return title && tag && title !== tag ? tag : "";
+  }
+  function iterationOrderValue(value) {
+    return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  function orderedIterations(iterations) {
+    const list = (Array.isArray(iterations) ? iterations : []).filter(item => item && typeof item === "object");
+    return [...list].sort((a, b) => {
+      const aOrder = iterationOrderValue(a.order);
+      const bOrder = iterationOrderValue(b.order);
+      if (aOrder !== bOrder) {
+        if (aOrder === null) return 1;
+        if (bOrder === null) return -1;
+        return aOrder - bOrder;
+      }
+      return String(a.created_at || "").localeCompare(String(b.created_at || ""))
+        || String(a.id || "").localeCompare(String(b.id || ""));
+    });
+  }
+  // Delegated tasks (and BUGs) intentionally live outside the version matrix.
+  function iterationApplies(record) {
+    if (!record || typeof record !== "object") return false;
+    return record.type !== "task" && record.type !== "bug";
+  }
+  function partitionIterationRecords(records, iterations, today) {
+    const list = (Array.isArray(records) ? records : []).filter(iterationApplies);
+    const iterList = orderedIterations(iterations);
     const iterMap = new Map(iterList.map(it => [it.id, it]));
-    const current = iterMap.get(currentIterationId) || iterList.find(it => it.status === "active" || it.status === "pending_release") || null;
     const groupedByIter = new Map();
     const backlog = [];
 
@@ -92,40 +135,31 @@
       }
     }
 
-    const activeIterations = [];
-    const releasedIterations = [];
-
-    for (const it of iterList) {
+    const groups = iterList.map(it => {
       const iterRecords = groupedByIter.get(it.id) || [];
-      const isReleased = it.status === "released" || it.status === "archived";
+      const isReleased = iterationIsReleased(it);
       const unfinished = iterRecords.filter(r => !["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
       const completed = iterRecords.filter(r => ["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
-      const isCurrent = current ? current.id === it.id : false;
-
-      const item = {
+      return {
         iteration: it,
         records: iterRecords,
         unfinished,
         completed,
         isReleased,
-        isCurrent,
-        // Zero-collapse rule: In unreleased iterations, all records remain visible in the active list (never folded)
-        visibleRecords: isReleased ? [] : iterRecords,
-        foldedRecords: isReleased ? iterRecords : []
+        // Unreleased versions keep every record flat. Released versions stay
+        // visible and only fold their completed records inside the group.
+        visibleRecords: isReleased ? unfinished : iterRecords,
+        foldedRecords: isReleased ? completed : []
       };
-
-      if (isReleased) releasedIterations.push(item);
-      else activeIterations.push(item);
-    }
+    });
 
     const backlogUnfinished = backlog.filter(r => !["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
     const backlogCompleted = backlog.filter(r => ["completed", "cancelled", "archived"].includes(r.effective_status || r.status));
     const backlogCompletion = partitionDailyCompletions(backlogCompleted, today);
 
     return {
-      currentIteration: current,
-      activeIterations,
-      releasedIterations,
+      iterations: iterList,
+      groups,
       backlog: {
         records: backlog,
         unfinished: backlogUnfinished,
@@ -402,9 +436,10 @@
         || String(b.source.id || "").localeCompare(String(a.source.id || "")));
   }
   function libraryGroupSlot(versions) {
+    const known = slot => !!slot && (librarySlotLabels[slot] || archiveSlotLabels[slot]);
     const latestSlot = versions[0]?.source?.slot;
-    if (latestSlot && librarySlotLabels[latestSlot]) return latestSlot;
-    const inherited = versions.find(item => item.source.slot && librarySlotLabels[item.source.slot]);
+    if (known(latestSlot)) return latestSlot;
+    const inherited = versions.find(item => known(item.source.slot));
     return inherited ? inherited.source.slot : null;
   }
   function libraryInspectionState(source, index, groupSlot) {
@@ -448,7 +483,7 @@
       const card = versions[0];
       const successTimes = versions.map(source => source.last_inspection_success_at).filter(Boolean).sort();
       groups.push({
-        group_id: groupId, slot, slot_label: librarySlotLabels[slot] || "其他来源",
+        group_id: groupId, slot, slot_label: librarySlotLabels[slot] || archiveSlotLabels[slot] || "补充材料",
         card, latest: card, versions, version_count: versionCount,
         history_count: Math.max(0, versionCount - 1),
         last_inspection_success_at: successTimes.length ? successTimes[successTimes.length - 1] : null
@@ -497,111 +532,118 @@
     architecture: "公共规范",
     other: "其他资料"
   });
-  function archiveView(sources, iterations, selectedIterationId) {
-    const list = Array.isArray(sources) ? sources.filter(item => item && typeof item === "object") : [];
-    const iterList = Array.isArray(iterations) ? iterations.filter(item => item && typeof item === "object") : [];
-    const active = list.filter(libraryActive);
-    const removed = list.filter(source => !libraryActive(source)).map(source => ({ ...source }));
-    const iterMap = new Map(iterList.map(it => [it.id, it]));
-    const currentIteration = iterMap.get(selectedIterationId)
-      || iterList.find(it => it.status === "active" || it.status === "pending_release")
-      || iterList[0]
-      || null;
-    const currentId = currentIteration ? currentIteration.id : null;
-
-    // Build Global section
-    const globalSources = active.filter(s => s.scope === "global" || (!s.scope && (s.slot === "api_doc" || s.slot === "architecture")));
-    const globalGroupView = libraryView(globalSources);
-    const globalSelected = new Map();
-    for (const def of globalArchiveSlots) {
-      const candidates = globalGroupView.groups.filter(g => g.slot === def.id);
-      globalSelected.set(def.id, candidates[0] || null);
+  function sourceScope(source) {
+    if (!source || typeof source !== "object") return "global";
+    if (source.scope === "global" || source.scope === "iteration") return source.scope;
+    if (["api_doc", "architecture", "standard"].includes(source.slot)) return "global";
+    return source.iteration_id ? "iteration" : "global";
+  }
+  function archiveAttachments(sources) {
+    const items = [];
+    for (const source of sources) {
+      for (const attachment of Array.isArray(source.attachments) ? source.attachments : []) {
+        items.push({ ...attachment, attachment: true, source_id: source.id, source_name: sourceDisplayNameOf(source) });
+      }
     }
-    const globalSlots = globalArchiveSlots.map(def => {
-      const group = globalSelected.get(def.id);
+    return items;
+  }
+  function sourceDisplayNameOf(source) {
+    return String(source?.name || source?.filename || source?.id || "材料");
+  }
+  function buildArchiveSection(partSources, definitions, meta) {
+    const view = libraryView(partSources);
+    const selected = new Map();
+    for (const definition of definitions) {
+      const candidates = view.groups.filter(group => {
+        if (definition.id === "prototype") return group.slot === "prototype" || group.slot === "codesign";
+        return group.slot === definition.id;
+      });
+      selected.set(definition.id, candidates[0] || null);
+    }
+    const slots = definitions.map(definition => {
+      const group = selected.get(definition.id);
       return {
-        slot: def.id, label: def.label, hint: def.hint,
+        slot: definition.id, label: definition.label, hint: definition.hint,
         group, card: group?.card || null, versions: group?.versions || [],
         version_count: group?.version_count || 0, history_count: group?.history_count || 0,
         empty: !group
       };
     });
-    const globalSupplementary = [];
-    for (const s of globalSources) {
-      if (s.slot !== "api_doc") globalSupplementary.push(s);
-      if (Array.isArray(s.attachments)) {
-        for (const att of s.attachments) globalSupplementary.push(att);
+    const fixedGroupIds = new Set([...selected.values()].filter(Boolean).map(group => group.group_id));
+    // Only groups that did not win a fixed slot become supplementary material.
+    // This is the isolation rule: one group has exactly one home in this scope.
+    const supplementaryGroups = view.groups.filter(group => !fixedGroupIds.has(group.group_id));
+    const attachments = archiveAttachments(partSources);
+    return {
+      ...meta,
+      slots,
+      supplementaryGroups,
+      attachments,
+      groups: view.groups,
+      fixedCount: slots.filter(slot => !slot.empty).length,
+      supplementaryCount: supplementaryGroups.length + attachments.length
+    };
+  }
+  // Archive matrix. Every source is assigned to exactly one section by scope
+  // and iteration, so a material can never leak into another version or into
+  // the shared public list.
+  function archiveView(sources, iterations) {
+    const list = Array.isArray(sources) ? sources.filter(item => item && typeof item === "object") : [];
+    const iterList = orderedIterations(iterations);
+    const iterMap = new Map(iterList.map(it => [it.id, it]));
+    const active = list.filter(libraryActive);
+    const removed = list.filter(source => !libraryActive(source)).map(source => ({ ...source }));
+
+    const globalSources = [];
+    const byIteration = new Map(iterList.map(it => [it.id, []]));
+    const groupLocations = new Map();
+    for (const source of active) {
+      const scope = sourceScope(source);
+      const groupId = source.group_id || source.id;
+      const location = scope === "iteration" && source.iteration_id && iterMap.has(source.iteration_id)
+        ? `iteration:${source.iteration_id}` : "global";
+      if (!groupLocations.has(groupId)) groupLocations.set(groupId, new Set());
+      groupLocations.get(groupId).add(location);
+      if (scope === "iteration" && source.iteration_id && iterMap.has(source.iteration_id)) {
+        byIteration.get(source.iteration_id).push(source);
+      } else {
+        // Version material with a missing target is treated as unassigned public
+        // material instead of leaking into an arbitrary version.
+        globalSources.push(source);
       }
     }
+    const mixedGroups = new Set([...groupLocations.entries()]
+      .filter(([, locations]) => locations.size > 1)
+      .map(([groupId]) => groupId));
 
-    // Build per-iteration matrix sections
-    const iterationSections = iterList.map(it => {
-      const itSources = active.filter(s => {
-        if (s.scope === "iteration") return s.iteration_id === it.id;
-        if (s.scope === "global") return false;
-        if (s.slot === "api_doc" || s.slot === "architecture") return false;
-        return s.iteration_id === it.id;
-      });
-      const itGroupView = libraryView(itSources);
-      const itSelected = new Map();
-      for (const def of iterationArchiveSlots) {
-        const candidates = itGroupView.groups.filter(g => {
-          if (def.id === "prototype") return g.slot === "prototype" || g.slot === "codesign";
-          return g.slot === def.id;
-        });
-        itSelected.set(def.id, candidates[0] || null);
-      }
-      const slots = iterationArchiveSlots.map(def => {
-        const group = itSelected.get(def.id);
-        return {
-          slot: def.id, label: def.label, hint: def.hint,
-          group, card: group?.card || null, versions: group?.versions || [],
-          version_count: group?.version_count || 0, history_count: group?.history_count || 0,
-          empty: !group
-        };
-      });
-      const supplementary = [];
-      const fixedGroupIds = new Set([...itSelected.values()].filter(Boolean).map(g => g.group_id));
-      for (const s of itSources) {
-        if (s.slot === "supplementary" || !fixedGroupIds.has(libraryGroupId(s))) {
-          supplementary.push(s);
-        }
-        if (Array.isArray(s.attachments)) {
-          for (const att of s.attachments) supplementary.push(att);
-        }
-      }
-      return {
-        iteration: it,
-        isCurrent: it.id === currentId,
-        slots,
-        supplementary,
-        groups: itGroupView.groups,
-        others: itGroupView.others
-      };
+    const globalSection = buildArchiveSection(globalSources, globalArchiveSlots, { scope: "global", iteration: null });
+    globalSection.mixedGroups = mixedGroups;
+    globalSection.removed = removed.filter(source => {
+      const scope = sourceScope(source);
+      return scope === "global" || !source.iteration_id || !iterMap.has(source.iteration_id);
     });
 
-    const activeSection = iterationSections.find(s => s.isCurrent) || iterationSections[0] || null;
+    const iterationSections = iterList.map(iteration => {
+      const section = buildArchiveSection(byIteration.get(iteration.id), iterationArchiveSlots, { scope: "iteration", iteration });
+      section.removed = removed.filter(source => sourceScope(source) === "iteration" && source.iteration_id === iteration.id);
+      section.mixedGroups = mixedGroups;
+      return section;
+    });
 
     return {
-      currentIteration,
       iterations: iterationSections,
-      rawIterations: iterList,
-      globalSection: {
-        slots: globalSlots,
-        supplementary: globalSupplementary,
-        groups: globalGroupView.groups,
-        others: globalGroupView.others
-      },
-      globalSlots,
-      iterationSlots: activeSection ? activeSection.slots : [],
-      supplementaryItems: activeSection ? activeSection.supplementary : [],
-      others: activeSection ? activeSection.others.concat(globalGroupView.others) : globalGroupView.others,
+      global: globalSection,
+      globalSection,
+      globalSlots: globalSection.slots,
+      mixedGroups,
       removed,
+      orderedIterations: iterList,
       activeCount: active.length
     };
   }
   const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionIterationRecords, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, sortTaskRecords, workPeriodProgress,
-    librarySlots, librarySlotLabels, libraryActive, libraryView,
+    iterationStatusLabels, iterationStatusLabel, iterationIsReleased, iterationName, iterationSecondaryTag, orderedIterations, iterationApplies,
+    librarySlots, librarySlotLabels, libraryActive, libraryView, sourceScope, sourceDisplayNameOf,
     globalArchiveSlots, iterationArchiveSlots, archiveSlotLabels, archiveView,
     workflowView, workflowChip, workflowStageDefinitions, workflowStatusLabel, workflowRoleLabel, workflowOutputLabel, workflowStagesFallback };
   if (typeof module !== "undefined" && module.exports) module.exports = model;

@@ -48,6 +48,33 @@ records = [
     item("fixture-old-task", "task", "Fixture task in old batch", datetime.now().astimezone().isoformat(), batch_id="batch-old", latest_brief="Historical task remains folded under its batch.")
 ]
 
+# Version matrix fixture: keep version material isolated from public material.
+sources.extend([
+    {"id": "fixture-global-api", "name": "公共接口文档", "type": "link", "url": "https://example.com/api", "status": "registered", "active": True, "scope": "global", "slot": "api_doc", "group_id": "fixture-global-api", "version_no": 1, "inspection_enabled": False, "inspection_mode": "manual", "read_state": "not_read", "lifecycle_status": "registered", "added_at": "2026-10-20T09:00:00+08:00"},
+    {"id": "fixture-global-supp", "name": "公共联调登记", "type": "link", "url": "https://example.com/api-log", "status": "registered", "active": True, "scope": "global", "slot": "supplementary", "group_id": "fixture-global-supp", "version_no": 1, "inspection_enabled": False, "inspection_mode": "manual", "read_state": "not_read", "lifecycle_status": "registered", "added_at": "2026-10-21T09:00:00+08:00"},
+    {"id": "fixture-1342-supp", "name": "PM 沟通截图", "type": "file", "filename": "pm-chat.png", "status": "registered", "active": True, "scope": "iteration", "iteration_id": "iter-fixture-1", "slot": "supplementary", "group_id": "fixture-1342-supp", "version_no": 1, "inspection_enabled": False, "inspection_mode": "manual", "read_state": "not_read", "lifecycle_status": "registered", "added_at": "2026-11-12T09:00:00+08:00", "attachments": [{"filename": "note.txt", "summary": "PM 补充确认", "download_url": "/fixture-note.txt"}]},
+    {"id": "fixture-old-figma", "name": "13.4.1 历史 Figma", "type": "link", "url": "https://figma.com/file/old", "status": "registered", "active": True, "scope": "iteration", "iteration_id": "iter-fixture-old", "slot": "figma", "group_id": "fixture-old-figma", "version_no": 1, "inspection_enabled": False, "inspection_mode": "manual", "read_state": "not_read", "lifecycle_status": "registered", "added_at": "2026-10-10T09:00:00+08:00"},
+    {"id": "fixture-old-supp", "name": "13.4.1 验收记录", "type": "link", "url": "https://example.com/old-qa", "status": "registered", "active": True, "scope": "iteration", "iteration_id": "iter-fixture-old", "slot": "supplementary", "group_id": "fixture-old-supp", "version_no": 1, "inspection_enabled": False, "inspection_mode": "manual", "read_state": "not_read", "lifecycle_status": "registered", "added_at": "2026-10-11T09:00:00+08:00"},
+])
+
+for _source in sources:
+    if _source.get("scope"):
+        continue
+    if _source.get("slot") == "api_doc":
+        _source["scope"] = "global"
+        _source["iteration_id"] = None
+    else:
+        _source["scope"] = "iteration"
+        _source["iteration_id"] = "iter-fixture-old" if _source["id"] == "fixture-removed" else "iter-fixture-1"
+
+for _record in records:
+    if _record["type"] == "task":
+        _record.pop("iteration_id", None)
+    elif _record["id"] == "fixture-work-yesterday":
+        _record["iteration_id"] = "iter-fixture-old"
+    elif _record["id"] in {"fixture-work-today", "fixture-work-unknown", "fixture-held"}:
+        _record["iteration_id"] = "iter-fixture-1"
+
 # 六阶段流水线 fixture：覆盖旧记录、active、blocked、rework、第 4 阶段子步骤与接口失败。
 WORKFLOW_TEMPLATE = {
     "id": "dev-standard", "version": 1, "name": "开发标准流程",
@@ -109,10 +136,12 @@ records += [
 ]
 
 FIXTURE_ITERATIONS = [
-    {"id": "iter-fixture-1", "version_tag": "v13.4.2", "title": "13.4.2 智能相册与AI音乐优化", "status": "active",
-     "target_release_date": "2026-11-30", "description": "包含 Wan3.0 适配、本地音乐列表滚动优化及埋点修复"},
-    {"id": "iter-fixture-old", "version_tag": "v13.4.1", "title": "13.4.1 历史已发布迭代", "status": "released",
-     "target_release_date": "2026-10-31", "description": "历史迭代"}
+    {"id": "iter-fixture-old", "version_tag": "13.4.1", "title": "13.4.1 历史已发布迭代", "status": "released",
+     "order": 0, "created_at": "2026-10-01T09:00:00+08:00",
+     "target_release_date": "2026-10-31", "description": "历史迭代"},
+    {"id": "iter-fixture-1", "version_tag": "13.4.2 迭代二", "title": "13.4.2 迭代二", "status": "active",
+     "order": 1, "created_at": "2026-11-01T09:00:00+08:00",
+     "target_release_date": "2026-11-30", "description": "包含 Wan3.0 适配、本地音乐列表滚动优化及埋点修复"}
 ]
 
 
@@ -124,6 +153,24 @@ def make_context(title):
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(WEB), **kwargs)
     def log_message(self, *_): pass
+    def do_POST(self):
+        import re
+        path = urlparse(self.path).path
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        match = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/location", path)
+        if match:
+            source = next((item for item in sources if item["id"] == match.group(1)), None)
+            if not source:
+                return self.respond({"error": "source_not_found"}, 404)
+            group_id = source.get("group_id") or source["id"]
+            members = [item for item in sources if (item.get("group_id") or item["id"]) == group_id]
+            for member in members:
+                member["scope"] = body.get("scope")
+                member["iteration_id"] = body.get("iteration_id") if body.get("scope") == "iteration" else None
+                member["slot"] = body.get("slot")
+            return self.respond({"revision": 2, "group_size": len(members), "source": source})
+        return self.respond({"error": "unsupported"}, 405)
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/dashboard":

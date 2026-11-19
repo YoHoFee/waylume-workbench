@@ -2397,44 +2397,86 @@ body[data-theme="dark"] .iteration-status-pill.pending_release{background:#182a4
   .archive-block-actions .library-text-button{min-height:30px}
 }
 
-/* 版本管理弹窗 ---------------------------------------------------------- */
-.iteration-manager-dialog{width:min(680px,calc(100vw - 24px));max-height:90vh}
-.iteration-manager-body{display:grid;gap:18px;padding:16px 18px 20px;overflow-y:auto;overscroll-behavior:contain}
-.manager-section{display:grid;gap:8px;min-width:0}
-.manager-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px}
-.manager-section-head h3{margin:0;color:#1d1d1f;font-size:14px;font-weight:650}
-.manager-section-head p{margin:3px 0 0;color:#6e6e73;font-size:11px;line-height:1.45}
-.iteration-manager-list,.iteration-assign-list{display:grid;gap:6px;margin:0;padding:0;list-style:none;min-width:0}
-.iteration-manager-row{display:flex;align-items:center;gap:10px;min-width:0;padding:10px 11px;border:1px solid #e5e5ea;border-radius:12px;background:#fff}
-.iteration-manager-index{display:inline-grid;place-items:center;flex:none;width:22px;height:22px;border-radius:999px;background:#f5f5f7;color:#6e6e73;font-size:10.5px;font-weight:650;font-variant-numeric:tabular-nums}
-.iteration-manager-copy{display:grid;gap:2px;min-width:0;flex:1}
-.iteration-manager-title-line{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}
-.iteration-manager-name{min-width:0;color:#1d1d1f;font-size:13px;font-weight:650;line-height:1.35;overflow-wrap:anywhere}
-.iteration-manager-meta{color:#6e6e73;font-size:10.5px;line-height:1.4}
-.iteration-manager-actions{display:flex;align-items:center;gap:4px;flex:none;flex-wrap:wrap;justify-content:flex-end}
-.iteration-manager-action{min-height:26px;padding:3px 7px;border:1px solid #e5e5ea;border-radius:8px;background:#fff;color:#1d1d1f;font-size:10.5px;font-weight:600;cursor:pointer}
-.iteration-manager-action:hover{background:#f5f5f7}
-.iteration-manager-action:disabled{opacity:.4;cursor:not-allowed}
-.iteration-manager-action.is-release{color:#0071e3;border-color:#0071e355;background:#0071e310}
-.iteration-manager-action:focus-visible,.iteration-assign-select:focus-visible{outline:2px solid #0071e3;outline-offset:2px}
-.iteration-assign-row{display:flex;align-items:center;gap:10px;min-width:0;padding:8px 11px;border:1px solid #e5e5ea;border-radius:11px;background:#fff}
-.iteration-assign-copy{display:grid;gap:1px;min-width:0;flex:1}
-.iteration-assign-id{color:#86868b;font-size:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.iteration-assign-title{min-width:0;color:#1d1d1f;font-size:12px;font-weight:550;line-height:1.4;overflow-wrap:anywhere}
-.iteration-assign-select{flex:none;max-width:190px;min-height:30px;padding:4px 8px;border:1px solid #d1d1d6;border-radius:8px;background:#fff;color:#1d1d1f;font-size:11px}
-body[data-theme="dark"] .iteration-manager-row,body[data-theme="dark"] .iteration-assign-row{background:#2c2c2e;border-color:#ffffff1c}
-body[data-theme="dark"] .iteration-manager-name,body[data-theme="dark"] .iteration-assign-title,body[data-theme="dark"] .manager-section-head h3{color:#f5f5f7}
-body[data-theme="dark"] .manager-section-head p,body[data-theme="dark"] .iteration-manager-meta,body[data-theme="dark"] .iteration-assign-id{color:#a1a1a6}
-body[data-theme="dark"] .iteration-manager-index{background:#3a3a3c;color:#d1d1d6}
-body[data-theme="dark"] .iteration-manager-action,body[data-theme="dark"] .iteration-assign-select{background:#2c2c2e;border-color:#ffffff24;color:#f5f5f7}
-body[data-theme="dark"] .iteration-manager-action:hover{background:#3a3a3c}
-body[data-theme="dark"] .iteration-manager-action.is-release{background:#0a84ff20;border-color:#0a84ff66;color:#64b5ff}
-@media(max-width:520px){
-  .iteration-manager-body{padding:12px 12px 16px}
-  .iteration-manager-row,.iteration-assign-row{flex-wrap:wrap}
-  .iteration-manager-actions,.iteration-assign-select{width:100%;max-width:none;justify-content:flex-start}
+/* 版本管理弹窗（ROUND5） ------------------------------------------------ */
+.iteration-manager-dialog{
+  width:min(720px,calc(100vw - 24px));max-height:min(86vh,760px);padding:0;
+  border:1px solid #00000014;border-radius:22px;background:#f5f5f7;color:#1d1d1f;
+  box-shadow:0 30px 90px #00000038;overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","Noto Sans SC",sans-serif;
 }
-
+.iteration-manager-dialog::backdrop{background:#00000045}
+.iteration-manager-dialog .manager-shell{display:flex;flex-direction:column;max-height:min(86vh,760px);min-height:0;background:#f5f5f7}
+.manager-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex:none;padding:22px 24px 16px;border-bottom:1px solid #0000000f;background:#f5f5f7}
+.manager-heading{display:grid;gap:3px;min-width:0}
+.manager-kicker{color:#6e6e73;font-size:11px;font-weight:600;letter-spacing:.05em}
+.manager-heading h2{margin:0;color:#1d1d1f;font-size:18px;font-weight:600;line-height:1.3;letter-spacing:-.015em;overflow-wrap:anywhere}
+.manager-subtitle{margin:0;color:#6e6e73;font-size:12px;line-height:1.45}
+.manager-hero-actions{display:flex;align-items:center;gap:8px;flex:none}
+.manager-primary{min-height:32px;padding:6px 13px;border:0;border-radius:9px;background:#0071e3;color:#fff;font-size:12px;font-weight:600;line-height:1.2;cursor:pointer;white-space:nowrap;transition:background-color 160ms ease,transform 160ms ease}
+.manager-primary:hover{background:#0066cc}
+.manager-primary:active{transform:translateY(1px)}
+.manager-primary:focus-visible{outline:2px solid #0071e3;outline-offset:3px}
+.iteration-manager-dialog .dialog-close{width:32px;height:32px;border:1px solid #00000014;background:#fff;color:#6e6e73;box-shadow:0 1px 2px #0000000a}
+.iteration-manager-dialog .dialog-close:hover{background:#f0f0f2;color:#1d1d1f}
+.iteration-manager-body{display:flex;flex-direction:column;min-height:0;padding:16px 24px 22px;overflow:hidden}
+.manager-section{display:flex;flex-direction:column;gap:10px;min-height:0;flex:1}
+.manager-list-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:0 2px}
+.manager-list-head h3{margin:0;color:#1d1d1f;font-size:13px;font-weight:600;letter-spacing:-.01em}
+.manager-list-count{color:#86868b;font-size:11px;font-variant-numeric:tabular-nums}
+.iteration-manager-list{display:flex;flex-direction:column;gap:8px;margin:0;padding:2px;list-style:none;min-height:0;max-height:min(52vh,460px);overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.iteration-manager-row{display:flex;align-items:center;gap:12px;min-width:0;padding:12px 14px;border:1px solid #0000000f;border-radius:16px;background:#fff;box-shadow:0 1px 2px #00000008;transition:border-color 160ms ease,box-shadow 160ms ease,transform 160ms ease}
+.iteration-manager-row:hover{border-color:#00000024;box-shadow:0 6px 20px #0000000f}
+.iteration-manager-row:focus-within{border-color:#0071e355;box-shadow:0 0 0 3px #0071e310}
+.iteration-manager-row.is-released{background:#fbfbfc}
+.iteration-manager-index{display:inline-grid;place-items:center;flex:none;width:26px;height:26px;border-radius:99px;background:#f5f5f7;color:#86868b;font-size:10px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:.02em}
+.iteration-manager-copy{display:grid;gap:3px;min-width:0;flex:1}
+.iteration-manager-title-line{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+.iteration-manager-name{min-width:0;color:#1d1d1f;font-size:14px;font-weight:600;line-height:1.35;letter-spacing:-.01em;overflow-wrap:anywhere}
+.iteration-manager-row.is-released .iteration-manager-name{color:#3a3a3c}
+.iteration-manager-meta{color:#6e6e73;font-size:11px;line-height:1.4;font-variant-numeric:tabular-nums}
+.iteration-manager-actions{display:flex;align-items:center;gap:2px;flex:none;flex-wrap:wrap;justify-content:flex-end}
+.iteration-manager-action{min-height:30px;padding:4px 9px;border:1px solid transparent;border-radius:8px;background:transparent;color:#6e6e73;font-size:11px;font-weight:550;line-height:1.2;cursor:pointer;white-space:nowrap;transition:background-color 160ms ease,color 160ms ease,border-color 160ms ease}
+.iteration-manager-action:hover{background:#f0f0f2;color:#1d1d1f}
+.iteration-manager-action:focus-visible{outline:2px solid #0071e3;outline-offset:2px}
+.iteration-manager-action:disabled{opacity:.35;cursor:not-allowed;background:transparent}
+.iteration-manager-action.is-release{color:#0071e3;border-color:#0071e333;background:#0071e30d}
+.iteration-manager-action.is-release:hover{background:#0071e31a}
+.manager-empty{margin:6px 2px 0;padding:22px 12px;border:1px dashed #0000001f;border-radius:14px;color:#6e6e73;font-size:12px;line-height:1.5;text-align:center}
+.manager-busy{margin:0;padding:8px 10px;border-radius:9px;background:#f0f0f2;color:#6e6e73;font-size:11px;line-height:1.4}
+.manager-busy[hidden],.manager-empty[hidden]{display:none}
+.iteration-manager-dialog.is-busy .iteration-manager-list{opacity:.72}
+body[data-theme="dark"] .iteration-manager-dialog{background:#1c1c1e;color:#f5f5f7;border-color:#ffffff1c;box-shadow:0 30px 90px #00000080}
+body[data-theme="dark"] .iteration-manager-dialog .manager-shell,body[data-theme="dark"] .iteration-manager-dialog .manager-hero{background:#1c1c1e}
+body[data-theme="dark"] .manager-hero{border-bottom-color:#ffffff17}
+body[data-theme="dark"] .manager-kicker,body[data-theme="dark"] .manager-subtitle,body[data-theme="dark"] .manager-list-count,body[data-theme="dark"] .iteration-manager-meta{color:#98989d}
+body[data-theme="dark"] .manager-heading h2,body[data-theme="dark"] .iteration-manager-name,body[data-theme="dark"] .manager-list-head h3{color:#f5f5f7}
+body[data-theme="dark"] .iteration-manager-row{background:#2c2c2e;border-color:#ffffff1c;box-shadow:none}
+body[data-theme="dark"] .iteration-manager-row:hover{border-color:#ffffff30;box-shadow:0 8px 26px #00000038}
+body[data-theme="dark"] .iteration-manager-row.is-released{background:#242426}
+body[data-theme="dark"] .iteration-manager-row.is-released .iteration-manager-name{color:#d1d1d6}
+body[data-theme="dark"] .iteration-manager-index{background:#3a3a3c;color:#a1a1a6}
+body[data-theme="dark"] .iteration-manager-action{color:#a1a1a6}
+body[data-theme="dark"] .iteration-manager-action:hover{background:#3a3a3c;color:#f5f5f7}
+body[data-theme="dark"] .iteration-manager-action.is-release{color:#64b5ff;border-color:#0a84ff59;background:#0a84ff1f}
+body[data-theme="dark"] .iteration-manager-dialog .dialog-close{background:#2c2c2e;border-color:#ffffff1c;color:#a1a1a6}
+body[data-theme="dark"] .manager-empty{border-color:#ffffff24;color:#a1a1a6}
+body[data-theme="dark"] .manager-busy{background:#2c2c2e;color:#a1a1a6}
+@media(max-width:520px){
+  .iteration-manager-dialog{width:calc(100vw - 12px);max-height:92vh;border-radius:18px}
+  .iteration-manager-dialog .manager-shell{max-height:92vh}
+  .manager-hero{padding:16px 16px 12px;gap:12px;flex-wrap:wrap}
+  .manager-heading h2{font-size:17px}
+  .iteration-manager-body{padding:12px 16px 18px}
+  .iteration-manager-list{max-height:56vh}
+  .iteration-manager-row{flex-wrap:wrap;gap:8px;padding:11px 12px}
+  .iteration-manager-actions{width:100%;justify-content:flex-start;padding-left:38px}
+}
+@media(max-width:380px){
+  .manager-hero{padding:14px 12px 10px}
+  .iteration-manager-body{padding:10px 12px 14px}
+  .iteration-manager-actions{padding-left:0}
+  .manager-primary{padding:6px 11px}
+}
 /* 移动材料 -------------------------------------------------------------- */
 .relocate-current,.relocate-group-hint{margin:0;font-size:11.5px;line-height:1.5;color:#6e6e73}
 .relocate-current{padding:8px 10px;border-radius:9px;background:#f5f5f7}

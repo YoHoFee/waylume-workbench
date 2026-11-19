@@ -972,7 +972,7 @@
       const iteration = iterationById(context.iterationId);
       node.textContent = iteration
         ? `添加到：${iterationName(iteration)} · ${slotLabel(slot)}。`
-        : "还没有版本可添加资料；请先在「编辑迭代」中新建版本。";
+        : "还没有版本可添加资料；请先在「编辑版本」中新建版本。";
     }
   }
   function makeReleasedArchiveHeading(count) {
@@ -1017,7 +1017,7 @@
     const empty = $("#archive-empty");
     const noVersions = activeScope === "iteration" && archive.iterations.length === 0;
     empty.hidden = !noVersions;
-    if (noVersions) empty.textContent = "还没有版本。请先在「编辑迭代」中新建版本，再把资料按版本归档。";
+    if (noVersions) empty.textContent = "还没有版本。请先在「编辑版本」中新建版本，再把资料按版本归档。";
 
     if (!state.libraryAddContext || (state.libraryAddContext.scope !== activeScope)) {
       state.libraryAddContext = defaultAddContext(activeScope);
@@ -1143,7 +1143,7 @@
     if (file && file.size > 15 * 1024 * 1024) { sourceFeedback("文件超过 15 MiB，请选择更小的文件。", "error"); return; }
     const scope = context.scope === "global" ? "global" : "iteration";
     const iteration_id = scope === "iteration" ? context.iterationId : null;
-    if (scope === "iteration" && !iteration_id) { sourceFeedback("请先在「编辑迭代」中新建版本，再添加版本资料。", "error"); return; }
+    if (scope === "iteration" && !iteration_id) { sourceFeedback("请先在「编辑版本」中新建版本，再添加版本资料。", "error"); return; }
     const slot = group?.slot || $("#library-add-slot").value || "supplementary";
     const versionLabel = $("#library-add-version").value.trim() || null;
     const category = model.archiveSlotLabels[slot] || "补充材料";
@@ -2571,14 +2571,24 @@
     if (!list) return;
     const iterations = orderedIterations();
     const empty = $("#iteration-manager-empty");
+    const count = $("#iteration-manager-count");
+    const loading = $("#iteration-manager-loading");
+    const busy = !!state.iterationBusy;
     if (empty) empty.hidden = iterations.length > 0;
+    if (count) count.textContent = `${iterations.length} 个版本`;
+    if (loading) loading.hidden = !busy;
+    list.setAttribute("aria-busy", String(busy));
+    $("#iteration-manager-dialog")?.classList.toggle("is-busy", busy);
     list.replaceChildren(...iterations.map((iteration, index) => {
       const row = document.createElement("li");
       row.className = "iteration-manager-row";
       row.dataset.iterationId = iteration.id;
+      const released = model.iterationIsReleased(iteration);
+      row.classList.toggle("is-released", released);
       const position = document.createElement("span");
       position.className = "iteration-manager-index";
-      position.textContent = String(index + 1);
+      position.textContent = String(index + 1).padStart(2, "0");
+      position.setAttribute("aria-hidden", "true");
       const copy = document.createElement("div");
       copy.className = "iteration-manager-copy";
       const titleLine = document.createElement("div");
@@ -2597,55 +2607,20 @@
       const actions = document.createElement("div");
       actions.className = "iteration-manager-actions";
       actions.append(
-        makeManagerAction("上移", "up", iteration.id, { disabled: index === 0, title: "上移版本" }),
-        makeManagerAction("下移", "down", iteration.id, { disabled: index === iterations.length - 1, title: "下移版本" }),
-        makeManagerAction("编辑", "edit", iteration.id, { title: "修改版本名、日期或描述" })
+        makeManagerAction("上移", "up", iteration.id, { disabled: busy || index === 0, title: "上移版本（更靠前、更新）" }),
+        makeManagerAction("下移", "down", iteration.id, { disabled: busy || index === iterations.length - 1, title: "下移版本（更靠后、更旧）" }),
+        makeManagerAction("编辑", "edit", iteration.id, { disabled: busy, title: "修改版本名、日期或描述" })
       );
-      if (!model.iterationIsReleased(iteration)) {
-        actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", title: "发布后该版本需求不再支持直接二次修改" }));
+      if (!released) {
+        actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", disabled: busy, title: "发布后该版本需求不再支持直接二次修改" }));
       }
       row.append(position, copy, actions);
       return row;
     }));
-    renderIterationAssignments();
   }
-  function renderIterationAssignments() {
-    const list = $("#iteration-assign-list");
-    if (!list) return;
-    const requirements = (state.data?.requirements || []).slice().sort((a, b) => String(a.display_id || a.id).localeCompare(String(b.display_id || b.id)));
-    const empty = $("#iteration-assign-empty");
-    if (empty) empty.hidden = requirements.length > 0;
-    const iterations = orderedIterations();
-    list.replaceChildren(...requirements.map(record => {
-      const row = document.createElement("li");
-      row.className = "iteration-assign-row";
-      const copy = document.createElement("div");
-      copy.className = "iteration-assign-copy";
-      const id = document.createElement("span");
-      id.className = "iteration-assign-id";
-      id.textContent = record.display_id || record.id;
-      const title = document.createElement("strong");
-      title.className = "iteration-assign-title";
-      title.textContent = record.title;
-      copy.append(id, title);
-      const select = document.createElement("select");
-      select.className = "iteration-assign-select";
-      select.dataset.assignIteration = record.id;
-      select.setAttribute("aria-label", `调整「${record.title}」所属版本`);
-      const none = document.createElement("option");
-      none.value = "";
-      none.textContent = "未归入版本";
-      select.append(none);
-      for (const iteration of iterations) {
-        const option = document.createElement("option");
-        option.value = iteration.id;
-        option.textContent = iterationName(iteration);
-        select.append(option);
-      }
-      select.value = iterations.some(iteration => iteration.id === record.iteration_id) ? record.iteration_id : "";
-      row.append(copy, select);
-      return row;
-    }));
+  function setIterationManagerBusy(busy) {
+    state.iterationBusy = busy;
+    renderIterationManager();
   }
   async function reorderIteration(iterationId, direction) {
     if (state.iterationBusy) return;
@@ -2654,7 +2629,7 @@
     const target = direction === "up" ? index - 1 : index + 1;
     if (index < 0 || target < 0 || target >= ids.length) return;
     [ids[index], ids[target]] = [ids[target], ids[index]];
-    state.iterationBusy = true;
+    setIterationManagerBusy(true);
     try {
       await postAction("/api/iterations/order", { ids });
       await refresh();
@@ -2662,19 +2637,7 @@
     } catch (error) {
       showToast(error.message || "版本顺序更新失败", "error");
     } finally {
-      state.iterationBusy = false;
-    }
-  }
-  async function assignRecordIteration(recordId, iterationId) {
-    try {
-      await postAction(`/api/items/${encodeURIComponent(recordId)}/iteration`, { iteration_id: iterationId || null });
-      const record = (state.data?.requirements || []).find(item => item.id === recordId);
-      if (record) record.iteration_id = iterationId || null;
-      showToast("已更新需求所属版本");
-      await refresh();
-    } catch (error) {
-      showToast(error.message || "所属版本更新失败", "error");
-      renderIterationAssignments();
+      setIterationManagerBusy(false);
     }
   }
   function iterationError(payload, fallback) {
@@ -2793,7 +2756,7 @@
     const iteration = iterationById(iterationId);
     if (!iteration) return;
     if (!window.confirm(`确认将版本「${iterationName(iteration)}」标记为已发布？\n发布后该版本需求不再支持直接二次修改。`)) return;
-    state.iterationBusy = true;
+    setIterationManagerBusy(true);
     try {
       await iterationRequest(`/api/iterations/${encodeURIComponent(iteration.id)}/release`, {});
       showToast(`版本「${iterationName(iteration)}」已标记发布`);
@@ -2801,7 +2764,7 @@
     } catch (error) {
       showToast(error.message || "标记发布失败", "error");
     } finally {
-      state.iterationBusy = false;
+      setIterationManagerBusy(false);
     }
   }
   function relocateSlotOptions(scope) {
@@ -3095,10 +3058,6 @@
     if (action === "up" || action === "down") return reorderIteration(iterationId, action);
     if (action === "edit") return openIterationEditDialog(iterationId);
     if (action === "release") return handleReleaseIteration(iterationId);
-  });
-  $("#iteration-assign-list").addEventListener("change", event => {
-    const select = event.target.closest("[data-assign-iteration]");
-    if (select) assignRecordIteration(select.dataset.assignIteration, select.value);
   });
   const iterCreateBtn = $("#iteration-create-open");
   if (iterCreateBtn) iterCreateBtn.addEventListener("click", openIterationCreateDialog);

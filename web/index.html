@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
     <title>知途 Waylume · AI助理工作台</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261119-archive-4">
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261119-archive-5">
   <script src="/assets/markdown.js?v=20261028-cancelled-terminal-1" defer></script>
-  <script src="/assets/dashboard-model.js?v=20261119-archive-4" defer></script>
-  <script src="/assets/dashboard.js?v=20261119-archive-4" defer></script>
+  <script src="/assets/dashboard-model.js?v=20261119-archive-5" defer></script>
+  <script src="/assets/dashboard.js?v=20261119-archive-5" defer></script>
 </head>
 <body data-theme="minimal">
   <svg class="library-logo-sprite" aria-hidden="true" focusable="false" width="0" height="0">
@@ -82,7 +82,7 @@
     <section class="toolbar" aria-label="工作项筛选">
       <label class="search"><span class="visually-hidden">搜索工作项</span><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索标题、编号、备注" autocomplete="off"></label>
       <label class="archive-toggle"><input id="show-archived" type="checkbox"><span>显示归档</span></label>
-      <button type="button" id="iteration-manager-open" class="toolbar-action" aria-haspopup="dialog">编辑迭代</button>
+      <button type="button" id="iteration-manager-open" class="toolbar-action" aria-haspopup="dialog">编辑版本</button>
     </section>
 
     <div class="inspection-tools global-inspection" id="inspection-tools">
@@ -247,26 +247,27 @@
     </div>
   </dialog>
   <dialog class="iteration-dialog iteration-manager-dialog" id="iteration-manager-dialog" aria-labelledby="iteration-manager-title">
-    <div class="dialog-shell">
-      <div class="dialog-top">
-        <div><span class="dialog-kicker">版本与归属</span><h2 id="iteration-manager-title">编辑迭代</h2></div>
-        <button type="button" class="dialog-close" id="iteration-manager-close" aria-label="关闭编辑迭代">×</button>
-      </div>
+    <div class="dialog-shell manager-shell">
+      <header class="manager-hero">
+        <div class="manager-heading">
+          <span class="manager-kicker">版本管理</span>
+          <h2 id="iteration-manager-title">编辑版本</h2>
+          <p class="manager-subtitle">越靠上越新，首页与资料馆按此顺序展示。</p>
+        </div>
+        <div class="manager-hero-actions">
+          <button type="button" class="manager-primary" id="iteration-create-open">新建版本</button>
+          <button type="button" class="dialog-close" id="iteration-manager-close" aria-label="关闭编辑版本">×</button>
+        </div>
+      </header>
       <div class="iteration-manager-body">
         <section class="manager-section" aria-labelledby="iteration-manager-versions-title">
-          <header class="manager-section-head">
-            <div><h3 id="iteration-manager-versions-title">版本列表</h3><p>这里的顺序就是首页与资料馆的展示顺序。</p></div>
-            <button type="button" class="source-action" id="iteration-create-open">新建版本</button>
-          </header>
+          <div class="manager-list-head">
+            <h3 id="iteration-manager-versions-title">版本列表</h3>
+            <span class="manager-list-count" id="iteration-manager-count"></span>
+          </div>
           <ol class="iteration-manager-list" id="iteration-manager-list"></ol>
-          <p class="library-empty" id="iteration-manager-empty" hidden>还没有版本。新建一个版本后，需求就可以归入版本。</p>
-        </section>
-        <section class="manager-section" aria-labelledby="iteration-manager-assign-title">
-          <header class="manager-section-head">
-            <div><h3 id="iteration-manager-assign-title">需求归属</h3><p>只调整工作需求；委托任务不参与版本分组。</p></div>
-          </header>
-          <p class="library-empty" id="iteration-assign-empty" hidden>暂无工作需求。</p>
-          <ul class="iteration-assign-list" id="iteration-assign-list"></ul>
+          <p class="manager-empty" id="iteration-manager-empty" hidden>还没有版本。新建一个版本后，需求就可以归入版本。</p>
+          <p class="manager-busy" id="iteration-manager-loading" role="status" aria-live="polite" hidden>正在更新版本…</p>
         </section>
       </div>
     </div>

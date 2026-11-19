@@ -17,9 +17,23 @@ class ArchiveUIContractTests(unittest.TestCase):
                          "iteration-release-button", "iteration-id-badge", "iteration-edit-open"):
             self.assertNotIn(f'id="{selector}"', HTML)
         for selector in ("iteration-manager-open", "iteration-manager-dialog", "iteration-manager-list",
-                         "iteration-assign-list", "iteration-create-open", "iteration-dialog",
+                         "iteration-manager-count", "iteration-manager-loading",
+                         "iteration-create-open", "iteration-dialog",
                          "iteration-edit-dialog", "reopen-dialog", "reopen-reason-input", "reopen-audit-mode"):
             self.assertIn(f'id="{selector}"', HTML)
+        self.assertIn('aria-haspopup="dialog">编辑版本</button>', HTML)
+        self.assertIn('<h2 id="iteration-manager-title">编辑版本</h2>', HTML)
+        self.assertIn('aria-label="关闭编辑版本"', HTML)
+        self.assertIn("越靠上越新", HTML)
+        # Assignment editing moved back to the record detail only.
+        self.assertNotIn('id="iteration-assign-list"', HTML)
+        self.assertNotIn('id="iteration-assign-empty"', HTML)
+        self.assertNotIn("需求归属", HTML)
+        self.assertNotIn("renderIterationAssignments", SCRIPT)
+        self.assertNotIn("assignRecordIteration", SCRIPT)
+        self.assertIn('iterSelect.className = "detail-iteration-select"', SCRIPT)
+        self.assertIn('makeManagerAction("上移"', SCRIPT)
+        self.assertIn('makeManagerAction("标记发布"', SCRIPT)
         # One editable version name; no second visible version_tag field.
         self.assertNotIn('id="iteration-tag-input"', HTML)
         self.assertNotIn('id="iteration-edit-tag-input"', HTML)

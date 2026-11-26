@@ -625,9 +625,13 @@ for index in range(24):
             dashboardctl.adopt_task_batch("BUG-1")
         dashboardctl.add_progress("LEGACY-TASK", "progress one", actor="agent", evidence=["local check"])
         dashboardctl.add_progress("LEGACY-TASK", "user correction", actor="user")
-        dashboardctl.add_progress("LEGACY-TASK", "final result", actor="agent", result=True, outcome="partial")
+        with self.assertRaisesRegex(ValueError, "status_line_required"):
+            dashboardctl.add_progress("LEGACY-TASK", "final result", actor="agent", result=True, outcome="partial")
+        dashboardctl.add_progress("LEGACY-TASK", "final result", actor="agent", result=True, outcome="partial",
+                                   status_line="流程已跑通，等待用户验收")
         context = dashboardctl.task_context("LEGACY-TASK")
         self.assertEqual(context["initial_brief"], "initial request")
+        self.assertEqual(context["status_line"], "流程已跑通，等待用户验收")
         self.assertEqual(context["latest_brief"], "final result")
         self.assertEqual([entry["message"] for entry in context["progress"]], ["progress one", "user correction", "final result"])
         self.assertEqual(context["final_result"]["outcome"], "partial")

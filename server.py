@@ -31,7 +31,26 @@ from handoff_view import handoff_view
 
 
 CODE_ROOT = Path(__file__).resolve().parent
+VERSION_FILE = CODE_ROOT / "VERSION"
 ROOT = waylume_paths.data_dir()
+
+
+def read_workbench_build() -> str:
+    """Cache-busting build id from the index.html dashboard.js version query."""
+    try:
+        html = (WEB / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(r"dashboard\.js\?v=([^\"&]+)", html)
+    return match.group(1) if match else ""
+
+
+def read_workbench_version() -> str:
+    try:
+        value = VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0.0.0"
+    return value if re.fullmatch(r"\d+\.\d+\.\d+", value) else "0.0.0"
 WEB = CODE_ROOT / "web"
 STORE = ROOT / "store.json"
 SCOPE_CATALOG = ROOT / "scope-catalog.json"
@@ -341,6 +360,38 @@ def load_scope_catalog() -> dict:
     return catalog
 
 
+_CREATION_TIMES_CACHE: dict[str, Any] = {"key": None, "data": {}}
+
+
+def _cached_task_creation_times() -> dict[str, str]:
+    events_path = dashboardctl.EVENTS
+    try:
+        st = events_path.stat()
+        cache_key = (str(events_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _CREATION_TIMES_CACHE["key"] == cache_key:
+        return _CREATION_TIMES_CACHE["data"]
+
+    def creation_times() -> dict[str, str]:
+        created = {}
+        try:
+            with events_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try: event = json.loads(line)
+                    except json.JSONDecodeError: continue
+                    if event.get("type") == "task" and event.get("action") == "create":
+                        created.setdefault(str(event.get("id") or ""), str(event.get("at") or ""))
+        except OSError:
+            pass
+        return created
+
+    data = dashboardctl.with_lock(creation_times)
+    _CREATION_TIMES_CACHE["key"] = cache_key
+    _CREATION_TIMES_CACHE["data"] = data
+    return data
+
+
 def build_payload() -> dict:
     """Expose only records explicitly entered into the local structured store."""
     if STORE.is_file() or (dashboardctl.ROOT / "meta.json").is_file():
@@ -351,25 +402,18 @@ def build_payload() -> dict:
     else:
         db = {"sources": []}
         records, sync, revision = [], {}, 0
-    records = [{**item, "display_id": (item["id"] if re.fullmatch(r"ZT-T-[A-F0-9]{12}", item.get("id", "")) else "ZT-L-" + hashlib.sha256(item["id"].encode()).hexdigest()[:12].upper())} if item.get("type") == "task" and isinstance(item.get("id"), str) else item for item in records]
+    # Legacy tasks keep their historical display alias. New numeric ids are a
+    # single primary identifier: never synthesize a second display id for them.
+    records = [{**item, "display_id": (item["id"] if re.fullmatch(r"ZT-T-[A-F0-9]{12}", item.get("id", "")) else "ZT-L-" + hashlib.sha256(item["id"].encode()).hexdigest()[:12].upper())}
+               if item.get("type") == "task" and isinstance(item.get("id"), str)
+               and not dashboardctl.NUMERIC_RECORD_ID_RE.fullmatch(item["id"]) else item
+               for item in records]
     grouped = {
         "requirements": [item for item in records if item.get("type") == "work"],
         "bugs": [item for item in records if item.get("type") == "bug"],
         "delegated": [item for item in records if item.get("type") == "task"],
     }
-    def creation_times() -> dict[str, str]:
-        created = {}
-        try:
-            with dashboardctl.EVENTS.open(encoding="utf-8") as stream:
-                for line in stream:
-                    try: event = json.loads(line)
-                    except json.JSONDecodeError: continue
-                    if event.get("type") == "task" and event.get("action") == "create":
-                        created.setdefault(str(event.get("id") or ""), str(event.get("at") or ""))
-        except OSError:
-            pass
-        return created
-    task_created_at = dashboardctl.with_lock(creation_times)
+    task_created_at = _cached_task_creation_times()
     for items in grouped.values():
         for item in items:
             item["source_status"] = item.get("status")
@@ -411,6 +455,8 @@ def build_payload() -> dict:
     library_sources = dashboardctl.enrich_source_records(active_sources, all_sources)
     return {
         "generated_at": now_local(),
+        "version": read_workbench_version(),
+        "build": read_workbench_build(),
         "data_state": "ready" if records else "empty",
         # `revision` is retained as the dashboard-wide store token for existing readers.
         "revision": revision,
@@ -451,6 +497,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(total))
         self.end_headers()
 
+    def _stream_events(self) -> None:
+        """Server-sent events: notify open dashboards as soon as the store revision changes."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        last_revision = None
+        try:
+            while True:
+                try:
+                    db = dashboardctl.load_store()
+                    revision = int(db.get("revision", 0) or 0)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    revision = 0
+                if revision != last_revision:
+                    payload = json.dumps({"revision": revision}, ensure_ascii=False)
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_revision = revision
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
     def do_GET(self) -> None:  # noqa: N802
         route = urlsplit(self.path).path
         if route == "/api/data-location":
@@ -469,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             if not it:
                 self._send_json({"error": "iteration_not_found"}, status=404)
             else:
-                self._send_json({"iteration": it})
+                self._send_json({"iteration": dashboardctl._iteration_public(it)})
             return
         if route == "/api/archive/context":
             query = parse_qs(urlsplit(self.path).query)
@@ -533,6 +603,16 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "source_not_found"}, status=404)
             return
+        if route == "/api/sources/preview":
+            query = parse_qs(urlsplit(self.path).query)
+            url = (query.get("url") or [""])[0]
+            try:
+                self._send_json(dashboardctl.preview_source_link(url))
+            except ValueError as exc:
+                code = dashboardctl.error_code(exc)
+                status = 400 if code == "invalid_source_url" else 502
+                self._send_json({"error": code}, status=status)
+            return
         if route == "/api/sources":
             query = parse_qs(urlsplit(self.path).query)
             include_removed = query.get("include_removed") == ["1"]
@@ -569,7 +649,37 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if route == "/api/dashboard":
+            since_revision = (parse_qs(urlsplit(self.path).query).get("since_revision") or [""])[0]
+            if since_revision:
+                if STORE.is_file() or (dashboardctl.ROOT / "meta.json").is_file():
+                    db = dashboardctl.load_store()
+                    revision = db.get("revision", 0)
+                    records = db.get("records", [])
+                    sync = db.get("sync", {})
+                else:
+                    revision, records, sync = 0, [], {}
+                scope_rev = load_scope_catalog().get("revision", 0)
+                build = read_workbench_build()
+                token = f"{revision}:{scope_rev}:{build}"
+                has_active_agent = any(item.get("agent_state") == "active" and dashboardctl.has_fresh_agent_owner(item) for item in records)
+                if since_revision == token and not has_active_agent:
+                    self._send_json({
+                        "unchanged": True,
+                        "generated_at": now_local(),
+                        "version": read_workbench_version(),
+                        "build": build,
+                        "revision": revision,
+                        "store_revision": revision,
+                        "sync": sync,
+                    })
+                    return
             self._send_json(build_payload())
+            return
+        if route == "/api/version":
+            self._send_json({"version": read_workbench_version(), "build": read_workbench_build()})
+            return
+        if route == "/api/events":
+            self._stream_events()
             return
         if route == "/api/workflow/templates":
             self._send_json({"templates": workflow.templates()})
@@ -590,6 +700,27 @@ class Handler(BaseHTTPRequestHandler):
                 detail = getattr(exc, "detail", None)
                 self._send_api_error(ApiError(404 if code == "record_not_found" else 400, code,
                                               detail if isinstance(detail, dict) else None))
+            return
+        evidence_file = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/evidence-file", route)
+        if evidence_file:
+            query = parse_qs(urlsplit(self.path).query)
+            evidence_path = (query.get("path") or [""])[0]
+            try:
+                result = dashboardctl.read_workflow_evidence_file(evidence_file.group(1), evidence_path)
+            except ValueError as exc:
+                code = dashboardctl.error_code(exc)
+                status = 415 if code in {"evidence_too_large", "evidence_not_text"} else 404
+                self._send_json({"error": code}, status=status)
+                return
+            body = result["text"].encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if route == "/api/scopes":
             try:
@@ -641,6 +772,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/bug-inspection/status":
             self._send_json(bug_inspection_status())
+            return
+        if route.startswith("/api/inspections"):
+            query = parse_qs(urlsplit(self.path).query)
+            date = (query.get("date") or [""])[0] or None
+            try:
+                self._send_json(dashboardctl.inspection_runs(date))
+            except ValueError:
+                self._send_json({"error": "invalid_inspection_query"}, status=400)
             return
         if route == "/api/followups/pending":
             db = dashboardctl.load_store()
@@ -716,20 +855,23 @@ class Handler(BaseHTTPRequestHandler):
                 result["attachment"]["download_url"] = f"/api/items/{attachment.group(1)}/attachments/{filename}"
                 self._send_json(result, status=201); return
             if route == "/api/iterations":
-                self._only_keys(payload, {"version_tag", "title", "status", "target_release_date", "description", "iteration_id", "order"})
+                self._only_keys(payload, {"version_tag", "title", "status", "target_release_date", "description", "iteration_id", "order", "version_type"})
                 version_tag = payload.get("version_tag")
                 title = payload.get("title")
                 order = payload.get("order")
+                version_type = payload.get("version_type")
                 if (not isinstance(version_tag, str) or not isinstance(title, str)
+                        or (version_type is not None and version_type not in dashboardctl.VERSION_TYPES)
                         or (order is not None and (isinstance(order, bool) or not isinstance(order, int)))):
                     raise ApiError(400, "invalid_iteration_payload")
                 result = dashboardctl.create_iteration(
                     version_tag, title,
-                    status=payload.get("status", "active"),
+                    status=payload.get("status", "planning"),
                     target_release_date=payload.get("target_release_date"),
                     description=payload.get("description", ""),
                     iteration_id=payload.get("iteration_id"),
-                    order=order
+                    order=order,
+                    version_type=version_type
                 )
                 self._send_json(result, status=201); return
             if route == "/api/iterations/order":
@@ -752,6 +894,15 @@ class Handler(BaseHTTPRequestHandler):
             if iter_update:
                 self._only_keys(payload, {"version_tag", "title", "description", "target_release_date", "status", "notes"})
                 self._send_json(dashboardctl.update_iteration(iter_update.group(1), payload)); return
+            iter_type = re.fullmatch(rf"/api/iterations/({dashboardctl.ITERATION_ID_PATTERN})/type", route)
+            if iter_type:
+                self._only_keys(payload, {"version_type", "dry_run"})
+                version_type = payload.get("version_type")
+                dry_run = payload.get("dry_run", False)
+                if version_type not in dashboardctl.VERSION_TYPES or not isinstance(dry_run, bool):
+                    raise ApiError(400, "invalid_iteration_version_type")
+                self._send_json(dashboardctl.set_iteration_type(
+                    iter_type.group(1), version_type, backup=True, dry_run=dry_run)); return
             item_iteration = re.fullmatch(r"/api/items/([A-Za-z0-9_.:-]{1,120})/iteration", route)
             if item_iteration:
                 self._only_keys(payload, {"iteration_id"})
@@ -856,6 +1007,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._only_keys(payload, {"start", "end"})
                 self._send_json(dashboardctl.set_work_hours(payload.get("start"), payload.get("end")))
                 return
+            if route == "/api/inspections/report":
+                try:
+                    entry = dashboardctl.record_inspection(payload)
+                except ValueError as exc:
+                    self._send_json({"error": dashboardctl.error_code(exc)}, status=400)
+                    return
+                self._send_json({"inspection": entry}, status=201)
+                return
             if route == "/api/bug-inspection/run":
                 self._only_keys(payload, set())
                 if not isinstance(INSPECTION_DISPATCHER, Path) or not INSPECTION_DISPATCHER.is_file():
@@ -898,8 +1057,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": "inspection_dispatch_failed"}, status=503)
                 return
             if route == "/api/sources/link":
-                self._only_keys(payload, {"url", "name", "category", "purpose", "primary", "slot", "group_id", "version_label", "scope", "iteration_id"})
+                self._only_keys(payload, {"url", "name", "category", "purpose", "primary", "slot", "group_id", "version_label", "scope", "iteration_id", "note", "note_masked"})
                 url, name, category = payload.get("url"), payload.get("name"), payload.get("category", "需求资料")
+                note, note_masked = payload.get("note"), payload.get("note_masked")
                 purpose, primary = payload.get("purpose"), payload.get("primary")
                 slot, group_id, version_label = payload.get("slot"), payload.get("group_id"), payload.get("version_label")
                 scope, iteration_id = payload.get("scope"), payload.get("iteration_id")
@@ -907,12 +1067,27 @@ class Handler(BaseHTTPRequestHandler):
                         or (purpose is not None and not isinstance(purpose, str)) or (primary is not None and not isinstance(primary, bool))
                         or (slot is not None and not isinstance(slot, str)) or (group_id is not None and not isinstance(group_id, str))
                         or (version_label is not None and not isinstance(version_label, str))
-                        or (scope is not None and not isinstance(scope, str)) or (iteration_id is not None and not isinstance(iteration_id, str))):
+                        or (scope is not None and not isinstance(scope, str)) or (iteration_id is not None and not isinstance(iteration_id, str))
+                        or (note is not None and not isinstance(note, str)) or (note_masked is not None and not isinstance(note_masked, bool))):
                     raise ApiError(400, "invalid_source_payload")
-                result = dashboardctl.add_source_link(url, name, category, "dashboard", purpose=purpose, primary=primary,
+                result = dashboardctl.add_source_link(url, name, category, "dashboard", purpose=purpose, primary=primary, note=note, note_masked=note_masked,
                                                       slot=slot, group_id=group_id, version_label=version_label,
                                                       scope=scope, iteration_id=iteration_id)
                 self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])}, status=201)
+                return
+            source_edit = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/edit", route)
+            if source_edit:
+                self._only_keys(payload, {"name", "url", "note", "note_masked"})
+                name, url = payload.get("name"), payload.get("url")
+                note, note_masked = payload.get("note"), payload.get("note_masked")
+                if (name is not None and not isinstance(name, str)) or (url is not None and not isinstance(url, str)) \
+                        or (note is not None and not isinstance(note, str)) \
+                        or (note_masked is not None and not isinstance(note_masked, bool)):
+                    raise ApiError(400, "invalid_source_payload")
+                if name is None and url is None and note is None and note_masked is None:
+                    raise ApiError(400, "invalid_source_payload")
+                result = dashboardctl.update_source(source_edit.group(1), name=name, url=url, note=note, note_masked=note_masked)
+                self._send_json({"revision": result["revision"], "source": public_enriched_source(result["source"])})
                 return
             source_inspection = re.fullmatch(r"/api/sources/([A-Za-z0-9_-]{1,100})/inspection", route)
             if source_inspection:

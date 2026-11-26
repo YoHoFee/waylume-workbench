@@ -30,6 +30,11 @@ Before dispatching a code task, read the [parallel Git worktree protocol](../../
 5. Keep status factual. The working agent must choose the appropriate non-linear status (`in_progress`, `developing`, `testing`, `on_hold`, or `completed`) and report changes using the workbench agent update/report interface; testing is not a passed test. Sub-agents must follow the same rule. Active states require an active agent owner; the owner becomes stale after two hours without agent activity, after which use the workbench’s on-hold state. Never fabricate session IDs, verification, approvals, completion, or external updates.
 6. Report meaningful milestones to the original item. Preserve earlier evidence and decisions; append or revise the current summary without deleting useful history. Apply user follow-ups to that item, mark each as handled after acting on it, and report outcome even if blocked.
 7. Before closing, distinguish implementation, review, test/acceptance, Git delivery, and external platform status. State what is verified and what remains unknown.
+8. **One-line status is mandatory before finishing.** Write a single line (≤200 characters, no line breaks) saying where the task stands now, what is next, and any blocker, with `task-result <ID> --summary "…" --message "…"` (the `--summary` flag is required; omitting it fails with `status_line_required`). Use `progress --summary` for mid-task updates or `summary <ID> "…"` to correct it. This line is what the card on the home page shows and what appears first in the detail view; the full progress and result go after it.
+
+## Archiving source files
+
+When you archive or register a source file/link (especially CoDesign/高保真 prototypes), put any access password or share code in that source's `note` field, never in a separate password field. Set `note_masked: true` when the note contains a password so the library hides it by default; ordinary notes stay plaintext. Use `POST /api/sources/<id>/edit` with `{note, note_masked}` (or the same keys on `/api/sources/link` when creating). The note is shown in the source card overview.
 
 ## References
 

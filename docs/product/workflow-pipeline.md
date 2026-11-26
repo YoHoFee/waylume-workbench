@@ -256,6 +256,16 @@ GET /api/items/<ID>/workflow
 
 workflow 为完整对象（含 history）；template 为模板定义。旧记录无 workflow：workflow null，HTTP 200。
 
+### 6.2.1 证据全文（只读）
+
+~~~text
+GET /api/items/<ID>/evidence-file?path=<URL-encoded evidence string>
+~~~
+
+仅允许读取该事项 `workflow.gates[*].evidence` 与 `workflow.history[*].evidence` 中**逐字记录过**的路径；请求值必须与记录值一致（去除首尾空白后比较）。允许根目录为当前数据目录、`~/.waylume`、`/tmp`（含 macOS `/private/tmp`）与项目仓库；相对路径先按项目仓库、再按数据目录解析。拒绝包含 `..` 的路径和解析后逃逸出允许根目录的路径（含符号链接）。文件必须是普通文件、只读、≤128 KiB、UTF-8 文本。
+
+成功返回 `text/plain; charset=utf-8` 原文；未记录/不存在/目录返回 404，超限或非文本返回 415。该接口只读，不写 events、不修改 evidence。
+
 ### 6.3 写操作
 
 ~~~text
@@ -317,7 +327,7 @@ POST /api/items/<ID>/workflow/close
 
 ### 8.1 详情卡
 
-在事项详情标题和“目前进展”之间加入“流水线”section：
+在事项详情标题和“交接信息”之间加入“流水线”section：
 
 - 桌面端横向 6 步 stepper；窄屏纵向/可横向滚动。
 - 每一步显示序号、短 label、owner 角色。

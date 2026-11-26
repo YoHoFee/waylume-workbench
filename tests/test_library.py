@@ -235,6 +235,25 @@ class LibraryApiTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_source_edit_api_updates_name_and_link_without_changing_identity(self):
+        _, first = self.send("POST", "/api/sources/link", {"name": "资料 A", "url": "https://example.com/a"})
+        _, second = self.send("POST", "/api/sources/link", {"name": "资料 B", "url": "https://example.com/b"})
+        source = first["source"]
+        status, edited = self.send("POST", f"/api/sources/{source['id']}/edit",
+                                   {"name": "资料 A · 编辑", "url": "https://example.com/a-new"})
+        self.assertEqual(status, 200)
+        self.assertEqual(edited["source"]["id"], source["id"])
+        self.assertEqual(edited["source"]["name"], "资料 A · 编辑")
+        self.assertEqual(edited["source"]["url"], "https://example.com/a-new")
+        self.assertEqual(edited["source"]["group_id"], source["group_id"])
+        status, duplicate = self.send("POST", f"/api/sources/{source['id']}/edit",
+                                      {"url": second["source"]["url"]})
+        self.assertEqual((status, duplicate["error"]), (409, "source_duplicate"))
+        status, invalid = self.send("POST", f"/api/sources/{source['id']}/edit", {"url": "ftp://example.com/x"})
+        self.assertEqual((status, invalid["error"]), (400, "invalid_source_url"))
+        status, missing = self.send("POST", "/api/sources/missing/edit", {"name": "x"})
+        self.assertEqual((status, missing["error"]), (404, "source_not_found"))
+
     def test_source_api_accepts_versions_inspection_and_slot_changes(self):
         status, first = self.send("POST", "/api/sources/link", {
             "name": "需求文档", "url": "https://example.com/doc-1", "slot": "requirement_doc", "version_label": "初稿"
@@ -326,6 +345,112 @@ class LibraryApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(read_state["source"]["last_inspection_success_at"], "2026-11-13T10:00:00+08:00")
         self.assertEqual(read_state["source"]["last_inspection_status"], "success")
+
+
+class SourceEditAndPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.patchers = [
+            patch.object(dashboardctl, "ROOT", self.root),
+            patch.object(dashboardctl, "STORE", self.root / "store.json"),
+            patch.object(dashboardctl, "LOCK", self.root / ".store.lock"),
+            patch.object(dashboardctl, "EVENTS", self.root / "events.jsonl"),
+            patch.object(dashboardctl, "UPLOADS", self.root / "sources" / "uploads"),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+        dashboardctl.atomic_write({"schema_version": 1, "revision": 0, "records": [], "sources": []})
+
+    def tearDown(self):
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        self.temp.cleanup()
+
+    def test_update_source_renames_and_relinks_without_changing_id(self):
+        source = dashboardctl.add_source_link("https://example.com/old", "旧名字")["source"]
+        updated = dashboardctl.update_source(source["id"], name=" 新名字  ", url="https://example.com/new")["source"]
+        self.assertEqual(updated["id"], source["id"])
+        self.assertEqual(updated["name"], "新名字")
+        self.assertEqual(updated["url"], "https://example.com/new")
+        self.assertEqual(updated["normalized_url"], "https://example.com/new")
+
+    def test_update_source_name_keeps_visible_override_in_sync(self):
+        source = dashboardctl.add_source_link("https://example.com/override", "原始名字")["source"]
+        dashboardctl.override_source(source["id"], {"name": "整理后的名字"})
+        updated = dashboardctl.update_source(source["id"], name="再次编辑")["source"]
+        self.assertEqual(updated["name"], "再次编辑")
+        self.assertEqual(updated["overrides"]["name"], "再次编辑")
+
+    def test_update_source_rejects_duplicate_link(self):
+        first = dashboardctl.add_source_link("https://example.com/a", "A")["source"]
+        dashboardctl.add_source_link("https://example.com/b", "B")
+        with self.assertRaisesRegex(ValueError, "source_duplicate"):
+            dashboardctl.update_source(first["id"], url="https://example.com/b")
+
+    def test_update_source_rejects_invalid_arguments(self):
+        source = dashboardctl.add_source_link("https://example.com/a", "A")["source"]
+        with self.assertRaisesRegex(ValueError, "invalid_source_update"):
+            dashboardctl.update_source(source["id"])
+        with self.assertRaisesRegex(ValueError, "invalid_source_name"):
+            dashboardctl.update_source(source["id"], name="   ")
+        with self.assertRaisesRegex(ValueError, "invalid_source_url"):
+            dashboardctl.update_source(source["id"], url="ftp://example.com/x")
+
+    def test_inspection_runs_summarize_today_with_titles(self):
+        db = dashboardctl.load_store()
+        db["records"].append(dashboardctl.normalize_record({
+            "id": "BUG-INSPECT-1", "type": "bug", "title": "巡检新增 BUG", "status": "pending"}))
+        db["records"].append(dashboardctl.normalize_record({
+            "id": "1009", "type": "work", "title": "巡检新增需求", "status": "pending"}))
+        dashboardctl.atomic_write(db)
+        entry = dashboardctl.record_inspection({"status": "succeeded", "new_bugs": ["BUG-INSPECT-1"],
+                                                 "new_requirements": ["1009"], "notes": "一轮"})
+        self.assertTrue(entry["at"])
+        summary = dashboardctl.inspection_runs(entry["at"][:10])
+        self.assertEqual(summary["new_bug_count"], 1)
+        self.assertEqual(summary["new_requirement_count"], 1)
+        run = summary["runs"][0]
+        self.assertEqual(run["new_bugs"][0]["title"], "巡检新增 BUG")
+        self.assertEqual(run["new_requirements"][0]["type"], "work")
+        with self.assertRaisesRegex(ValueError, "invalid_inspection_status"):
+            dashboardctl.record_inspection({"status": "nope"})
+
+    def test_source_note_supports_plain_and_masked_text(self):
+        source = dashboardctl.add_source_link("https://codesign.qq.com/s/2", "原型")["source"]
+        updated = dashboardctl.update_source(source["id"], note="访问密码：IUUR", note_masked=True)["source"]
+        self.assertEqual(updated["note"], "访问密码：IUUR")
+        self.assertTrue(updated["note_masked"])
+        manifest = dashboardctl.source_manifest()
+        row = next(item for item in manifest["sources"] if item["id"] == source["id"])
+        self.assertEqual(row["note"], "访问密码：IUUR")
+        self.assertTrue(row["note_masked"])
+        with self.assertRaisesRegex(ValueError, "invalid_source_note_masked"):
+            dashboardctl.update_source(source["id"], note="x", note_masked="yes")
+
+    def test_workflow_reports_are_mirrored_into_record_folder(self):
+        record = {"id": "1001", "type": "task", "workflow": {"gates": {"audit_response": {"outputs": {
+            "audit_report": "# 审计报告\n- 结论：可合入", "dev_response": "# 开发回应\n- 决定：采纳"}}}}}
+        dashboardctl._persist_workflow_reports(record)
+        folder = self.root / "records" / "task" / "1001"
+        self.assertIn("可合入", (folder / "audit-report.md").read_text(encoding="utf-8"))
+        self.assertIn("采纳", (folder / "dev-response.md").read_text(encoding="utf-8"))
+
+    def test_workflow_report_paths_are_not_copied_as_bodies(self):
+        record = {"id": "1002", "type": "task", "workflow": {"gates": {"audit_response": {"outputs": {
+            "audit_report": "/tmp/report.md"}}}}}
+        dashboardctl._persist_workflow_reports(record)
+        self.assertFalse((self.root / "records" / "task" / "1002" / "audit-report.md").exists())
+
+    def test_preview_helpers_reject_private_hosts_and_parse_title(self):
+        self.assertFalse(dashboardctl._preview_host_allowed("localhost"))
+        self.assertFalse(dashboardctl._preview_host_allowed("127.0.0.1"))
+        self.assertFalse(dashboardctl._preview_host_allowed("10.1.2.3"))
+        self.assertEqual(dashboardctl._extract_html_title("<html><title> A &amp; B </title></html>"), "A & B")
+        with self.assertRaisesRegex(ValueError, "invalid_source_url"):
+            dashboardctl.preview_source_link("http://127.0.0.1/secret")
+        with self.assertRaisesRegex(ValueError, "invalid_source_url"):
+            dashboardctl.preview_source_link("ftp://example.com/x")
 
 
 if __name__ == "__main__":

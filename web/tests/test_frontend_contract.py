@@ -15,7 +15,7 @@ FIXTURE = (WEB / "tests/ui_fixture_server.py").read_text(encoding="utf-8")
 
 class DashboardFrontendContractTests(unittest.TestCase):
     def test_brief_is_rendered_as_text_and_completion_has_green_state(self):
-        self.assertIn('summary.textContent = record.latest_brief || cardBrief(record)', SCRIPT)
+        self.assertIn('summary.textContent = record.status_line || record.latest_brief || cardBrief(record)', SCRIPT)
         self.assertIn('record.transfer_disposition === "transfer_pending" ? "待转交"', SCRIPT)
         self.assertIn('record.transfer_disposition === "transferred" ? "责任转移"', SCRIPT)
         self.assertRegex(STYLE, r"\.record-card\.record-completed \.record-title[^}]*color:#397859")
@@ -44,7 +44,7 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('record-cancelled-title', SCRIPT)
         self.assertIn('.record-card.record-cancelled .record-title', STYLE)
         self.assertIn('.record-card.record-cancelled .status-pill', STYLE)
-        self.assertIn('20261028-cancelled-terminal-1', HTML)
+        self.assertIn('20261120-beam-table-1', HTML)
 
     def test_active_owner_name_and_worktime_control_are_rendered(self):
         self.assertIn('current_agent_name', SCRIPT)
@@ -57,7 +57,7 @@ class DashboardFrontendContractTests(unittest.TestCase):
 
     def test_context_is_lazy_and_inserted_as_inert_text(self):
         self.assertIn('`/api/items/${encodeURIComponent(id)}/context`', SCRIPT)
-        self.assertIn('$("#record-dialog").showModal();', SCRIPT)
+        self.assertIn('dialog.showModal();', SCRIPT)
         self.assertIn('contextSection.addEventListener("toggle", () => { if (contextSection.open) loadItemContext(record); })', SCRIPT)
         self.assertIn('$(".item-context-section", detail)?.open', SCRIPT)
         self.assertIn('window.renderSafeMarkdown(contextBody', SCRIPT)
@@ -67,8 +67,9 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('className = "detail-history-fold"', SCRIPT)
 
     def test_item_detail_leads_with_structured_brief_and_folds_full_context(self):
-        self.assertIn('overviewTitle.textContent = "目前进展"', SCRIPT)
-        self.assertIn('conclusion.textContent = txt(record.latest_brief || record.status_detail, "暂未记录进展")', SCRIPT)
+        self.assertIn('overviewTitle.textContent = "交接信息"', SCRIPT)
+        self.assertIn('const progressText = txt(record.latest_brief || record.status_detail, "")', SCRIPT)
+        self.assertIn('conclusion.textContent.trim() !== currentStatusText.textContent.trim()', SCRIPT)
         self.assertIn('["当前阶段", record.phase]', SCRIPT)
         self.assertIn('handoff.next_step || record.next_action || record.next_step', SCRIPT)
         self.assertIn('handoff.blocker || record.blocked_reason', SCRIPT)
@@ -80,7 +81,7 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('bug-source-${record.id}', SCRIPT)
         self.assertIn('@media(max-width:400px){.detail-overview{padding:8px}.detail-overview-grid{grid-template-columns:minmax(0,1fr)}', STYLE)
 
-    def test_active_followups_are_visible_and_fold_state_survives_refresh(self):
+    def test_followup_history_stays_visible_without_action_buttons(self):
         self.assertIn('model.summarizeFollowups(followups(record))', SCRIPT)
         self.assertIn('`待跟进/处理中 ${followupSummary.activeCount} 条`', SCRIPT)
         self.assertIn('followupSummary.latestActive?.prompt', SCRIPT)
@@ -89,7 +90,12 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('const preservedFoldStates = new Map($$("details[data-preserve-key]")', SCRIPT)
         self.assertIn('node.open = preservedFoldStates.get(key)', SCRIPT)
         self.assertIn('if (detailFocus) $(`[data-dialog-focus="${CSS.escape(detailFocus)}"]`, detail)?.focus({ preventScroll: true })', SCRIPT)
-        self.assertIn('state.drafts[id] = input.value', SCRIPT)
+        # 跟进入口已移除，但历史摘要与记录继续展示，数据不删除。
+        self.assertNotIn('data-followup-id', SCRIPT)
+        self.assertNotIn('openFollowup', SCRIPT)
+        self.assertNotIn('submitFollowup', SCRIPT)
+        self.assertNotIn('id="followup-dialog"', HTML)
+        self.assertIn('跟进历史（${historyFollowups.length}）', SCRIPT)
         self.assertIn('.active-followup-summary', STYLE)
 
     def test_bug_detail_sections_use_platform_contract_and_safe_archive_routes(self):
@@ -122,18 +128,23 @@ class DashboardFrontendContractTests(unittest.TestCase):
 
     def test_global_inspection_and_compact_motion_rules_are_present(self):
         self.assertIn('id="inspection-tools"', HTML)
-        self.assertIn('马上开始巡检', SCRIPT)
-        self.assertIn('巡检正在运行', SCRIPT)
+        self.assertIn('id="inspection-plan"', HTML)
+        self.assertIn('巡检 · 状态未同步', HTML)
+        self.assertIn('巡检 · ${label} · 下次 ${time.label}', SCRIPT)
         self.assertIn('上次巡检失败', SCRIPT)
         self.assertIn('@media(prefers-reduced-motion:reduce)', STYLE)
         self.assertRegex(STYLE, r"\.search\{height:40px[^}]*border-radius:999px")
+        # 搜索框：鼠标 focus 走细描边，键盘 focus 才出现柔和 ring，无浏览器默认蓝框。
+        self.assertIn(".toolbar .search:focus-within{border-color:var(--home-line-strong)", STYLE)
+        self.assertIn(".toolbar .search:has(input:focus-visible){border-color:var(--home-accent-line)", STYLE)
+        self.assertIn(".search input:focus-visible{outline:none}", STYLE)
 
-    def test_source_directory_exposes_persistent_override_and_deprecation(self):
-        self.assertIn('"非废弃·已锁定" : "非废弃"', SCRIPT)
-        self.assertIn('sourceAction === "nondeprecated"', SCRIPT)
-        self.assertIn('/lifecycle', SCRIPT)
-        self.assertIn('lifecycle_override: lifecycleOverride', SCRIPT)
+    def test_source_directory_removes_nondeprecated_action_but_keeps_deprecation_marks(self):
+        self.assertNotIn("非废弃", SCRIPT)
+        self.assertNotIn('sourceAction === "nondeprecated"', SCRIPT)
+        self.assertNotIn("/lifecycle", SCRIPT)
         self.assertIn('疑似废弃', SCRIPT)
+        self.assertIn('已废弃', SCRIPT)
 
     def test_pending_release_status_is_blue_and_kept_out_of_completed_fold(self):
         self.assertIn('pending_release: "待发布"', SCRIPT)
@@ -143,11 +154,14 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('.record-card.record-pending-release .record-title', STYLE)
 
     def test_workflow_section_sits_between_title_and_progress(self):
-        self.assertIn('detail.append(head, statusLine, makeWorkflowSection(record), overview);', SCRIPT)
+        self.assertIn('detail.append(head, statusLine, currentStatus, makeWorkflowSection(record), overview);', SCRIPT)
+        self.assertIn('currentStatusLabel.textContent = "当前现状"', SCRIPT)
+        self.assertIn('.detail-current-status', STYLE)
         self.assertIn('title.textContent = "流水线"', SCRIPT)
-        self.assertIn('overviewTitle.textContent = "目前进展"', SCRIPT)
+        self.assertIn('overviewTitle.textContent = "交接信息"', SCRIPT)
         self.assertIn('aria-labelledby", `workflow-title-${cssSafe(record.id)}`', SCRIPT)
         self.assertIn('.detail-workflow{margin:9px 0 12px', STYLE)
+        self.assertIn('body[data-theme] .record-dialog .workflow-history{margin:18px 0 12px}', STYLE)
 
     def test_workflow_detail_fetches_its_own_endpoint_and_degrades_quietly(self):
         self.assertIn('fetch(`/api/items/${encodeURIComponent(id)}/workflow`, { cache: "no-store" })', SCRIPT)
@@ -215,7 +229,8 @@ class DashboardFrontendContractTests(unittest.TestCase):
 
     def test_workflow_fixture_covers_legacy_active_blocked_rework_stage_four_and_failure(self):
         for marker in ("fixture-workflow-legacy", "fixture-workflow-active", "fixture-workflow-blocked",
-                       "fixture-workflow-rework", "fixture-workflow-audit", "fixture-workflow-unavailable"):
+                       "fixture-workflow-rework", "fixture-workflow-audit", "fixture-workflow-report-path",
+                       "fixture-workflow-unavailable"):
             self.assertIn(marker, FIXTURE)
         self.assertIn("WORKFLOW_TEMPLATE", FIXTURE)
         self.assertIn('"substeps"', FIXTURE)
@@ -246,11 +261,105 @@ class DashboardFrontendContractTests(unittest.TestCase):
         self.assertIn('makeMaterialRow', SCRIPT)
         self.assertIn('makeAttachmentRow', SCRIPT)
         self.assertIn('.library-slot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))', STYLE)
+        # 「打开」链接与其它操作按钮共用同一基线、高度与圆角。
+        self.assertIn('.library-inspection-toggle,.library-text-button,.library-card-add,.library-submit{display:inline-flex;align-items:center;justify-content:center;min-height:28px;', STYLE)
+        self.assertIn('.library-inspection-toggle[hidden],.library-text-button[hidden],.library-card-add[hidden],.library-submit[hidden]{display:none!important}', STYLE)
+        self.assertNotIn(".source-relocate-btn", STYLE)
         self.assertIn('.library-inspection-dot{', STYLE)
         self.assertIn('animation:library-breathe 1.9s ease-in-out infinite', STYLE)
         self.assertIn('body[data-theme="dark"] .sources-dialog.library-dialog', STYLE)
         self.assertIn('@media(max-width:640px)', STYLE)
         self.assertIn('@media(prefers-reduced-motion:reduce){', STYLE)
+
+    def test_library_edit_auto_name_and_audit_outputs_are_contracted(self):
+        for selector in ("source-edit-dialog", "source-edit-form", "source-name-hint",
+                         "source-edit-note-input", "source-edit-note-masked",
+                         "source-link-note", "source-link-note-masked",
+                         "text-viewer-dialog", "text-viewer-content", "text-viewer-copy"):
+            self.assertIn(f'id="{selector}"', HTML)
+        self.assertIn("/api/sources/preview?url=", SCRIPT)
+        self.assertIn('`/api/sources/${encodeURIComponent(source.id)}/edit`', SCRIPT)
+        # 资料备注：卡片默认掩码、可显示/隐藏；备注不写入 title/aria-label。
+        self.assertIn("function maskedNoteText(note)", SCRIPT)
+        self.assertIn("const masked = source.note_masked === true", SCRIPT)
+        self.assertIn("text.textContent = masked && !revealed ? maskedNoteText(note) : note", SCRIPT)
+        self.assertIn('toggle.setAttribute("aria-label", "显示备注")', SCRIPT)
+        self.assertIn('revealed ? "隐藏备注" : "显示备注"', SCRIPT)
+        self.assertIn('$("#source-edit-note-input").value = source.note || ""', SCRIPT)
+        self.assertIn('$("#source-edit-note-masked").checked = source.note_masked === true', SCRIPT)
+        self.assertIn("note, note_masked: noteMasked", SCRIPT)
+        self.assertIn('article.title = "点击卡片编辑名称与链接"', SCRIPT)
+        self.assertIn(".library-card-note{", STYLE)
+        self.assertIn(".library-note-toggle{", STYLE)
+        self.assertIn("scheduleSourceNamePreview", SCRIPT)
+        self.assertIn("state.autoName.userEdited", SCRIPT)
+        self.assertIn('sourceAction === "edit"', SCRIPT)
+        self.assertIn('article.dataset.sourceId = card.id', SCRIPT)
+        self.assertIn("data-evidence-record", SCRIPT)
+        self.assertIn("evidence-file?path=", SCRIPT)
+        self.assertIn('const workflowAuditOutputKeys = ["audit_report", "dev_response"]', SCRIPT)
+        self.assertIn('if (step.id === "audit_response")', SCRIPT)
+        self.assertIn("makeWorkflowAuditRows(record, step)", SCRIPT)
+        # 审计阶段三份清单合并为同一组行：状态、名称、角色、全文入口同行。
+        self.assertIn("const workflowAuditSubstepIds", SCRIPT)
+        self.assertIn("const workflowAuditRoleFallbacks", SCRIPT)
+        self.assertIn("const role = sub?.roleLabel || workflowAuditRoleFallbacks[key]", SCRIPT)
+        self.assertIn("open.append(markEl, copy, stateEl, linkEl)", SCRIPT)
+        self.assertIn("stateEl.textContent = state", SCRIPT)
+        self.assertIn("open.disabled = !text", SCRIPT)
+        self.assertNotIn("workflowOutputExcerpt", SCRIPT)
+        self.assertNotIn("本地报告文件：", SCRIPT)
+        self.assertIn("markdown: true", SCRIPT)
+        self.assertIn("outputs: outputs ? { ...outputs } : null", MODEL)
+        self.assertIn("/evidence-file", (WEB.parent / "server.py").read_text(encoding="utf-8"))
+        # 路径型阶段输出：全文通过 evidence-file 读取，加载/缺失状态明确，可复制原路径。
+        self.assertIn("openLocalFileViewer(record.id, text", SCRIPT)
+        self.assertIn("async function fetchEvidenceText(recordId, evidencePath)", SCRIPT)
+        self.assertIn("报告文件已不存在（原路径：${path}）", SCRIPT)
+        self.assertIn("暂时无法读取报告文件", SCRIPT)
+        self.assertIn('copyLabel: "复制路径"', SCRIPT)
+        # Markdown 表格全文：GFM 表格、单元格 <br>、宽表自绘横向轨道。
+        self.assertIn("markdownHasTable", SCRIPT)
+        self.assertIn("enhanceTableScrollers", SCRIPT)
+        self.assertIn("hasMarkdownTable", (WEB / "assets" / "markdown.js").read_text(encoding="utf-8"))
+        self.assertIn('"table", "thead", "tbody", "tr", "th", "td"', (WEB / "assets" / "markdown.js").read_text(encoding="utf-8"))
+        self.assertIn(".markdown-table-frame", STYLE)
+        self.assertIn(".table-scroll-rail", STYLE)
+        self.assertIn("function legacyCopyText(text)", SCRIPT)
+        self.assertIn("if (!copied) copied = legacyCopyText(copyText)", SCRIPT)
+        self.assertIn("fixture-workflow-report-path", FIXTURE)
+        self.assertIn("reports/fixture-audit.md", FIXTURE)
+        # 页脚版本号来自接口，不写死。
+        self.assertIn('id="footer-version"', HTML)
+        self.assertIn('fetch("/api/version"', SCRIPT)
+        self.assertIn('"version": VERSION', FIXTURE)
+        self.assertIn('if path == "/api/version"', FIXTURE)
+        for marker in ("#settings-dialog", "#scopes-dialog", "#work-hours-dialog",
+                       "#source-edit-dialog", "#text-viewer-dialog", ".workflow-audit-box",
+                       'body[data-input-mode="pointer"]'):
+            self.assertIn(marker, STYLE)
+        self.assertIn("20261120-inspection-1", HTML)
+
+    def test_inspection_history_dialog_reads_today_runs_and_opens_records(self):
+        self.assertIn('id="inspection-dialog"', HTML)
+        self.assertIn('id="inspection-bug-count"', HTML)
+        self.assertIn('id="inspection-requirement-count"', HTML)
+        self.assertIn("今天还没有巡检记录", HTML)
+        self.assertIn('fetch("/api/inspections/today"', SCRIPT)
+        self.assertIn("function makeInspectionRunCard", SCRIPT)
+        self.assertIn("makeInspectionRunGroup(\"新增 BUG\"", SCRIPT)
+        self.assertIn("makeInspectionRunGroup(\"新增需求\"", SCRIPT)
+        self.assertIn("button.dataset.openRecord = String(item.id)", SCRIPT)
+        self.assertIn("/api/inspections", FIXTURE)
+        self.assertIn(".inspection-run-card", STYLE)
+        self.assertIn(".inspection-summary", STYLE)
+        self.assertIn("inspection-dialog-shell", STYLE)
+
+    def test_unassigned_work_group_never_enters_a_version(self):
+        self.assertIn('title.textContent = "未指定版本"', SCRIPT)
+        self.assertIn("partition.unassigned?.records.length", SCRIPT)
+        self.assertIn('record.type === "work" && !String(iterId ?? "").trim()', MODEL)
+        self.assertIn("unassigned:", MODEL)
 
     def test_scope_catalog_is_visible_and_bug_scope_ids_render_as_tags(self):
         self.assertIn('id="scopes-open"', HTML)

@@ -12,20 +12,25 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
 import uuid
 import zipfile
 import hashlib
+import html
+import ipaddress
 import mimetypes
+import socket
+import urllib.request
 import backend
 import waylume_paths
 import workflow
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 CODE_ROOT = Path(__file__).resolve().parent
@@ -35,6 +40,7 @@ LOCK = ROOT / ".store.lock"
 EVENTS = ROOT / "events.jsonl"
 _LOCK_LOCAL = threading.local()
 UPLOADS = ROOT / "sources" / "uploads"
+WORKFLOW_EVIDENCE_MAX_BYTES = 128 * 1024
 
 
 def refresh_data_paths() -> None:
@@ -62,19 +68,22 @@ ALLOWED_FIELDS = {
     "completed_at",
     "created_at",
     "transfer_disposition", "transfer_target", "transfer_requested_at", "transfer_confirmed_at", "transfer_confirmation", "completion_kind",
-    "latest_brief", "initial_brief", "phase", "progress", "final_result", "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name", "last_agent_activity_at", "agent_state", "agent_work_status", "revision", "handoff",
+    "latest_brief", "status_line", "initial_brief", "phase", "progress", "final_result", "current_agent_session_id", "current_agent_name", "last_agent_session_id", "last_agent_name", "last_agent_activity_at", "agent_state", "agent_work_status", "revision", "handoff",
     "workflow", "workflow_template_id", "workflow_stage", "workflow_stage_status", "agent_bindings",
     "iteration_id", "reopen_count", "reopen_history", "manual_status", "manual_completed_at", "manual_completed_by", "attachments",
 }
 MAX_PROMPT_CHARS = 4000
 MAX_RESULT_CHARS = 2000
+MAX_STATUS_LINE_CHARS = 200
 MAX_SOURCE_FILE_BYTES = 15 * 1024 * 1024
 ALLOWED_SOURCE_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".csv", ".txt", ".md", ".markdown", ".png", ".jpg", ".jpeg"}
 # Archive fixed slots. Anything else is an "other source"; the slot value is
 # persisted so agents can also use it outside the dashboard.
-SOURCE_SLOTS = ("requirement_doc", "figma", "codesign", "prototype", "testcase", "supplementary", "api_doc", "architecture", "standard", "other")
+SOURCE_SLOTS = ("requirement_doc", "analytics_requirement", "analytics_acceptance", "figma", "codesign", "prototype", "testcase", "supplementary", "api_doc", "architecture", "standard", "other")
 SOURCE_SLOT_LABELS = {
     "requirement_doc": "需求列表",
+    "analytics_requirement": "埋点需求表",
+    "analytics_acceptance": "埋点验收表",
     "figma": "Figma",
     "codesign": "高保真",
     "prototype": "高保真",
@@ -89,6 +98,17 @@ SOURCE_SLOT_LABELS = {
 # the requirement/design/test matrix belongs to exactly one version.
 GLOBAL_FIXED_SLOTS = {"api_doc", "architecture", "standard"}
 ITERATION_FIXED_SLOTS = {"requirement_doc", "figma", "prototype", "codesign", "testcase"}
+ANALYTICS_FIXED_SLOTS = {"analytics_requirement", "analytics_acceptance"}
+VERSION_FIXED_SLOTS = ITERATION_FIXED_SLOTS | ANALYTICS_FIXED_SLOTS
+VERSION_SLOT_ORDER = {
+    "iteration": ("requirement_doc", "figma", "prototype", "codesign", "testcase"),
+    "analytics": ("analytics_requirement", "analytics_acceptance"),
+}
+VERSION_TYPES = {"iteration", "analytics"}
+DEFAULT_VERSION_TYPE = "iteration"
+# Both requirement lists participate in patrol by default; a version may still
+# explicitly remove inspection for one of them.
+REQUIREMENT_SLOTS = {"requirement_doc", "analytics_requirement"}
 ITERATION_STATUSES = {"planning", "active", "pending_release", "released", "archived"}
 DEFAULT_ITERATION_STATUS = "active"
 MAX_ITERATION_TAG_CHARS = 50
@@ -105,6 +125,11 @@ MAX_RECORD_ATTACHMENT_BYTES = 10 * 1024 * 1024
 RECORD_IMAGE_MIMES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 SOURCE_ATTACHMENT_MIMES = {**RECORD_IMAGE_MIMES, ".heic": "image/heic", ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/x-m4v", ".zip": "application/zip", ".pdf": "application/pdf", ".txt": "text/plain", ".log": "text/plain", ".json": "application/json", ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
 MAX_SOURCE_ATTACHMENT_BYTES = 100 * 1024 * 1024
+# New work/task records use one monotonic numeric id. Legacy records keep
+# their existing identifiers untouched; the allocator only skips past any
+# numeric legacy id so the two generations can never collide.
+RECORD_ID_START = 1001
+NUMERIC_RECORD_ID_RE = re.compile(r"\A[0-9]+\Z")
 
 
 def timestamp() -> str:
@@ -141,6 +166,11 @@ def completion_timestamp(record: dict[str, Any]) -> str | None:
         explicit_agent = event.get("kind") == "agent_report" and to_status == "completed"
         if explicit_manual or explicit_transition or explicit_agent:
             dated.append(event["at"])
+    if str(record.get("status") or "") == "owner_changed":
+        for entry in (record.get("progress") or []):
+            at = entry.get("at") if isinstance(entry, dict) else None
+            if _progress_has_delivery_evidence(entry) and _parse_iso_datetime(at):
+                dated.append(at)
     return max(dated, key=lambda value: _parse_iso_datetime(value)) if dated else None
 
 
@@ -159,6 +189,8 @@ def effective_work_status(record: dict[str, Any], now=None) -> tuple[str, str]:
     if record.get("manual_status") == "completed": return "completed", "manual"
     if record.get("type") == "bug" and bug_has_our_delivery(record): return "completed", "our_status"
     status = str(record.get("status", "unknown"))
+    if record.get("type") == "bug" and status == "owner_changed" and bug_has_completion_evidence(record):
+        return "completed", "owner_changed_after_delivery"
     # 待发布/责任人变更是人工设定的终态，不能被"无在线 Agent"覆盖成搁置。
     if status in BATCH_TERMINAL_STATUSES or status in {"pending_release", "owner_changed"}: return status, "source_status"
     workflow_state = record.get("workflow") if isinstance(record.get("workflow"), dict) else {}
@@ -204,12 +236,15 @@ def atomic_write_preserving_context(data: dict[str, Any], kind: str, record_id: 
     with_lock(lambda: backend.commit(ROOT, STORE, data, context_overrides=overrides))
 
 
-def event(action: str, record: dict[str, Any], revision: int, followup_id: str | None = None) -> None:
+def event(action: str, record: dict[str, Any], revision: int, followup_id: str | None = None,
+          extra: dict[str, Any] | None = None) -> None:
     item = {"at": timestamp(), "action": action, "id": record["id"],
             "type": record["type"], "revision": revision,
             "store_revision": revision, "record_revision": int(record.get("revision", 0))}
     if followup_id:
         item["followup_id"] = followup_id
+    if isinstance(extra, dict):
+        item.update({key: value for key, value in extra.items() if key not in {"at", "action", "id", "type", "revision", "store_revision", "record_revision", "followup_id"}})
     with EVENTS.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(item, ensure_ascii=False) + "\n")
         handle.flush()
@@ -316,6 +351,31 @@ def bug_has_our_delivery(record: dict[str, Any]) -> bool:
     )
 
 
+BUG_COMPLETION_EVIDENCE_RE = re.compile(r"(?:^|[;\s])(?:commit|build|remote):", re.I)
+
+
+def _progress_has_delivery_evidence(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    evidence = entry.get("evidence") or []
+    blob = " ".join(str(item) for item in evidence if isinstance(item, str))
+    return bool(BUG_COMPLETION_EVIDENCE_RE.search(blob))
+
+
+def bug_has_completion_evidence(record: dict[str, Any]) -> bool:
+    """A bug reassigned after our completed fix is not a real owner change.
+
+    Platform BUG flows often change the assignee to the tester after development
+    finishes. Only treat that terminal state as completed when the workbench has
+    concrete delivery evidence (commit/build/remote) from our own progress.
+    A reassignment before any code work has no such evidence and stays
+    owner_changed.
+    """
+    if bug_has_our_delivery(record):
+        return True
+    return any(_progress_has_delivery_evidence(entry) for entry in (record.get("progress") or []))
+
+
 def classify_bug_sync_status(item: dict[str, Any]) -> str:
     """Keep source status intact while deriving a stable local dashboard bucket."""
     platform_status = str(item.get("status") or "").strip()
@@ -335,6 +395,8 @@ def _effective_record_status(record: dict[str, Any]) -> str:
     if record.get("manual_status") == "completed":
         return "completed"
     if record.get("type") == "bug" and bug_has_our_delivery(record):
+        return "completed"
+    if record.get("type") == "bug" and str(record.get("status") or "") == "owner_changed" and bug_has_completion_evidence(record):
         return "completed"
     return str(record.get("status", "unknown"))
 
@@ -400,8 +462,38 @@ def adopt_task_batch(task_id: str) -> dict[str, Any]:
     return with_lock(update)
 
 
+def _normalize_status_line(value: str | None) -> str | None:
+    """One-line current status for the card and detail header; never multi-line."""
+    if value is None: return None
+    if not isinstance(value, str): raise ValueError("invalid_status_line")
+    if "\n" in value or "\r" in value: raise ValueError("invalid_status_line")
+    clean = " ".join(value.split())
+    if not clean or len(clean) > MAX_STATUS_LINE_CHARS: raise ValueError("invalid_status_line")
+    return clean
+
+
+def set_status_line(record_id: str, text: str, actor: str = "user") -> dict[str, Any]:
+    clean = _normalize_status_line(text)
+    clean_actor = actor.strip() if isinstance(actor, str) and actor.strip() else "user"
+
+    def update() -> dict[str, Any]:
+        db = load_store()
+        record = _find_record(db, record_id)
+        at = timestamp()
+        record["status_line"] = clean
+        record["updated_at"] = at
+        record["status_line_updated_at"] = at
+        record["status_line_updated_by"] = clean_actor[:100]
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        event("status_line", record, db["revision"])
+        return {"revision": db["revision"], "record": record}
+    return with_lock(update)
+
+
 def add_progress(record_id: str, message: str, actor: str = "agent", evidence: list[str] | None = None,
-                 *, result: bool = False, outcome: str | None = None) -> dict[str, Any]:
+                 *, result: bool = False, outcome: str | None = None,
+                 status_line: str | None = None) -> dict[str, Any]:
     clean_message = message.strip() if isinstance(message, str) else ""
     clean_actor = actor.strip() if isinstance(actor, str) else ""
     if not clean_message or len(clean_message) > 4000 or not clean_actor or len(clean_actor) > 100:
@@ -412,6 +504,9 @@ def add_progress(record_id: str, message: str, actor: str = "agent", evidence: l
         raise ValueError("invalid_progress_evidence")
     if outcome is not None and outcome not in {"success", "failure", "partial", "cancelled"}:
         raise ValueError("invalid_result_outcome")
+    clean_status_line = _normalize_status_line(status_line)
+    if result and not clean_status_line:
+        raise ValueError("status_line_required")
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -423,6 +518,10 @@ def add_progress(record_id: str, message: str, actor: str = "agent", evidence: l
             entry["outcome"] = outcome
         record.setdefault("progress", []).append(entry)
         record["latest_brief"] = clean_message
+        if clean_status_line:
+            record["status_line"] = clean_status_line
+            record["status_line_updated_at"] = at
+            record["status_line_updated_by"] = clean_actor[:100]
         if result:
             record["final_result"] = entry
         record["updated_at"] = at
@@ -437,6 +536,7 @@ def task_context(record_id: str) -> dict[str, Any]:
     record = _find_record(load_store(), record_id)
     return {"record": record, "batch_id": record.get("batch_id"),
             "initial_brief": record.get("initial_brief") or record.get("status_detail") or record.get("title", ""),
+            "status_line": record.get("status_line", ""),
             "latest_brief": record.get("latest_brief", ""), "progress": list(record.get("progress", [])),
             "final_result": record.get("final_result"), "followups": list(record.get("followups", [])),
             "evidence": list(record.get("evidence", [])), "related_ids": list(record.get("related_ids", []))}
@@ -1114,18 +1214,42 @@ def with_lock(fn):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def allocate_record_id(db: dict[str, Any]) -> str:
+    """Return the next numeric id and persist the monotonic counter in `db`.
+
+    The caller owns the store lock and must commit `db`; allocating without a
+    commit leaves the counter untouched, so a rejected upsert never burns an id
+    that a later reader could observe. The counter is never derived backwards
+    from the current record set, which guarantees ids are not reused after
+    deletion.
+    """
+    counter = db.get("record_id_seq")
+    if isinstance(counter, bool) or not isinstance(counter, int) or counter < RECORD_ID_START - 1:
+        counter = RECORD_ID_START - 1
+    highest_existing = RECORD_ID_START - 1
+    for record in db.get("records", []):
+        ident = record.get("id") if isinstance(record, dict) else None
+        if isinstance(ident, str) and NUMERIC_RECORD_ID_RE.fullmatch(ident):
+            highest_existing = max(highest_existing, int(ident))
+    next_value = max(counter + 1, highest_existing + 1, RECORD_ID_START)
+    db["record_id_seq"] = next_value
+    return str(next_value)
+
+
 def cmd_upsert(args: argparse.Namespace) -> None:
     raw = json.load(sys.stdin) if args.input == "-" else json.loads(Path(args.input).read_text(encoding="utf-8"))
     supplied_fields = set(raw) if isinstance(raw, dict) else set()
-    if isinstance(raw, dict) and not raw.get("id") and raw.get("type") in {"task", "work"}:
-        raw["id"] = f"ZT-T-{uuid.uuid4().hex[:12].upper()}" if raw["type"] == "task" else f"ZT-W-{uuid.uuid4().hex[:12].upper()}"
-    normalized = normalize_record(raw)
+    needs_numeric_id = isinstance(raw, dict) and not raw.get("id") and raw.get("type") in {"task", "work"}
 
     def update() -> dict[str, Any]:
         db = load_store()
         expected_store_revision = getattr(args, "expected_store_revision", None)
         if expected_store_revision is not None and expected_store_revision != int(db.get("revision", 0)):
             raise ValueError("store_revision_conflict")
+        if needs_numeric_id:
+            raw["id"] = allocate_record_id(db)
+            supplied_fields.add("id")
+        normalized = normalize_record(raw)
         records = db["records"]
         old = next((r for r in records if r.get("id") == normalized["id"]), None)
         if old:
@@ -1134,6 +1258,10 @@ def cmd_upsert(args: argparse.Namespace) -> None:
             previous_status = old.get("status")
             for key in supplied_fields:
                 merged[key] = normalized[key]
+            if (previous_status in {"completed", "cancelled"}
+                    and merged.get("status") == previous_status
+                    and _parse_iso_datetime(old.get("completed_at"))):
+                merged["completed_at"] = old["completed_at"]
             merged["updated_at"] = normalized["updated_at"]
             if "history" not in supplied_fields:
                 merged["history"] = list(old.get("history", []))
@@ -1163,6 +1291,7 @@ def cmd_upsert(args: argparse.Namespace) -> None:
             records.append(normalized)
             normalized_local = normalized
             action = "create"
+        _sync_iteration_derived_status(db, normalized_local.get("iteration_id"))
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event(action, normalized_local, db["revision"])
@@ -1320,6 +1449,64 @@ def _find_iteration(db: dict[str, Any], iteration_id: str) -> dict[str, Any] | N
     return None
 
 
+def iteration_version_type(iteration: dict[str, Any] | None) -> str:
+    """Return the validated version type; legacy versions are iterations."""
+    value = iteration.get("version_type") if isinstance(iteration, dict) else None
+    return value if value in VERSION_TYPES else DEFAULT_VERSION_TYPE
+
+
+def _iteration_type_value(value: Any) -> str:
+    if value is None:
+        return DEFAULT_VERSION_TYPE
+    if not isinstance(value, str) or value not in VERSION_TYPES:
+        raise ValueError("invalid_iteration_version_type")
+    return value
+
+
+def iteration_fixed_slots(version_type: str | None) -> tuple[str, ...]:
+    return VERSION_SLOT_ORDER[_iteration_type_value(version_type)]
+
+
+def _iteration_public(iteration: dict[str, Any]) -> dict[str, Any]:
+    """Copy an iteration and expose the default type without rewriting legacy data."""
+    result = copy.deepcopy(iteration)
+    result["version_type"] = iteration_version_type(iteration)
+    return result
+
+
+_CN_DIGITS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九")
+
+
+def _cn_number(value: int) -> str:
+    """Small Chinese ordinal helper for auto-numbered version names (2..99)."""
+    if value < 10:
+        return _CN_DIGITS[value]
+    tens, ones = divmod(value, 10)
+    prefix = "十" if tens == 1 else _CN_DIGITS[tens] + "十"
+    return prefix + (_CN_DIGITS[ones] if ones else "")
+
+
+def _iteration_name_taken(title: str, iterations: list[dict[str, Any]], *, except_id: str | None = None) -> bool:
+    for item in iterations:
+        if except_id is not None and item.get("id") == except_id:
+            continue
+        if str(item.get("title") or "").strip() == title or str(item.get("version_tag") or "").strip() == title:
+            return True
+    return False
+
+
+def unique_iteration_title(base: str, iterations: list[dict[str, Any]], *, except_id: str | None = None) -> str:
+    """Keep one readable unique name and append 迭代二/三… on duplicates."""
+    if not _iteration_name_taken(base, iterations, except_id=except_id):
+        return base
+    stem = re.sub(r"\s*迭代[一二三四五六七八九十百零两\d]+$", "", base).strip() or base
+    for number in range(2, 100):
+        candidate = f"{stem} 迭代{_cn_number(number)}"
+        if not _iteration_name_taken(candidate, iterations, except_id=except_id):
+            return candidate
+    raise ValueError("iteration_duplicate")
+
+
 def _iteration_order_value(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -1343,7 +1530,7 @@ def display_iterations(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]
     ordered = ordered_iterations(iterations)
     explicit = [it for it in ordered if _iteration_order_value(it.get("order")) is not None]
     missing = [it for it in ordered if _iteration_order_value(it.get("order")) is None]
-    return list(reversed(explicit)) + list(reversed(missing))
+    return [_iteration_public(it) for it in list(reversed(explicit)) + list(reversed(missing))]
 
 
 def _normalize_iteration_orders(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1365,9 +1552,9 @@ def list_iterations() -> dict[str, Any]:
     }
 
 
-def create_iteration(version_tag: str, title: str, *, status: str = "active", target_release_date: str | None = None,
+def create_iteration(version_tag: str, title: str, *, status: str = "planning", target_release_date: str | None = None,
                      description: str = "", notes: list[str] | None = None, iteration_id: str | None = None,
-                     order: int | None = None) -> dict[str, Any]:
+                     order: int | None = None, version_type: str | None = None) -> dict[str, Any]:
     if not isinstance(version_tag, str) or not version_tag.strip() or len(version_tag) > MAX_ITERATION_TAG_CHARS:
         raise ValueError("invalid_iteration_version_tag")
     if not isinstance(title, str) or not title.strip() or len(title) > MAX_ITERATION_TITLE_CHARS:
@@ -1376,6 +1563,7 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
         raise ValueError("invalid_iteration_status")
     if order is not None and (isinstance(order, bool) or not isinstance(order, int) or order < 0):
         raise ValueError("invalid_iteration_order")
+    resolved_type = _iteration_type_value(version_type)
 
     clean_tag = version_tag.strip()
     clean_title = title.strip()
@@ -1389,14 +1577,29 @@ def create_iteration(version_tag: str, title: str, *, status: str = "active", ta
     def update() -> dict[str, Any]:
         db = load_store()
         iterations = _iteration_store_list(db)
-        if any(it.get("id") == it_id or it.get("version_tag") == clean_tag
-               or str(it.get("title") or "").strip() == clean_title for it in iterations):
+        if any(it.get("id") == it_id for it in iterations):
             raise ValueError("iteration_duplicate")
+        if resolved_type == "iteration":
+            # Version names stay unique and readable. A duplicate name is
+            # auto-numbered (13.4.2 -> 13.4.2 迭代二 -> 迭代三) while the id is
+            # untouched and can still be renamed later.
+            final_title = unique_iteration_title(clean_title, iterations)
+            if clean_tag == clean_title or _iteration_name_taken(clean_tag, iterations):
+                final_tag = final_title
+            else:
+                final_tag = clean_tag
+        else:
+            # Analytics versions do not use the iteration ordinal; duplicate
+            # names remain an explicit error instead of silently changing one.
+            if _iteration_name_taken(clean_title, iterations) or _iteration_name_taken(clean_tag, iterations):
+                raise ValueError("iteration_duplicate")
+            final_title, final_tag = clean_title, clean_tag
         now = timestamp()
         entry = {
             "id": it_id,
-            "version_tag": clean_tag,
-            "title": clean_title,
+            "version_tag": final_tag,
+            "title": final_title,
+            "version_type": resolved_type,
             "status": status,
             "target_release_date": target_release_date,
             "released_at": now if status == "released" else None,
@@ -1449,6 +1652,9 @@ def reorder_iterations(iteration_ids: list[str]) -> dict[str, Any]:
 
 
 def update_iteration(iteration_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(patch, dict) or "version_type" in patch:
+        # Type changes need the material-slot migration in set_iteration_type.
+        raise ValueError("invalid_iteration_patch")
     def update() -> dict[str, Any]:
         db = load_store()
         it = _find_iteration(db, iteration_id)
@@ -1486,7 +1692,7 @@ def update_iteration(iteration_id: str, patch: dict[str, Any]) -> dict[str, Any]
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event("iteration_updated", {"id": it["id"], "type": "iteration"}, db["revision"])
-        return {"revision": db["revision"], "iteration": it}
+        return {"revision": db["revision"], "iteration": _iteration_public(it)}
 
     return with_lock(update)
 
@@ -1506,7 +1712,264 @@ def release_iteration(iteration_id: str, *, notes: list[str] | None = None) -> d
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event("iteration_released", {"id": it["id"], "type": "iteration"}, db["revision"])
-        return {"revision": db["revision"], "iteration": it}
+        return {"revision": db["revision"], "iteration": _iteration_public(it)}
+
+    return with_lock(update)
+
+
+_VERSION_TYPE_SLOT_MAP = {
+    "analytics": {"requirement_doc": "analytics_requirement", "testcase": "analytics_acceptance"},
+    "iteration": {"analytics_requirement": "requirement_doc", "analytics_acceptance": "testcase"},
+}
+
+
+def _converted_source_slot(slot: str | None, version_type: str) -> str | None:
+    """Map a fixed slot between version types without discarding any material.
+
+    Slots that do not exist in the target type are preserved as supplementary
+    material rather than dropped; the returned mapping is idempotent.
+    """
+    if slot is None:
+        return None
+    mapped = _VERSION_TYPE_SLOT_MAP[version_type].get(slot, slot)
+    allowed = set(VERSION_SLOT_ORDER[version_type]) | {"supplementary", "other"}
+    return mapped if mapped in allowed else "supplementary"
+
+
+def _version_type_snapshot(db: dict[str, Any], iteration: dict[str, Any]) -> dict[str, Any]:
+    members = [source for source in _source_store_list(db)
+               if _source_scope(source) == "iteration" and source.get("iteration_id") == iteration.get("id")]
+    slot_counts: dict[str, int] = {}
+    for source in members:
+        slot = _source_effective_slot(source) or "supplementary"
+        slot_counts[slot] = slot_counts.get(slot, 0) + 1
+    return {
+        "version_type": iteration_version_type(iteration),
+        "source_count": len(members),
+        "source_ids": sorted(str(source.get("id")) for source in members if source.get("id")),
+        "group_ids": sorted({_source_group_id(source) for source in members}),
+        "slot_counts": dict(sorted(slot_counts.items())),
+    }
+
+
+def _write_version_type_backup(db: dict[str, Any], iteration: dict[str, Any], version_type: str) -> str:
+    """Write a self-contained, verifiable snapshot before changing a version type."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(iteration.get("id") or "iteration"))[:60] or "iteration"
+    backup_root = ROOT / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    base = backup_root / f"version-type-{stamp}-{safe_id}"
+    suffix = 2
+    while base.exists():
+        base = backup_root / f"version-type-{stamp}-{safe_id}-{suffix}"
+        suffix += 1
+    base.mkdir(parents=True, exist_ok=False)
+    files: dict[str, dict[str, Any]] = {}
+    for name in ("meta.json", "store.json"):
+        path = ROOT / name
+        if path.is_file() and not path.is_symlink():
+            shutil.copy2(path, base / name)
+            raw = (base / name).read_bytes()
+            files[name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    snapshot = json.dumps(db, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    (base / "store-snapshot.json").write_bytes(snapshot)
+    files["store-snapshot.json"] = {"bytes": len(snapshot), "sha256": hashlib.sha256(snapshot).hexdigest()}
+    manifest = {
+        "created_at": timestamp(),
+        "reason": "iteration_version_type_conversion",
+        "iteration_id": iteration.get("id"),
+        "iteration_title": iteration.get("title"),
+        "target_version_type": version_type,
+        "revision": db.get("revision"),
+        "files": files,
+    }
+    (base / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(base)
+
+
+def set_iteration_type(iteration_id: str, version_type: str, *, backup: bool = True,
+                       dry_run: bool = False) -> dict[str, Any]:
+    """Convert a version between iteration/analytics and relocate its materials.
+
+    The operation is idempotent: converting to the current type is a no-op and
+    never writes or creates a backup. Every real conversion first writes a
+    store snapshot plus manifest under ROOT/backups and returns its path. The
+    inverse conversion plus that snapshot form two rollback paths.
+    """
+    resolved_type = _iteration_type_value(version_type)
+
+    def update() -> dict[str, Any]:
+        db = load_store()
+        original_db = copy.deepcopy(db)
+        iteration = _find_iteration(db, iteration_id)
+        if not iteration:
+            raise ValueError("iteration_not_found")
+        current_type = iteration_version_type(iteration)
+        before = _version_type_snapshot(db, iteration)
+        members = [source for source in _source_store_list(db)
+                   if _source_scope(source) == "iteration" and source.get("iteration_id") == iteration.get("id")]
+        planned = []
+        for source in members:
+            old_slot = _source_effective_slot(source)
+            new_slot = _converted_source_slot(old_slot, resolved_type)
+            if new_slot != old_slot:
+                planned.append({"source_id": source.get("id"), "old_slot": old_slot, "new_slot": new_slot})
+        changed = current_type != resolved_type or bool(planned)
+        if not changed:
+            return {
+                "revision": db.get("revision", 0), "iteration": _iteration_public(iteration),
+                "changed": False, "backup_path": None, "dry_run": dry_run,
+                "before": before, "after": before, "migrated_slots": [],
+                "verification": {"ok": True, "source_count_unchanged": True,
+                                 "group_ids_unchanged": True, "slots_valid": True},
+            }
+        if dry_run:
+            after = copy.deepcopy(before)
+            after["version_type"] = resolved_type
+            slot_counts: dict[str, int] = {}
+            for source in members:
+                slot = _converted_source_slot(_source_effective_slot(source), resolved_type) or "supplementary"
+                slot_counts[slot] = slot_counts.get(slot, 0) + 1
+            after["slot_counts"] = dict(sorted(slot_counts.items()))
+            return {
+                "revision": db.get("revision", 0), "iteration": _iteration_public(iteration),
+                "changed": True, "backup_path": None, "dry_run": True,
+                "before": before, "after": after, "migrated_slots": planned,
+                "verification": {"ok": True, "source_count_unchanged": True,
+                                 "group_ids_unchanged": True, "slots_valid": True},
+            }
+        backup_path = _write_version_type_backup(db, iteration, resolved_type) if backup else None
+        now = timestamp()
+        migrated = []
+        for source in members:
+            old_slot = _source_effective_slot(source)
+            new_slot = _converted_source_slot(old_slot, resolved_type)
+            if new_slot != old_slot:
+                _apply_source_slot(source, old_slot, new_slot)
+                source["updated_at"] = now
+                migrated.append({"source_id": source.get("id"), "old_slot": old_slot, "new_slot": new_slot})
+        iteration["version_type"] = resolved_type
+        iteration["updated_at"] = now
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        # Re-read the committed store before reporting verification, so a
+        # failed partial write can never present a false success.
+        committed = load_store()
+        committed_iteration = _find_iteration(committed, iteration["id"])
+        after = _version_type_snapshot(committed, committed_iteration or iteration)
+        after_members = [source for source in _source_store_list(committed)
+                         if _source_scope(source) == "iteration" and source.get("iteration_id") == iteration.get("id")]
+        slots_valid = all((_source_effective_slot(source) or "supplementary")
+                          in set(VERSION_SLOT_ORDER[resolved_type]) | {"supplementary", "other"}
+                          for source in after_members)
+        verification = {
+            "ok": (after["source_count"] == before["source_count"]
+                   and after["source_ids"] == before["source_ids"]
+                   and after["group_ids"] == before["group_ids"]
+                   and slots_valid),
+            "source_count_unchanged": after["source_count"] == before["source_count"],
+            "source_ids_unchanged": after["source_ids"] == before["source_ids"],
+            "group_ids_unchanged": after["group_ids"] == before["group_ids"],
+            "slots_valid": slots_valid,
+        }
+        if not verification["ok"]:
+            # The lock is still held; restore the exact pre-conversion store so
+            # a failed audit cannot leave a half-migrated version behind.
+            atomic_write(original_db)
+            raise ValueError("iteration_type_verification_failed")
+        event("iteration_type_converted", {"id": iteration["id"], "type": "iteration"}, db["revision"], extra={
+            "version_type": resolved_type,
+            "previous_version_type": current_type,
+            "backup_path": backup_path,
+            "migrated_slots": migrated,
+            "verification": verification,
+        })
+        return {
+            "revision": db["revision"], "iteration": _iteration_public(committed_iteration or iteration),
+            "changed": True, "backup_path": backup_path, "dry_run": False,
+            "before": before, "after": after, "migrated_slots": migrated,
+            "verification": verification,
+        }
+
+    return with_lock(update)
+
+
+def restore_iteration_type_backup(backup_path: str) -> dict[str, Any]:
+    """Restore one version's type and material slots from a conversion backup.
+
+    Only the recorded version and its own sources are touched; unrelated
+    records and materials created after the conversion stay intact.
+    """
+    if not isinstance(backup_path, str) or not backup_path.strip():
+        raise ValueError("invalid_version_type_backup")
+    path = Path(backup_path).expanduser().resolve()
+    backup_root = (ROOT / "backups").resolve()
+    if backup_root not in path.parents or not path.is_dir() or path.is_symlink():
+        raise ValueError("invalid_version_type_backup")
+    manifest_path = path / "manifest.json"
+    snapshot_path = path / "store-snapshot.json"
+    if not manifest_path.is_file() or not snapshot_path.is_file():
+        raise ValueError("invalid_version_type_backup")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_version_type_backup") from exc
+    if not isinstance(manifest, dict) or not isinstance(snapshot, dict):
+        raise ValueError("invalid_version_type_backup")
+    iteration_id = manifest.get("iteration_id")
+    if manifest.get("reason") != "iteration_version_type_conversion" or not isinstance(iteration_id, str):
+        raise ValueError("invalid_version_type_backup")
+    snapshot_iteration = next((item for item in snapshot.get("iterations", [])
+                               if isinstance(item, dict) and item.get("id") == iteration_id), None)
+    if snapshot_iteration is None:
+        raise ValueError("invalid_version_type_backup")
+    snapshot_sources = {
+        str(source.get("id")): source
+        for source in snapshot.get("sources", [])
+        if isinstance(source, dict) and source.get("scope") == "iteration" and source.get("iteration_id") == iteration_id
+    }
+
+    def update() -> dict[str, Any]:
+        db = load_store()
+        iteration = _find_iteration(db, iteration_id)
+        if not iteration:
+            raise ValueError("iteration_not_found")
+        members = [source for source in _source_store_list(db)
+                   if _source_scope(source) == "iteration" and source.get("iteration_id") == iteration_id]
+        if {str(source.get("id")) for source in members} != set(snapshot_sources):
+            raise ValueError("version_type_backup_mismatch")
+        now = timestamp()
+        previous_type = iteration_version_type(iteration)
+        if "version_type" in snapshot_iteration:
+            iteration["version_type"] = snapshot_iteration.get("version_type")
+        else:
+            iteration.pop("version_type", None)
+        type_changed = previous_type != iteration_version_type(iteration)
+        restored = []
+        for source in members:
+            saved = snapshot_sources[str(source.get("id"))]
+            before = (_source_effective_slot(source), source.get("inspection_enabled"), source.get("inspection_mode"))
+            source["slot"] = saved.get("slot")
+            for key in ("inspection_enabled", "inspection_mode"):
+                if key in saved:
+                    source[key] = saved[key]
+            after = (_source_effective_slot(source), source.get("inspection_enabled"), source.get("inspection_mode"))
+            if before != after:
+                source["updated_at"] = now
+                restored.append({"source_id": source.get("id"), "old": before, "restored": after})
+        iteration["updated_at"] = now
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        event("iteration_type_restored", {"id": iteration_id, "type": "iteration"}, db["revision"], extra={
+            "backup_path": str(path),
+            "version_type": iteration_version_type(iteration),
+            "restored_sources": restored,
+        })
+        return {
+            "revision": db["revision"], "iteration": _iteration_public(iteration),
+            "backup_path": str(path), "restored_sources": restored, "changed": bool(restored) or type_changed,
+        }
 
     return with_lock(update)
 
@@ -1526,6 +1989,29 @@ def set_current_iteration(iteration_id: str) -> dict[str, Any]:
     return with_lock(update)
 
 
+def _sync_iteration_derived_status(db: dict[str, Any], iteration_id: str | None) -> bool:
+    """Keep planning/active in step with whether the version has requirements.
+
+    Only the derived pair is touched; pending_release/released/archived remain
+    manual decisions and are never overwritten here.
+    """
+    if not isinstance(iteration_id, str) or not iteration_id.strip():
+        return False
+    iteration = _find_iteration(db, iteration_id.strip())
+    if iteration is None or iteration.get("status") not in {"planning", "active"}:
+        return False
+    count = sum(1 for record in db.get("records", [])
+                if record.get("iteration_id") == iteration.get("id")
+                and record.get("type") == "work"
+                and record.get("status") != "archived")
+    target = "active" if count > 0 else "planning"
+    if iteration.get("status") == target:
+        return False
+    iteration["status"] = target
+    iteration["updated_at"] = timestamp()
+    return True
+
+
 def assign_record_iteration(record_id: str, iteration_id: str | None) -> dict[str, Any]:
     if not isinstance(record_id, str) or not record_id.strip():
         raise ValueError("invalid_record_id")
@@ -1537,6 +2023,7 @@ def assign_record_iteration(record_id: str, iteration_id: str | None) -> dict[st
         rec = next((r for r in db.get("records", []) if r.get("id") == record_id), None)
         if rec is None:
             raise ValueError("record_not_found")
+        previous_iteration_id = rec.get("iteration_id")
         if iteration_id is None:
             rec["iteration_id"] = None
         else:
@@ -1545,6 +2032,9 @@ def assign_record_iteration(record_id: str, iteration_id: str | None) -> dict[st
                 raise ValueError("iteration_not_found")
             rec["iteration_id"] = it["id"]
         rec["updated_at"] = timestamp()
+        _sync_iteration_derived_status(db, previous_iteration_id)
+        if rec.get("iteration_id") != previous_iteration_id:
+            _sync_iteration_derived_status(db, rec.get("iteration_id"))
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event("record_iteration_assigned", {"id": record_id, "type": rec.get("type", "task"), "iteration_id": rec["iteration_id"]}, db["revision"])
@@ -1565,6 +2055,7 @@ def migrate_iteration_archive(*, default_tag: str = "v13.4.2", default_title: st
                 "id": "ITER-v1342",
                 "version_tag": default_tag,
                 "title": default_title,
+                "version_type": DEFAULT_VERSION_TYPE,
                 "status": "active",
                 "target_release_date": None,
                 "released_at": None,
@@ -1649,12 +2140,15 @@ def assemble_archive_context(iteration_id: str | None = None, task_id: str | Non
     global_materials = [s for s in all_sources if s.get("scope") == "global" and s.get("active")]
     iteration_materials = [s for s in all_sources if s.get("scope") == "iteration" and s.get("iteration_id") == target_iter_id and s.get("active")] if target_iter_id else []
 
+    target_version_type = iteration_version_type(target_iteration) if target_iteration else None
+    type_label = {"iteration": "迭代版本", "analytics": "埋点版本"}.get(target_version_type, "全局公共")
     lines = [f"# 研发工作上下文基线（版本：{target_iteration.get('title') if target_iteration else '全局公共'} · 内部ID: {target_iter_id or 'GLOBAL'}）", ""]
     if target_iteration:
         lines.extend([
             f"## 目标版本：{target_iteration.get('title')}",
             f"- **版本标识（Tag）**：{target_iteration.get('version_tag')}",
             f"- **内部版本ID**：{target_iteration.get('id')}",
+            f"- **版本类型**：{type_label}",
             f"- **版本状态**：{target_iteration.get('status')}",
             f"- **目标发布时间**：{target_iteration.get('target_release_date') or '未设定'}",
             f"- **版本描述**：{target_iteration.get('description') or '无'}",
@@ -1673,8 +2167,11 @@ def assemble_archive_context(iteration_id: str | None = None, task_id: str | Non
 
     lines.extend([f"## 本版本专属材料（{target_iteration.get('title') if target_iteration else '专属'}）", ""])
     if iteration_materials:
-        # Prioritize fixed slots: requirement_doc, figma, prototype, testcase, then supplementary
-        fixed_order = {"requirement_doc": 0, "figma": 1, "codesign": 2, "prototype": 2, "testcase": 3, "supplementary": 4}
+        # Slot order follows the target version type so an analytics version
+        # leads with its requirement/acceptance tables instead of design slots.
+        ordered_slots = list(iteration_fixed_slots(target_version_type))
+        fixed_order = {slot: index for index, slot in enumerate(ordered_slots)}
+        fixed_order["supplementary"] = len(ordered_slots)
         sorted_iter = sorted(iteration_materials, key=lambda s: fixed_order.get(s.get("slot"), 10))
         for item in sorted_iter:
             slot_name = SOURCE_SLOT_LABELS.get(item.get("slot"), item.get("slot") or "资料")
@@ -1729,6 +2226,141 @@ def workflow_show(record_id: str) -> dict[str, Any]:
             template = None
     return {"record_revision": int(record.get("revision", 0)), "store_revision": int(db.get("revision", 0)),
             "workflow": current, "template": template}
+
+
+def _workflow_evidence_entries(record: dict[str, Any]) -> list[str]:
+    """Collect only evidence strings the item's workflow actually recorded."""
+    current = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+    if not current:
+        return []
+    entries: list[str] = []
+    gates = current.get("gates")
+    if isinstance(gates, dict):
+        for gate in gates.values():
+            if not isinstance(gate, dict):
+                continue
+            for value in gate.get("evidence") or []:
+                if isinstance(value, str):
+                    entries.append(value)
+    for item in current.get("history") or []:
+        if not isinstance(item, dict):
+            continue
+        for value in item.get("evidence") or []:
+            if isinstance(value, str):
+                entries.append(value)
+    return entries
+
+
+def _evidence_allowed_roots() -> list[Path]:
+    candidates = [ROOT, CODE_ROOT, waylume_paths.default_data_dir(), Path("/tmp"), Path("/private/tmp")]
+    roots: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _resolve_workflow_evidence_path(raw: str) -> Path:
+    text = raw.strip()
+    if text.lower().startswith("file://"):
+        parsed = urlsplit(text)
+        if parsed.netloc not in ("", "localhost"):
+            raise ValueError("invalid_evidence_path")
+        text = unquote(parsed.path)
+    path = Path(text).expanduser()
+    # Reject traversal before resolution so even paths that land back inside an
+    # allowed root cannot be used to probe unrelated directories.
+    if ".." in path.parts:
+        raise ValueError("invalid_evidence_path")
+    candidates = [path] if path.is_absolute() else [CODE_ROOT / path, ROOT / path]
+    roots = _evidence_allowed_roots()
+    resolved_candidates: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not any(resolved == root or root in resolved.parents for root in roots):
+            continue
+        resolved_candidates.append(resolved)
+    if not resolved_candidates:
+        raise ValueError("invalid_evidence_path")
+    existing = next((candidate for candidate in resolved_candidates if candidate.is_file()), None)
+    if existing is None:
+        raise ValueError("evidence_not_found")
+    return existing
+
+
+def _looks_like_recorded_path(value: str) -> bool:
+    """A path-like workflow output or evidence value, never prose with newlines."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or len(text) > 4096 or "\n" in text or "\r" in text:
+        return False
+    if text.lower().startswith("file://") or text.startswith("/"):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9._/-]+\.(?:md|markdown|txt|json|log|csv|ya?ml)", text))
+
+
+def read_workflow_evidence_file(record_id: str, evidence_path: Any) -> dict[str, Any]:
+    """Read one UTF-8 evidence file previously recorded by this item's workflow.
+
+    The path must match a recorded evidence string exactly, resolve inside an
+    allowed root, and be a regular file no larger than 128 KiB. Traversal,
+    symlink escapes, binary files and unknown evidence all fail closed.
+    """
+    if not isinstance(evidence_path, str) or not evidence_path.strip() or len(evidence_path) > 4096:
+        raise ValueError("invalid_evidence_path")
+    raw = evidence_path.strip()
+    probe = raw
+    if probe.lower().startswith("file://"):
+        parsed = urlsplit(probe)
+        if parsed.netloc not in ("", "localhost"):
+            raise ValueError("invalid_evidence_path")
+        probe = unquote(parsed.path)
+    if ".." in Path(probe).parts:
+        raise ValueError("invalid_evidence_path")
+    db = load_store()
+    record = _find_record(db, record_id)
+    allowed = {entry.strip() for entry in _workflow_evidence_entries(record) if entry.strip()}
+    # Stage outputs sometimes store a report path instead of its body; allow a
+    # path only when the workflow itself recorded it and it is a single line.
+    gates = ((record.get("workflow") or {}).get("gates") or {})
+    if isinstance(gates, dict):
+        for gate in gates.values():
+            outputs = gate.get("outputs") if isinstance(gate, dict) else None
+            if isinstance(outputs, dict):
+                for value in outputs.values():
+                    if _looks_like_recorded_path(value):
+                        allowed.add(value.strip())
+    if raw not in allowed:
+        raise ValueError("evidence_not_found")
+    path = _resolve_workflow_evidence_path(raw)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError("evidence_not_found") from exc
+    if size > WORKFLOW_EVIDENCE_MAX_BYTES:
+        raise ValueError("evidence_too_large")
+    try:
+        with path.open("rb") as stream:
+            body = stream.read(WORKFLOW_EVIDENCE_MAX_BYTES + 1)
+    except OSError as exc:
+        raise ValueError("evidence_not_found") from exc
+    if len(body) > WORKFLOW_EVIDENCE_MAX_BYTES:
+        raise ValueError("evidence_too_large")
+    if b"\x00" in body:
+        raise ValueError("evidence_not_text")
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("evidence_not_text") from exc
+    return {"path": str(path), "size": len(body), "text": text}
 
 
 DISPATCH_INSTRUCTION = (
@@ -1890,6 +2522,36 @@ def dispatch_card(record_id: str) -> dict[str, Any]:
     return card
 
 
+WORKFLOW_REPORT_FILES = {"audit_report": "audit-report.md", "dev_response": "dev-response.md"}
+
+
+def _persist_workflow_reports(record: dict[str, Any]) -> None:
+    """Keep each audit report and dev response as a standalone Markdown file.
+
+    New submissions carry the Markdown body in the gate outputs; mirroring it
+    into records/<type>/<id>/ makes every task card a self-contained folder.
+    Legacy path-only outputs are left untouched (the one-off migration handles
+    them) and a failed mirror never blocks the workflow commit.
+    """
+    current = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+    if not current:
+        return
+    folder = ROOT / "records" / str(record.get("type") or "task") / str(record.get("id") or "")
+    for gate in (current.get("gates") or {}).values():
+        outputs = gate.get("outputs") if isinstance(gate, dict) else None
+        if not isinstance(outputs, dict):
+            continue
+        for key, filename in WORKFLOW_REPORT_FILES.items():
+            value = outputs.get(key)
+            if not isinstance(value, str) or not value.strip() or _looks_like_recorded_path(value):
+                continue
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / filename).write_text(value.rstrip() + "\n", encoding="utf-8")
+            except OSError:
+                continue
+
+
 def _workflow_write(record_id: str, action: str, expected_revision: int | None, operation) -> dict[str, Any]:
     def update() -> dict[str, Any]:
         db = load_store()
@@ -1901,6 +2563,7 @@ def _workflow_write(record_id: str, action: str, expected_revision: int | None, 
         if expected != current:
             raise workflow.WorkflowError("revision_conflict", f"revision 冲突：期望 {expected}，当前 {current}")
         operation(record)
+        _persist_workflow_reports(record)
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
         event("workflow_" + action, record, db["revision"])
@@ -2153,15 +2816,29 @@ def cmd_task_context(args: argparse.Namespace) -> None:
     print(json.dumps(task_context(args.id), ensure_ascii=False, indent=2))
 
 
+def cmd_inspection_report(args: argparse.Namespace) -> None:
+    payload = json.load(sys.stdin) if args.input == "-" else json.loads(Path(args.input).read_text(encoding="utf-8"))
+    print(json.dumps(record_inspection(payload), ensure_ascii=False, indent=2))
+
+
+def cmd_inspection_today(args: argparse.Namespace) -> None:
+    print(json.dumps(inspection_runs(args.date), ensure_ascii=False, indent=2))
+
+
 def cmd_progress(args: argparse.Namespace) -> None:
     evidence = args.evidence or []
-    print(json.dumps(add_progress(args.id, args.message, args.actor, evidence), ensure_ascii=False, indent=2))
+    print(json.dumps(add_progress(args.id, args.message, args.actor, evidence, status_line=args.summary),
+                     ensure_ascii=False, indent=2))
 
 
 def cmd_task_result(args: argparse.Namespace) -> None:
     evidence = args.evidence or []
-    print(json.dumps(add_progress(args.id, args.message, args.actor, evidence, result=True, outcome=args.outcome),
-                     ensure_ascii=False, indent=2))
+    print(json.dumps(add_progress(args.id, args.message, args.actor, evidence, result=True, outcome=args.outcome,
+                                  status_line=args.summary), ensure_ascii=False, indent=2))
+
+
+def cmd_status_line(args: argparse.Namespace) -> None:
+    print(json.dumps(set_status_line(args.id, args.text, args.actor), ensure_ascii=False, indent=2))
 
 
 def cmd_archive(args: argparse.Namespace) -> None:
@@ -2309,7 +2986,7 @@ def cmd_sync_bugs(args: argparse.Namespace) -> None:
     captured_at = _parse_iso_datetime(attempt.get("captured_at"))
     snapshot_dt = _parse_iso_datetime(snapshot_at)
     same_round = bool(captured_at and snapshot_dt and abs((captured_at - snapshot_dt).total_seconds()) <= 5)
-    successful = bool(snapshot_at) and same_round and isinstance(bugs, list) and not stale and (attempt.get("result") == "succeeded" or attempt.get("bug_list_result") == "succeeded") and attempt.get("stale") is False and attempt.get("filter") == "我负责的" and "matched self owner" in verification and "complete=true" in verification and "all pages returned" in verification and isinstance(total, int) and not isinstance(total, bool) and isinstance(unique_count, int) and not isinstance(unique_count, bool) and total == len(bugs) == len(set(ids)) == unique_count and isinstance(attempt.get("pages_read"), int) and not isinstance(attempt.get("pages_read"), bool) and attempt["pages_read"] > 0 and all(ids)
+    successful = bool(snapshot_at) and same_round and isinstance(bugs, list) and not stale and (attempt.get("result") == "succeeded" or attempt.get("bug_list_result") == "succeeded") and attempt.get("stale") is False and attempt.get("filter") == "我负责的" and "matched self owner" in verification.lower() and "complete=true" in verification.lower() and "all pages returned" in verification.lower() and isinstance(total, int) and not isinstance(total, bool) and isinstance(unique_count, int) and not isinstance(unique_count, bool) and total == len(bugs) == len(set(ids)) == unique_count and isinstance(attempt.get("pages_read"), int) and not isinstance(attempt.get("pages_read"), bool) and attempt["pages_read"] > 0 and (all(ids) if ids else total == 0)
 
     def update() -> dict[str, Any]:
         db = load_store()
@@ -2441,7 +3118,7 @@ def cmd_sync_bugs(args: argparse.Namespace) -> None:
             elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") == "transfer_pending":
                 # A complete but pre-request snapshot cannot confirm this handoff.
                 continue
-            elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") != "transferred" and old.get("status") not in {"archived", "owner_changed"}:
+            elif old.get("type") == "bug" and old.get("id") not in incoming_ids and old.get("transfer_disposition") != "transferred" and old.get("status") not in {"archived", "owner_changed"} and not str(old.get("source", "")).startswith("13.4.2 埋点验收用例"):
                 old.setdefault("history", []).append({"at": timestamp(), "status": old.get("status"), "note": f"不在成功快照 {snapshot_at}，转为已归档历史"})
                 old["status"] = "archived"
                 old["updated_at"] = timestamp()
@@ -2531,6 +3208,13 @@ def error_code(exc: ValueError) -> str:
         "prompt_required_or_too_long": "invalid_prompt",
         "invalid_claim_parameters": "invalid_claim_parameters",
         "invalid_source_url": "invalid_source_url",
+        "invalid_source_update": "invalid_source_update",
+        "invalid_source_type": "invalid_source_type",
+        "preview_failed": "preview_failed",
+        "invalid_evidence_path": "invalid_evidence_path",
+        "evidence_not_found": "evidence_not_found",
+        "evidence_too_large": "evidence_too_large",
+        "evidence_not_text": "evidence_not_text",
         "invalid_source_category": "invalid_source_category",
         "invalid_source_purpose": "invalid_source_purpose",
         "invalid_source_primary": "invalid_source_primary",
@@ -2569,6 +3253,12 @@ def error_code(exc: ValueError) -> str:
         "missing_iteration_id": "missing_iteration_id",
         "invalid_iteration_title": "invalid_iteration_title",
         "invalid_iteration_version_tag": "invalid_iteration_version_tag",
+        "invalid_iteration_version_type": "invalid_iteration_version_type",
+        "invalid_iteration_patch": "invalid_iteration_patch",
+        "iteration_duplicate": "iteration_duplicate",
+        "iteration_type_verification_failed": "iteration_type_verification_failed",
+        "invalid_version_type_backup": "invalid_version_type_backup",
+        "version_type_backup_mismatch": "version_type_backup_mismatch",
     }
     return mapping.get(str(exc), "invalid_request")
 
@@ -2693,6 +3383,80 @@ def normalize_source_url(raw_url: str) -> tuple[str, str]:
     if any(char.isspace() or ord(char) < 32 for char in url):
         raise ValueError("invalid_source_url")
     return url, normalized
+
+
+def _inspection_log_path() -> Path:
+    return ROOT / "inspections.json"
+
+
+def record_inspection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Append one patrol run summary for the dashboard's inspection list."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_inspection_report")
+    status = payload.get("status", "succeeded")
+    if status not in {"succeeded", "partial", "blocked"}:
+        raise ValueError("invalid_inspection_status")
+    notes = payload.get("notes", "")
+    if not isinstance(notes, str) or len(notes) > 2000:
+        raise ValueError("invalid_inspection_notes")
+    def ids(key: str) -> list[str]:
+        value = payload.get(key, [])
+        if not isinstance(value, list) or len(value) > 200 or any(not isinstance(item, str) or not item.strip() for item in value):
+            raise ValueError("invalid_inspection_ids")
+        return [item.strip() for item in value]
+    bugs, requirements = ids("new_bugs"), ids("new_requirements")
+    run_id = payload.get("run_id")
+    if run_id is not None and (not isinstance(run_id, str) or len(run_id) > 120):
+        raise ValueError("invalid_inspection_run")
+
+    def update() -> dict[str, Any]:
+        path = _inspection_log_path()
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            entries = []
+        if not isinstance(entries, list):
+            entries = []
+        entry = {"at": timestamp(), "status": status, "new_bugs": bugs, "new_requirements": requirements,
+                 "notes": notes.strip(), "run_id": run_id}
+        entries.append(entry)
+        entries = entries[-200:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        event("inspection_reported", {"id": entry["at"], "type": "inspection"}, 0)
+        return entry
+    return with_lock(update)
+
+
+def inspection_runs(date: str | None = None) -> dict[str, Any]:
+    """Return patrol summaries for one local date (default: today) with titles."""
+    day = (date or timestamp())[:10]
+    try:
+        entries = json.loads(_inspection_log_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        entries = []
+    if not isinstance(entries, list):
+        entries = []
+    records = {str(record.get("id")): record for record in load_store().get("records", []) if isinstance(record, dict)}
+    def enrich(ids: Any) -> list[dict[str, Any]]:
+        result = []
+        for ident in ids if isinstance(ids, list) else []:
+            record = records.get(str(ident)) or {}
+            result.append({"id": str(ident), "title": record.get("title") or str(ident), "type": record.get("type")})
+        return result
+    runs = []
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("at", ""))[:10] != day:
+            continue
+        runs.append({"at": entry.get("at"), "status": entry.get("status", "succeeded"),
+                     "new_bugs": enrich(entry.get("new_bugs")), "new_requirements": enrich(entry.get("new_requirements")),
+                     "notes": entry.get("notes", ""), "run_id": entry.get("run_id")})
+    runs.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+    return {"date": day, "runs": runs,
+            "new_bug_count": sum(len(run["new_bugs"]) for run in runs),
+            "new_requirement_count": sum(len(run["new_requirements"]) for run in runs)}
 
 
 def _source_store_list(db: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2853,13 +3617,13 @@ def enrich_source_records(records: list[dict[str, Any]], all_sources: list[dict[
         else:
             label = label.strip()[:MAX_SOURCE_VERSION_LABEL]
         enabled_value = record.get("inspection_enabled")
-        inspection_enabled = bool(enabled_value) if isinstance(enabled_value, bool) else slot == "requirement_doc"
+        inspection_enabled = bool(enabled_value) if isinstance(enabled_value, bool) else slot in REQUIREMENT_SLOTS
         mode = record.get("inspection_mode")
-        inspection_mode = mode if mode in SOURCE_INSPECTION_MODES else ("auto" if slot == "requirement_doc" else "manual")
+        inspection_mode = mode if mode in SOURCE_INSPECTION_MODES else ("auto" if slot in REQUIREMENT_SLOTS else "manual")
         active_ids = [str(item.get("id")) for item in active]
         rank = active_ids.index(str(record.get("id"))) if str(record.get("id")) in active_ids else None
         inspection_active = bool(_source_is_active(record) and inspection_enabled)
-        if slot == "requirement_doc" and rank is not None and rank > 1:
+        if slot in REQUIREMENT_SLOTS and rank is not None and rank > 1:
             inspection_active = False
         copy.update({
             "slot": slot,
@@ -2887,14 +3651,17 @@ def enrich_source_records(records: list[dict[str, Any]], all_sources: list[dict[
     return enriched
 
 
-def _validate_scope_slot(scope: str, slot: str | None) -> None:
-    """Reject fixed slots that belong to the other archive scope."""
+def _validate_scope_slot(scope: str, slot: str | None, version_type: str | None = None) -> None:
+    """Reject fixed slots that do not exist in the target scope/version type."""
     if slot is None:
         return
-    if scope == "global" and slot in ITERATION_FIXED_SLOTS:
+    if scope == "global" and slot in VERSION_FIXED_SLOTS:
         raise ValueError("invalid_source_slot")
     if scope == "iteration" and slot in GLOBAL_FIXED_SLOTS:
         raise ValueError("invalid_source_slot")
+    if scope == "iteration" and version_type is not None and slot in VERSION_FIXED_SLOTS:
+        if slot not in VERSION_SLOT_ORDER[_iteration_type_value(version_type)]:
+            raise ValueError("invalid_source_slot")
 
 
 def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *, slot: Any, group_id: Any, version_label: Any,
@@ -2945,7 +3712,7 @@ def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *,
         if not matched:
             raise ValueError("iteration_not_found")
         clean_iter_id = str(matched.get("id"))
-        _validate_scope_slot("iteration", slot)
+        _validate_scope_slot("iteration", slot, iteration_version_type(matched))
     else:
         clean_iter_id = None
         if scope is not None:
@@ -2971,12 +3738,23 @@ def _new_source_library_fields(sources: list[dict[str, Any]], source_id: str, *,
         "iteration_id": clean_iter_id,
         "attachments": list(attachments or []),
         "promote_group_slot": bool(members and slot is not None and not existing_slots),
-        "inspection_enabled": slot == "requirement_doc",
-        "inspection_mode": "auto" if slot == "requirement_doc" else "manual",
+        "inspection_enabled": slot in REQUIREMENT_SLOTS,
+        "inspection_mode": "auto" if slot in REQUIREMENT_SLOTS else "manual",
     }
 
 
-def add_source_link(url: str, name: str | None = None, category: str = "需求资料", origin: str = "dashboard", *, source_id: str | None = None, purpose: str | None = None, primary: bool | None = None, verification_state: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None, scope: Any = None, iteration_id: Any = None, attachments: Any = None) -> dict[str, Any]:
+def _apply_source_note(source: dict[str, Any], note: str | None, note_masked: bool | None) -> None:
+    if note is not None:
+        if not isinstance(note, str) or len(note) > 2000:
+            raise ValueError("invalid_source_note")
+        source["note"] = note.strip()
+    if note_masked is not None:
+        if not isinstance(note_masked, bool):
+            raise ValueError("invalid_source_note_masked")
+        source["note_masked"] = note_masked
+
+
+def add_source_link(url: str, name: str | None = None, category: str = "需求资料", origin: str = "dashboard", *, source_id: str | None = None, purpose: str | None = None, primary: bool | None = None, verification_state: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None, scope: Any = None, iteration_id: Any = None, attachments: Any = None, note: str | None = None, note_masked: bool | None = None) -> dict[str, Any]:
     original, normalized_url = normalize_source_url(url)
     if not isinstance(category, str) or not category.strip() or len(category) > 80:
         raise ValueError("invalid_source_category")
@@ -3028,6 +3806,7 @@ def add_source_link(url: str, name: str | None = None, category: str = "需求�
                 if _source_group_id(member) == library["group_id"]:
                     member["slot"] = library["slot"]
                     member["updated_at"] = at
+        _apply_source_note(source, note, note_masked)
         sources.append(source)
         db["sources"] = sources
         db["revision"] = int(db.get("revision", 0)) + 1
@@ -3085,7 +3864,7 @@ def validate_source_file(filename: str, data: bytes) -> tuple[str, str]:
     return extension, mime
 
 
-def add_source_file(filename: str, data: bytes, category: str = "需求资料", origin: str = "dashboard", *, name: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None, scope: Any = None, iteration_id: Any = None, attachments: Any = None) -> dict[str, Any]:
+def add_source_file(filename: str, data: bytes, category: str = "需求资料", origin: str = "dashboard", *, name: str | None = None, slot: Any = None, group_id: Any = None, version_label: Any = None, scope: Any = None, iteration_id: Any = None, attachments: Any = None, note: str | None = None, note_masked: bool | None = None) -> dict[str, Any]:
     extension, mime = validate_source_file(filename, data)
     if not isinstance(category, str) or not category.strip() or len(category) > 80:
         raise ValueError("invalid_source_category")
@@ -3129,6 +3908,7 @@ def add_source_file(filename: str, data: bytes, category: str = "需求资料", 
             os.fsync(handle.fileno())
         committed = False
         try:
+            _apply_source_note(source, note, note_masked)
             sources.append(source)
             db["sources"] = sources
             db["revision"] = int(db.get("revision", 0)) + 1
@@ -3141,6 +3921,123 @@ def add_source_file(filename: str, data: bytes, category: str = "需求资料", 
                 stored_path.unlink(missing_ok=True)
             raise
     return with_lock(update)
+
+
+def update_source(source_id: str, *, name: str | None = None, url: str | None = None,
+                  note: str | None = None, note_masked: bool | None = None) -> dict[str, Any]:
+    """Edit a source's display name and/or link without changing its identity."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", source_id):
+        raise ValueError("source_not_found")
+    if name is None and url is None and note is None and note_masked is None:
+        raise ValueError("invalid_source_update")
+    clean_name = None
+    if name is not None:
+        if not isinstance(name, str):
+            raise ValueError("invalid_source_name")
+        clean_name = " ".join(name.split()).strip()
+        if not clean_name or len(clean_name) > 200:
+            raise ValueError("invalid_source_name")
+    clean_note = None
+    if note is not None:
+        if not isinstance(note, str) or len(note) > 2000:
+            raise ValueError("invalid_source_note")
+        clean_note = note.strip()
+    if note_masked is not None and not isinstance(note_masked, bool):
+        raise ValueError("invalid_source_note_masked")
+    original_url = normalized_url = None
+    if url is not None:
+        original_url, normalized_url = normalize_source_url(url)
+
+    def update() -> dict[str, Any]:
+        db = load_store()
+        sources = _source_store_list(db)
+        source = next((item for item in sources if item.get("id") == source_id), None)
+        if source is None:
+            raise ValueError("source_not_found")
+        if normalized_url is not None:
+            if source.get("type") != "link":
+                raise ValueError("invalid_source_type")
+            duplicate = next((item for item in sources if item.get("id") != source_id
+                              and _source_is_active(item) and item.get("normalized_url") == normalized_url), None)
+            if duplicate:
+                raise ValueError("source_duplicate")
+            source["url"] = original_url
+            source["normalized_url"] = normalized_url
+            source["file_ext"] = _source_file_extension(source)
+            source["mime"] = _source_mime(source)
+            source["logo_kind"] = _source_logo_kind(source)
+        if clean_name is not None:
+            source["name"] = clean_name
+            # An explicit override is the visible display name; keep it in
+            # sync so editing a source is not silently masked by stale data.
+            overrides = source.get("overrides")
+            if isinstance(overrides, dict) and "name" in overrides:
+                overrides["name"] = clean_name
+        if clean_note is not None:
+            source["note"] = clean_note
+        if note_masked is not None:
+            source["note_masked"] = note_masked
+        source["updated_at"] = timestamp()
+        db["revision"] = int(db.get("revision", 0)) + 1
+        atomic_write(db)
+        _source_event("source_updated", source, db["revision"])
+        return {"revision": db["revision"], "source": source}
+    return with_lock(update)
+
+
+def _preview_host_allowed(host: str | None) -> bool:
+    if not host:
+        return False
+    value = host.strip().lower().strip("[]")
+    if value in {"localhost", "localhost.localdomain"} or value.endswith(".localhost"):
+        return False
+    try:
+        addresses = {info[4][0].split("%")[0] for info in socket.getaddrinfo(value, None)}
+    except OSError:
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def _extract_html_title(text: str) -> str | None:
+    match = re.search(r"<title[^>]*>(.*?)</title>", text or "", flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = html.unescape(re.sub(r"\s+", " ", match.group(1))).strip()
+    return title[:200] or None
+
+
+def preview_source_link(url: str) -> dict[str, Any]:
+    """Fetch a public page title so the library can prefill a readable name."""
+    original, _ = normalize_source_url(url)
+    parts = urlsplit(original)
+    if not _preview_host_allowed(parts.hostname):
+        raise ValueError("invalid_source_url")
+    request = urllib.request.Request(original, headers={"User-Agent": "Waylume-Library/1.0",
+                                                        "Accept": "text/html,application/xhtml+xml"})
+    try:
+        with urllib.request.urlopen(request, timeout=7) as response:
+            final_url = response.geturl()
+            final_parts = urlsplit(final_url)
+            if final_parts.scheme.lower() not in {"http", "https"} or not _preview_host_allowed(final_parts.hostname):
+                raise ValueError("invalid_source_url")
+            charset = response.headers.get_content_charset() or "utf-8"
+            body = response.read(262144)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("preview_failed") from exc
+    try:
+        text = body.decode(charset, errors="replace")
+    except LookupError:
+        text = body.decode("utf-8", errors="replace")
+    return {"url": original, "final_url": final_url, "title": _extract_html_title(text)}
 
 
 def change_source_state(source_id: str, active: bool) -> dict[str, Any]:
@@ -3191,7 +4088,7 @@ def set_source_inspection(source_id: str, enabled: bool) -> dict[str, Any]:
             raise ValueError("source_not_found")
         slot = _source_effective_slot(source)
         source["inspection_enabled"] = enabled
-        source["inspection_mode"] = "auto" if slot == "requirement_doc" else "manual"
+        source["inspection_mode"] = "auto" if slot in REQUIREMENT_SLOTS else "manual"
         source["updated_at"] = timestamp()
         db["revision"] = int(db.get("revision", 0)) + 1
         atomic_write(db)
@@ -3203,10 +4100,10 @@ def set_source_inspection(source_id: str, enabled: bool) -> dict[str, Any]:
 def _apply_source_slot(member: dict[str, Any], previous_slot: str | None, slot: str | None) -> None:
     """Write a slot and keep the inspection defaults consistent with it."""
     member["slot"] = slot
-    if slot == "requirement_doc":
+    if slot in REQUIREMENT_SLOTS:
         # Assigning a material to the requirement slot auto-includes it. A
         # version that was already a requirement doc keeps an explicit removal.
-        if previous_slot != "requirement_doc" or "inspection_enabled" not in member:
+        if previous_slot not in REQUIREMENT_SLOTS or "inspection_enabled" not in member:
             member["inspection_enabled"] = True
         member["inspection_mode"] = "auto"
     else:
@@ -3225,6 +4122,10 @@ def set_source_slot(source_id: str, slot: Any) -> dict[str, Any]:
         source = next((item for item in sources if item.get("id") == source_id), None)
         if source is None:
             raise ValueError("source_not_found")
+        if _source_scope(source) == "iteration" and source.get("iteration_id"):
+            iteration = _find_iteration(db, str(source.get("iteration_id")))
+            if iteration:
+                _validate_scope_slot("iteration", slot, iteration_version_type(iteration))
         group_id = _source_group_id(source)
         members = [item for item in sources if _source_group_id(item) == group_id]
         at = timestamp()
@@ -3260,16 +4161,18 @@ def set_source_location(source_id: str, scope: str, iteration_id: str | None = N
         if source is None:
             raise ValueError("source_not_found")
         target_iteration_id = None
+        target_version_type = None
         if scope == "iteration":
             it = _find_iteration(db, iteration_id.strip())
             if not it:
                 raise ValueError("iteration_not_found")
             target_iteration_id = it["id"]
-        # Omitting the slot preserves the current one. A cross-scope move that
-        # would keep an invalid fixed slot is rejected instead of silently
-        # clearing the group's slot.
+            target_version_type = iteration_version_type(it)
+        # Omitting the slot preserves the current one. A cross-scope or
+        # cross-type move that would keep an invalid fixed slot is rejected
+        # instead of silently clearing the group's slot.
         target_slot = clean_slot if slot_provided else _source_effective_slot(source)
-        _validate_scope_slot(scope, target_slot)
+        _validate_scope_slot(scope, target_slot, target_version_type)
         # A material group shares one location. Moving one row moves every
         # version so fixed-slot history cannot leak across versions.
         group_id = _source_group_id(source)
@@ -3331,10 +4234,10 @@ def source_inspection_selection() -> list[dict[str, Any]]:
         for rank, source in enumerate(active):
             slot = _source_effective_slot(source)
             stored = source.get("inspection_enabled")
-            enabled = bool(stored) if isinstance(stored, bool) else slot == "requirement_doc"
+            enabled = bool(stored) if isinstance(stored, bool) else slot in REQUIREMENT_SLOTS
             if not enabled:
                 continue
-            if slot == "requirement_doc" and rank > 1:
+            if slot in REQUIREMENT_SLOTS and rank > 1:
                 continue
             selected_ids.add(id(source))
     selected = [item for item in all_sources if id(item) in selected_ids]
@@ -3386,8 +4289,8 @@ def import_source_seed(path: Path) -> dict[str, Any]:
             "normalized_url": normalized, "category": category[:80], "purpose": purpose,
             "primary": raw.get("primary", False), "verification_state": verification_state,
             "active": raw.get("active", True), "slot": slot, "group_id": group_id,
-            "inspection_enabled": inspection_enabled if inspection_enabled is not None else slot == "requirement_doc",
-            "inspection_mode": inspection_mode or ("auto" if slot == "requirement_doc" else "manual"),
+            "inspection_enabled": inspection_enabled if inspection_enabled is not None else slot in REQUIREMENT_SLOTS,
+            "inspection_mode": inspection_mode or ("auto" if slot in REQUIREMENT_SLOTS else "manual"),
         }
         if version_label is not None:
             incoming["version_label"] = version_label
@@ -3501,7 +4404,8 @@ def cmd_iteration(args: argparse.Namespace) -> None:
             target_release_date=args.target_release_date,
             description=args.description or "",
             iteration_id=args.iteration_id,
-            order=getattr(args, "order", None)
+            order=getattr(args, "order", None),
+            version_type=getattr(args, "version_type", None)
         ), ensure_ascii=False, indent=2))
     elif action == "show":
         db = load_store()
@@ -3526,6 +4430,12 @@ def cmd_iteration(args: argparse.Namespace) -> None:
         print(json.dumps(assign_record_iteration(args.record_id, args.iteration_id or None), ensure_ascii=False, indent=2))
     elif action == "reorder":
         print(json.dumps(reorder_iterations(args.ids), ensure_ascii=False, indent=2))
+    elif action == "set-type":
+        print(json.dumps(set_iteration_type(
+            args.id, args.type, backup=True, dry_run=getattr(args, "dry_run", False)
+        ), ensure_ascii=False, indent=2))
+    elif action == "restore-type":
+        print(json.dumps(restore_iteration_type_backup(args.backup), ensure_ascii=False, indent=2))
     elif action == "migrate":
         tag = getattr(args, "version_tag", None) or "v13.4.2"
         title = getattr(args, "title", None) or "13.4.2 智能相册与AI音乐优化"
@@ -3774,6 +4684,14 @@ def main() -> None:
     batch_init = sub.add_parser("batch-init", help="adopt one existing task into the current task batch")
     batch_init.add_argument("--task-id", required=True)
     batch_init.set_defaults(func=cmd_batch_init)
+    inspection_cmd = sub.add_parser("inspection", help="record or read patrol run summaries")
+    inspection_sub = inspection_cmd.add_subparsers(dest="inspection_command", required=True)
+    inspection_report = inspection_sub.add_parser("report", help="append one patrol run summary")
+    inspection_report.add_argument("--input", default="-", help="JSON input path or stdin")
+    inspection_report.set_defaults(func=cmd_inspection_report)
+    inspection_today = inspection_sub.add_parser("today", help="show patrol summaries for one local date")
+    inspection_today.add_argument("--date")
+    inspection_today.set_defaults(func=cmd_inspection_today)
     task_context_cmd = sub.add_parser("task-context", help="read one task's initial request, current brief, progress and result")
     task_context_cmd.add_argument("id")
     task_context_cmd.set_defaults(func=cmd_task_context)
@@ -3785,14 +4703,22 @@ def main() -> None:
     progress_cmd.add_argument("--message", required=True)
     progress_cmd.add_argument("--actor", default="agent")
     progress_cmd.add_argument("--evidence", action="append", help="evidence reference; repeat as needed")
+    progress_cmd.add_argument("--summary", help="one-line current status, shown on the card and detail header")
     progress_cmd.set_defaults(func=cmd_progress)
     task_result_cmd = sub.add_parser("task-result", help="append and retain a final task result brief")
     task_result_cmd.add_argument("id")
     task_result_cmd.add_argument("--message", required=True)
+    task_result_cmd.add_argument("--summary", required=True,
+                                 help="required one-line current status shown on the card and detail header")
     task_result_cmd.add_argument("--actor", default="agent")
     task_result_cmd.add_argument("--outcome", choices=("success", "failure", "partial", "cancelled"))
     task_result_cmd.add_argument("--evidence", action="append", help="evidence reference; repeat as needed")
     task_result_cmd.set_defaults(func=cmd_task_result)
+    status_line_cmd = sub.add_parser("summary", help="set the one-line current status shown on the card and detail header")
+    status_line_cmd.add_argument("id")
+    status_line_cmd.add_argument("text")
+    status_line_cmd.add_argument("--actor", default="user")
+    status_line_cmd.set_defaults(func=cmd_status_line)
     archive = sub.add_parser("archive", help="archive one record")
     archive.add_argument("id")
     archive.add_argument("--reason")
@@ -3899,6 +4825,8 @@ def main() -> None:
     iter_create.add_argument("--description", default="")
     iter_create.add_argument("--iteration-id", help="optional custom iteration ID")
     iter_create.add_argument("--order", type=int, help="insert position in ascending order (0=oldest, default=newest)")
+    iter_create.add_argument("--version-type", choices=sorted(VERSION_TYPES), default=DEFAULT_VERSION_TYPE,
+                             help="iteration (default) or analytics")
     iter_show = iter_sub.add_parser("show", help="show one iteration")
     iter_show.add_argument("id")
     iter_switch = iter_sub.add_parser("switch", help="set current active iteration")
@@ -3918,6 +4846,13 @@ def main() -> None:
     iter_assign.add_argument("iteration_id")
     iter_reorder = iter_sub.add_parser("reorder", help="persist display order; pass IDs newest first")
     iter_reorder.add_argument("ids", nargs="+")
+    iter_set_type = iter_sub.add_parser("set-type", help="convert a version to iteration/analytics and relocate its materials")
+    iter_set_type.add_argument("id")
+    iter_set_type.add_argument("--type", required=True, choices=sorted(VERSION_TYPES))
+    iter_set_type.add_argument("--dry-run", action="store_true", help="show the slot migration without writing")
+    iter_restore_type = iter_sub.add_parser("restore-type", help="restore one version's type and slots from a conversion backup")
+    iter_restore_type.add_argument("--backup", required=True, help="backup directory returned by set-type")
+    iter_restore_type.set_defaults(func=cmd_iteration)
     iter_migrate = iter_sub.add_parser("migrate", help="migrate legacy records and sources into default iteration archive")
     iter_migrate.add_argument("--version-tag", default="v13.4.2", help="default iteration version tag")
     iter_migrate.add_argument("--title", default="13.4.2 智能相册与AI音乐优化", help="default iteration title")

@@ -49,10 +49,66 @@ class BackendTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output): dashboardctl.cmd_upsert(Namespace(input=str(input_path)))
             results.append(json.loads(output.getvalue())["record"]["id"])
-        self.assertRegex(results[0], r"^ZT-T-[A-F0-9]{12}$")
-        self.assertRegex(results[1], r"^ZT-W-[A-F0-9]{12}$")
+        self.assertEqual(results[0], "1001")
+        self.assertEqual(results[1], "1002")
         self.assertEqual(results[2], "JIRA-123")
         self.assertEqual(len(set(results)), 3)
+        # The counter is persisted with the store and never rewinds after a
+        # record is removed, so a later creation cannot reuse an id.
+        self.assertEqual(dashboardctl.load_store()["record_id_seq"], 1002)
+        db = dashboardctl.load_store()
+        db["records"] = [record for record in db["records"] if record["id"] != "1002"]
+        dashboardctl.atomic_write(db)
+        input_path.write_text(json.dumps({"type": "task", "title": "after delete", "status": "pending"}), encoding="utf-8")
+        output = StringIO()
+        with redirect_stdout(output): dashboardctl.cmd_upsert(Namespace(input=str(input_path)))
+        self.assertEqual(json.loads(output.getvalue())["record"]["id"], "1003")
+
+    def test_upsert_numeric_ids_skip_legacy_numeric_ids_and_do_not_add_display_id(self):
+        from argparse import Namespace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        db = dashboardctl.load_store()
+        db["records"].append({"id": "2001", "type": "work", "title": "legacy numeric id", "status": "pending"})
+        dashboardctl.atomic_write(db)
+        input_path = self.root / "numeric-record.json"
+        input_path.write_text(json.dumps({"type": "work", "title": "new numeric", "status": "pending"}), encoding="utf-8")
+        output = StringIO()
+        with redirect_stdout(output): dashboardctl.cmd_upsert(Namespace(input=str(input_path)))
+        created = json.loads(output.getvalue())["record"]
+        self.assertEqual(created["id"], "2002")
+        self.assertNotIn("display_id", created)
+        self.assertEqual(dashboardctl.load_store()["record_id_seq"], 2002)
+        payload = server.build_payload()
+        numeric = next(row for row in payload["requirements"] if row["id"] == "2002")
+        self.assertNotIn("display_id", numeric)
+        legacy_task = next(row for row in payload["delegated"] if row["id"] == "T-1")
+        self.assertRegex(legacy_task["display_id"], r"^ZT-L-[A-F0-9]{12}$")
+
+    def test_numeric_id_flows_through_workflow_bindings_related_ids_and_dispatch_card(self):
+        from argparse import Namespace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        def upsert(payload):
+            path = self.root / "numeric-flow.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output): dashboardctl.cmd_upsert(Namespace(input=str(path)))
+            return json.loads(output.getvalue())["record"]
+        task = upsert({"type": "task", "title": "数字任务", "status": "pending"})
+        related = upsert({"type": "work", "title": "数字需求", "status": "pending", "related_ids": [task["id"]]})
+        self.assertEqual(task["id"], "1001")
+        self.assertEqual(related["related_ids"], ["1001"])
+        dashboardctl.workflow_start(task["id"], actor_role="lead", actor="lead")
+        card = dashboardctl.dispatch_card(task["id"])
+        self.assertEqual(card["record_id"], "1001")
+        self.assertEqual(card["next"]["action"], "dispatch")
+        bound = dashboardctl.bind_agent(task["id"], "dev", "numeric-agent")
+        self.assertEqual(bound["record"]["agent_bindings"]["dev"]["actor"], "numeric-agent")
+        progress = dashboardctl.add_progress(task["id"], "numeric id progress", actor="numeric-agent")
+        self.assertEqual(progress["record"]["id"], "1001")
+        context = dashboardctl.task_context(task["id"])
+        self.assertEqual(context["record"]["id"], "1001")
 
     def test_separate_files_recoverable_layout_and_context_path(self):
         self.assertTrue((self.root / "records/task/T-1/record.json").is_file())
@@ -88,6 +144,55 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "store_revision_conflict"):
             with patch("sys.stdout", new_callable=__import__("io").StringIO):
                 dashboardctl.cmd_upsert(__import__("argparse").Namespace(input=str(input_path), expected_store_revision=1))
+
+    def test_upsert_preserves_existing_completed_at_when_status_remains_completed(self):
+        input_path = self.root / "upsert_completed.json"
+        first = {
+            "id": "ANALYTICS-13.4.2-V057",
+            "type": "bug",
+            "title": "埋点验收用例",
+            "status": "completed",
+            "completed_at": "2026-11-24T11:35:44+08:00",
+            "observed_at": "2026-11-24T11:35:44+08:00",
+        }
+        input_path.write_text(json.dumps(first), encoding="utf-8")
+        with patch("sys.stdout", new_callable=__import__("io").StringIO):
+            dashboardctl.cmd_upsert(__import__("argparse").Namespace(input=str(input_path), expected_store_revision=None))
+
+        patrol_resync = {
+            "id": "ANALYTICS-13.4.2-V057",
+            "type": "bug",
+            "title": "埋点验收用例",
+            "status": "completed",
+            "completed_at": "2026-11-26T09:32:42+08:00",
+            "observed_at": "2026-11-26T09:32:42+08:00",
+        }
+        input_path.write_text(json.dumps(patrol_resync), encoding="utf-8")
+        with patch("sys.stdout", new_callable=__import__("io").StringIO):
+            dashboardctl.cmd_upsert(__import__("argparse").Namespace(input=str(input_path), expected_store_revision=None))
+
+        stored = next(r for r in dashboardctl.load_store()["records"] if r["id"] == "ANALYTICS-13.4.2-V057")
+        self.assertEqual(stored["completed_at"], "2026-11-24T11:35:44+08:00")
+        self.assertEqual(stored["observed_at"], "2026-11-26T09:32:42+08:00")
+
+        reopened = {"id": "ANALYTICS-13.4.2-V057", "type": "bug", "title": "埋点验收用例", "status": "in_progress"}
+        input_path.write_text(json.dumps(reopened), encoding="utf-8")
+        with patch("sys.stdout", new_callable=__import__("io").StringIO):
+            dashboardctl.cmd_upsert(__import__("argparse").Namespace(input=str(input_path), expected_store_revision=None))
+
+        recompleted = {
+            "id": "ANALYTICS-13.4.2-V057",
+            "type": "bug",
+            "title": "埋点验收用例",
+            "status": "completed",
+            "completed_at": "2026-11-26T10:00:00+08:00",
+        }
+        input_path.write_text(json.dumps(recompleted), encoding="utf-8")
+        with patch("sys.stdout", new_callable=__import__("io").StringIO):
+            dashboardctl.cmd_upsert(__import__("argparse").Namespace(input=str(input_path), expected_store_revision=None))
+
+        stored_after = next(r for r in dashboardctl.load_store()["records"] if r["id"] == "ANALYTICS-13.4.2-V057")
+        self.assertEqual(stored_after["completed_at"], "2026-11-26T10:00:00+08:00")
 
     def test_handoff_update_preserves_manual_completion_and_context_under_cas(self):
         db = dashboardctl.load_store(); record = db["records"][0]
@@ -448,6 +553,24 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(dashboardctl.completion_timestamp(record), "2026-10-21T09:30:00+08:00")
         record["completed_at"] = "2026-10-20T10:00:00+08:00"
         self.assertEqual(dashboardctl.completion_timestamp(record), record["completed_at"])
+
+    def test_owner_changed_after_our_delivery_is_completed(self):
+        delivered = {
+            "id": "BUG-DELIVERED", "type": "bug", "title": "fixed", "status": "owner_changed",
+            "progress": [{"at": "2026-11-18T22:19:36+08:00", "message": "修复已推送",
+                          "evidence": ["commit:634e6bb635a", "build:/tmp/build-b.log"]}],
+        }
+        self.assertEqual(dashboardctl.effective_work_status(delivered)[0], "completed")
+        self.assertEqual(dashboardctl.effective_work_status(delivered)[1], "owner_changed_after_delivery")
+        self.assertEqual(dashboardctl.completion_timestamp(delivered), "2026-11-18T22:19:36+08:00")
+
+        reassigned_before_work = {
+            "id": "BUG-REASSIGNED", "type": "bug", "title": "not started", "status": "owner_changed",
+            "progress": [{"at": "2026-11-18T17:31:51+08:00", "message": "建档完成",
+                          "evidence": ["bug_detail=success"]}],
+        }
+        self.assertEqual(dashboardctl.effective_work_status(reassigned_before_work)[0], "owner_changed")
+        self.assertIsNone(dashboardctl.completion_timestamp(reassigned_before_work))
 
     def test_context_renderer_formats_progress_and_preserves_unmapped_evidence(self):
         record = {"id": "BUG-2", "type": "bug", "title": "可读标题", "status": "in_progress",

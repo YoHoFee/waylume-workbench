@@ -16,7 +16,7 @@ def handoff_view(record: dict[str, Any]) -> dict[str, Any]:
     fields["goal"] = fields["goal"] or text(record.get("initial_brief"))
     fields["next_step"] = fields["next_step"] or text(record.get("next_step")) or text(record.get("next_action"))
     fields["blocker"] = fields["blocker"] or text(record.get("blocked_reason"))
-    summary = text(record.get("latest_brief")) or text(record.get("status_detail"))
+    summary = text(record.get("status_line")) or text(record.get("latest_brief")) or text(record.get("status_detail"))
     progress = record.get("progress") if isinstance(record.get("progress"), list) else []
     matching = next((entry for entry in reversed(progress) if isinstance(entry, dict)
                      and text(entry.get("message")) == summary and text(entry.get("at"))), None)

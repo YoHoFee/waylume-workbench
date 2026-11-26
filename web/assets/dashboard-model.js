@@ -83,12 +83,15 @@
   function releasedVersionOpen(manualOpen, searchActive, hasMatches) {
     return !!manualOpen || (!!searchActive && !!hasMatches);
   }
+  // Row-first masonry: card 0 goes left, card 1 right, card 2 left, and so on.
+  // Heights are intentionally ignored so every new row starts on the left and
+  // the two columns stay equal-width; uneven bottoms are allowed.
   function masonryColumnIndex(heights, visibleColumns, cardIndex = 0) {
     const visible = Array.isArray(visibleColumns) ? visibleColumns : [true, true];
-    const candidates = [0, 1].filter(index => visible[index] !== false);
-    if (!candidates.length) return Math.abs(Number(cardIndex) || 0) % 2;
-    const measured = index => Number(heights?.[index]) || 0;
-    return candidates.reduce((best, index) => measured(index) < measured(best) ? index : best, candidates[0]);
+    const index = Math.max(0, Math.floor(Number(cardIndex) || 0));
+    if (visible[1] === false) return 0;
+    if (visible[0] === false) return 1;
+    return index % 2;
   }
   function partitionTerminalRecords(records, today) { return partitionDailyCompletions(records, today); }
   function partitionCompletedRecords(records, today) { return partitionTerminalRecords(records, today); }
@@ -96,6 +99,15 @@
     planning: "规划中", active: "进行中", pending_release: "待发布", released: "已发布", archived: "已归档"
   });
   function iterationStatusLabel(status) { return iterationStatusLabels[status] || String(status || "未设置"); }
+  const versionTypeLabels = Object.freeze({ iteration: "迭代", analytics: "埋点" });
+  function iterationVersionType(iteration) {
+    const value = iteration && typeof iteration === "object" ? iteration.version_type : null;
+    return value === "analytics" ? "analytics" : "iteration";
+  }
+  function versionTypeLabel(iterationOrType) {
+    const value = typeof iterationOrType === "string" ? iterationOrType : iterationVersionType(iterationOrType);
+    return versionTypeLabels[value] || versionTypeLabels.iteration;
+  }
   function iterationIsReleased(iteration) {
     return !!iteration && (iteration.status === "released" || iteration.status === "archived");
   }
@@ -145,12 +157,17 @@
     const iterMap = new Map(iterList.map(it => [it.id, it]));
     const groupedByIter = new Map();
     const backlog = [];
+    const unassigned = [];
 
     for (const record of list) {
       const iterId = record.iteration_id;
       if (iterId && iterMap.has(iterId)) {
         if (!groupedByIter.has(iterId)) groupedByIter.set(iterId, []);
         groupedByIter.get(iterId).push(record);
+      } else if (record.type === "work" && !String(iterId ?? "").trim()) {
+        // Patrol-created requirements start without a version. They are an
+        // explicit group instead of leaking into the current/latest version.
+        unassigned.push(record);
       } else {
         backlog.push(record);
       }
@@ -183,6 +200,11 @@
       groups,
       activeGroups: groups.filter(group => !group.isReleased),
       releasedGroups: groups.filter(group => group.isReleased),
+      unassigned: {
+        records: unassigned,
+        unfinished: unassigned.filter(r => !["completed", "cancelled", "archived"].includes(r.effective_status || r.status)),
+        completed: unassigned.filter(r => ["completed", "cancelled", "archived"].includes(r.effective_status || r.status))
+      },
       backlog: {
         records: backlog,
         unfinished: backlogUnfinished,
@@ -375,6 +397,7 @@
         id: stage.id, index: stage.index, label: stage.label, short: stage.short, owner: stage.owner, roles: stage.roles,
         status: stepStatus, statusLabel: workflowStatusLabels[stepStatus], current,
         nextLabel: nextStage ? (nextStage.short || nextStage.label) : "流程结束",
+        outputs: outputs ? { ...outputs } : null,
         checklist: stage.requiredOutputs.map(key => ({ key, label: stage.outputLabels[key] || workflowOutputLabel(key), done: outputs ? workflowOutputFilled(outputs, key) : null })),
         note: gate && gate.note ? String(gate.note) : "",
         evidence: gate && Array.isArray(gate.evidence) ? gate.evidence.map(String) : gate && gate.evidence ? [String(gate.evidence)] : [],
@@ -466,11 +489,12 @@
     return inherited ? inherited.source.slot : null;
   }
   function libraryInspectionState(source, index, groupSlot) {
+    const requirementSlot = groupSlot === "requirement_doc" || groupSlot === "analytics_requirement";
     const enabled = typeof source.inspection_enabled === "boolean"
       ? source.inspection_enabled
-      : groupSlot === "requirement_doc";
-    // 需求文档只巡检最新与上一版；更旧版本即使显式开启也不参与。
-    const eligible = groupSlot !== "requirement_doc" || index < 2;
+      : requirementSlot;
+    // 需求文档/埋点需求表只巡检最新与上一版；更旧版本即使显式开启也不参与。
+    const eligible = !requirementSlot || index < 2;
     return { enabled, eligible, active: enabled && eligible, rank: index };
   }
   function libraryView(sources) {
@@ -544,8 +568,18 @@
     Object.freeze({ id: "prototype", label: "高保真", hint: "CoDesign / 交互原型" }),
     Object.freeze({ id: "testcase", label: "测试用例", hint: "QA冒烟与验收用例参考" })
   ]);
+  const analyticsArchiveSlots = Object.freeze([
+    Object.freeze({ id: "analytics_requirement", label: "埋点需求表", hint: "埋点事件、参数与分工清单" }),
+    Object.freeze({ id: "analytics_acceptance", label: "埋点验收表", hint: "埋点验收结果与测试证据" })
+  ]);
+  function versionSlotDefinitions(iterationOrType) {
+    return iterationVersionType(typeof iterationOrType === "string" ? { version_type: iterationOrType } : iterationOrType) === "analytics"
+      ? analyticsArchiveSlots : iterationArchiveSlots;
+  }
   const archiveSlotLabels = Object.freeze({
     requirement_doc: "需求列表",
+    analytics_requirement: "埋点需求表",
+    analytics_acceptance: "埋点验收表",
     figma: "Figma",
     prototype: "高保真",
     codesign: "高保真",
@@ -647,7 +681,7 @@
     });
 
     const iterationSections = iterList.map(iteration => {
-      const section = buildArchiveSection(byIteration.get(iteration.id), iterationArchiveSlots, { scope: "iteration", iteration });
+      const section = buildArchiveSection(byIteration.get(iteration.id), versionSlotDefinitions(iteration), { scope: "iteration", iteration });
       section.removed = removed.filter(source => sourceScope(source) === "iteration" && source.iteration_id === iteration.id);
       section.mixedGroups = mixedGroups;
       return section;
@@ -665,9 +699,10 @@
     };
   }
   const model = { beijingDate, groupCompletedByDate, partitionCompletedRecords, partitionTerminalRecords, partitionDailyCompletions, partitionIterationRecords, partitionTaskBatches, contextPlaceholder, replaceContextPreservingScroll, summarizeFollowups, shortestMasonryColumn, masonryColumnIndex, releasedEntryOpen, releasedVersionOpen, sortTaskRecords, workPeriodProgress,
-    iterationStatusLabels, iterationStatusLabel, iterationIsReleased, iterationName, iterationSecondaryTag, orderedIterations, iterationApplies,
+    iterationStatusLabels, iterationStatusLabel, versionTypeLabels, iterationVersionType, versionTypeLabel,
+    iterationIsReleased, iterationName, iterationSecondaryTag, orderedIterations, iterationApplies,
     librarySlots, librarySlotLabels, libraryActive, libraryView, sourceScope, sourceDisplayNameOf,
-    globalArchiveSlots, iterationArchiveSlots, archiveSlotLabels, archiveView,
+    globalArchiveSlots, iterationArchiveSlots, analyticsArchiveSlots, versionSlotDefinitions, archiveSlotLabels, archiveView,
     workflowView, workflowChip, workflowStageDefinitions, workflowStatusLabel, workflowRoleLabel, workflowOutputLabel, workflowStagesFallback };
   if (typeof module !== "undefined" && module.exports) module.exports = model;
   if (typeof window !== "undefined") window.dashboardModel = model;

@@ -43,7 +43,8 @@ class ArchiveStoreTests(unittest.TestCase):
             description="本迭代包含Wan3.0与BGM优化"
         )["iteration"]
         self.assertEqual(created["version_tag"], "v13.4.2")
-        self.assertEqual(created["status"], "active")
+        # New empty versions start in planning; assigning requirements derives active.
+        self.assertEqual(created["status"], "planning")
         self.assertIsNone(created["released_at"])
 
         # List iterations
@@ -147,8 +148,17 @@ class ArchiveStoreTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
             dashboardctl.update_iteration(second["id"], {"version_tag": "13.4.0"})
-        with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
-            dashboardctl.create_iteration("another-tag", "13.4.0 埋点")
+        # A duplicate new name is auto-numbered instead of rejected; the
+        # caller-supplied distinct tag is preserved, and the version id stays
+        # the single stable identity.
+        renamed = dashboardctl.create_iteration("another-tag", "13.4.0 埋点")["iteration"]
+        self.assertEqual(renamed["title"], "13.4.0 埋点 迭代二")
+        self.assertEqual(renamed["version_tag"], "another-tag")
+        self.assertEqual(renamed["version_type"], "iteration")
+        another = dashboardctl.create_iteration("13.4.0 埋点", "13.4.0 埋点")["iteration"]
+        self.assertEqual(another["title"], "13.4.0 埋点 迭代三")
+        self.assertEqual(another["version_tag"], "13.4.0 埋点 迭代三")
+        self.assertNotEqual(another["id"], inserted["id"])
 
     def test_iteration_id_charset_and_update_length_limits(self):
         dotted = dashboardctl.create_iteration(
@@ -322,6 +332,160 @@ class ArchiveStoreTests(unittest.TestCase):
         self.assertEqual(sources_by_id["src-legacy-api"]["scope"], "global")
 
 
+    def test_analytics_version_uses_its_own_fixed_slots_and_context_labels(self):
+        analytics = dashboardctl.create_iteration(
+            "13.4.2 埋点", "13.4.2 埋点", version_type="analytics"
+        )["iteration"]
+        self.assertEqual(analytics["version_type"], "analytics")
+        legacy = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]
+        self.assertEqual(legacy["version_type"], "iteration")
+
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.add_source_link(
+                "https://example.com/legacy-prd", "迭代需求", slot="requirement_doc",
+                scope="iteration", iteration_id=analytics["id"]
+            )
+        req = dashboardctl.add_source_link(
+            "https://example.com/tracking", "埋点需求表", slot="analytics_requirement",
+            scope="iteration", iteration_id=analytics["id"]
+        )["source"]
+        acceptance = dashboardctl.add_source_link(
+            "https://example.com/acceptance", "埋点验收表", slot="analytics_acceptance",
+            scope="iteration", iteration_id=analytics["id"]
+        )["source"]
+        dashboardctl.add_source_link(
+            "https://example.com/note", "埋点补充", slot="supplementary",
+            scope="iteration", iteration_id=analytics["id"]
+        )
+        public = dashboardctl.add_source_link(
+            "https://example.com/api", "公共接口", slot="api_doc", scope="global"
+        )["source"]
+        self.assertTrue(req["inspection_enabled"])
+        self.assertEqual(req["inspection_mode"], "auto")
+        self.assertFalse(acceptance["inspection_enabled"])
+
+        context = dashboardctl.assemble_archive_context(iteration_id=analytics["id"])
+        markdown = context["summary_markdown"]
+        self.assertIn("- **版本类型**：埋点版本", markdown)
+        self.assertIn("[埋点需求表]", markdown)
+        self.assertIn("[埋点验收表]", markdown)
+        self.assertLess(markdown.index("[埋点需求表]"), markdown.index("[埋点验收表]"))
+        self.assertIn("[接口文档]", markdown)
+        self.assertIn(public["id"], {item["id"] for item in context["global_materials"]})
+
+        # A cross-type relocation must be explicit; silently keeping the old
+        # iteration slot would make the analytics matrix inconsistent.
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.set_source_location(public["id"], scope="iteration", iteration_id=analytics["id"])
+        with self.assertRaisesRegex(ValueError, "invalid_source_slot"):
+            dashboardctl.set_source_location(req["id"], scope="iteration", iteration_id=legacy["id"])
+
+    def test_version_type_conversion_can_be_rolled_back_from_backup(self):
+        iteration = dashboardctl.create_iteration("13.4.2 埋点", "13.4.2 埋点")["iteration"]
+        requirement = dashboardctl.add_source_link(
+            "https://example.com/tracking", "埋点需求", slot="requirement_doc",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        testcase = dashboardctl.add_source_link(
+            "https://example.com/qa", "验收用例", slot="testcase",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        figma = dashboardctl.add_source_link(
+            "https://example.com/figma", "设计稿", slot="figma",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        converted = dashboardctl.set_iteration_type(iteration["id"], "analytics")
+        restored = dashboardctl.restore_iteration_type_backup(converted["backup_path"])
+        self.assertTrue(restored["changed"])
+        self.assertEqual(restored["iteration"]["id"], iteration["id"])
+        self.assertEqual(restored["iteration"]["version_type"], "iteration")
+        stored = {item["id"]: item for item in dashboardctl._source_store_list(dashboardctl.load_store())}
+        self.assertEqual(stored[requirement["id"]]["slot"], "requirement_doc")
+        self.assertEqual(stored[testcase["id"]]["slot"], "testcase")
+        self.assertEqual(stored[figma["id"]]["slot"], "figma")
+        self.assertTrue(stored[requirement["id"]]["inspection_enabled"])
+        self.assertFalse(stored[testcase["id"]]["inspection_enabled"])
+        with self.assertRaisesRegex(ValueError, "invalid_version_type_backup"):
+            dashboardctl.restore_iteration_type_backup("/tmp/not-a-waylume-backup")
+        with self.assertRaisesRegex(ValueError, "invalid_version_type_backup"):
+            dashboardctl.restore_iteration_type_backup(iteration["id"])
+
+    def test_analytics_version_name_duplicates_are_still_explicit_errors(self):
+        dashboardctl.create_iteration("13.4.2 埋点", "13.4.2 埋点", version_type="analytics")
+        with self.assertRaisesRegex(ValueError, "iteration_duplicate"):
+            dashboardctl.create_iteration("13.4.2 埋点", "13.4.2 埋点", version_type="analytics")
+
+    def test_version_type_conversion_is_backed_up_idempotent_and_maps_slots(self):
+        iteration = dashboardctl.create_iteration("13.4.2 埋点", "13.4.2 埋点")["iteration"]
+        requirement = dashboardctl.add_source_link(
+            "https://example.com/tracking", "埋点需求", slot="requirement_doc",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        testcase = dashboardctl.add_source_link(
+            "https://example.com/qa", "验收用例", slot="testcase",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        figma = dashboardctl.add_source_link(
+            "https://example.com/figma", "设计稿", slot="figma",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+        note = dashboardctl.add_source_link(
+            "https://example.com/note", "补充说明", slot="supplementary",
+            scope="iteration", iteration_id=iteration["id"]
+        )["source"]
+
+        dry = dashboardctl.set_iteration_type(iteration["id"], "analytics", backup=True, dry_run=True)
+        self.assertTrue(dry["changed"])
+        self.assertIsNone(dry["backup_path"])
+        self.assertFalse((dashboardctl.ROOT / "backups").exists())
+
+        result = dashboardctl.set_iteration_type(iteration["id"], "analytics")
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["verification"]["ok"])
+        self.assertTrue(result["verification"]["source_count_unchanged"])
+        self.assertTrue(result["verification"]["group_ids_unchanged"])
+        backup_path = Path(result["backup_path"])
+        self.assertTrue((backup_path / "manifest.json").is_file())
+        self.assertTrue((backup_path / "store-snapshot.json").is_file())
+        snapshot = json.loads((backup_path / "store-snapshot.json").read_text(encoding="utf-8"))
+        snapshot_source = next(item for item in snapshot["sources"] if item["id"] == requirement["id"])
+        self.assertEqual(snapshot_source["slot"], "requirement_doc")
+        self.assertEqual(result["before"]["slot_counts"], {"figma": 1, "requirement_doc": 1, "supplementary": 1, "testcase": 1})
+        self.assertEqual(result["after"]["slot_counts"], {"analytics_acceptance": 1, "analytics_requirement": 1, "supplementary": 2})
+        self.assertEqual(result["after"]["source_ids"], result["before"]["source_ids"])
+        self.assertEqual(result["after"]["group_ids"], result["before"]["group_ids"])
+
+        stored = {item["id"]: item for item in dashboardctl._source_store_list(dashboardctl.load_store())}
+        self.assertEqual(stored[requirement["id"]]["slot"], "analytics_requirement")
+        self.assertEqual(stored[testcase["id"]]["slot"], "analytics_acceptance")
+        self.assertEqual(stored[figma["id"]]["slot"], "supplementary")
+        self.assertEqual(stored[note["id"]]["slot"], "supplementary")
+        self.assertTrue(stored[requirement["id"]]["inspection_enabled"])
+        self.assertFalse(stored[testcase["id"]]["inspection_enabled"])
+
+        backups_after_first = sorted((dashboardctl.ROOT / "backups").iterdir())
+        again = dashboardctl.set_iteration_type(iteration["id"], "analytics")
+        self.assertFalse(again["changed"])
+        self.assertIsNone(again["backup_path"])
+        self.assertEqual(sorted((dashboardctl.ROOT / "backups").iterdir()), backups_after_first)
+
+        reverted = dashboardctl.set_iteration_type(iteration["id"], "iteration")
+        self.assertTrue(reverted["changed"])
+        stored = {item["id"]: item for item in dashboardctl._source_store_list(dashboardctl.load_store())}
+        self.assertEqual(stored[requirement["id"]]["slot"], "requirement_doc")
+        self.assertEqual(stored[testcase["id"]]["slot"], "testcase")
+        # Iteration-only slots that analytics does not expose stay preserved as
+        # supplementary material; the pre-conversion snapshot can restore the
+        # original slot exactly.
+        self.assertEqual(stored[figma["id"]]["slot"], "supplementary")
+        self.assertEqual(stored[note["id"]]["slot"], "supplementary")
+
+        with self.assertRaisesRegex(ValueError, "invalid_iteration_patch"):
+            dashboardctl.update_iteration(iteration["id"], {"version_type": "analytics"})
+        with self.assertRaisesRegex(ValueError, "iteration_not_found"):
+            dashboardctl.set_iteration_type("ITER-missing", "analytics")
+
+
 class ArchiveApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -492,6 +656,52 @@ class ArchiveApiTests(unittest.TestCase):
         status, data = self.request("GET", "/api/archive/context?iteration=ITER-13.4.0-ANALYTICS")
         self.assertEqual(status, 200)
         self.assertEqual(data["iteration"]["id"], "ITER-13.4.0-ANALYTICS")
+
+    def test_iteration_type_api_creates_and_converts_with_backup(self):
+        status, created = self.request("POST", "/api/iterations", {
+            "version_tag": "13.4.2 埋点", "title": "13.4.2 埋点", "version_type": "analytics"
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(created["iteration"]["version_type"], "analytics")
+        iteration_id = created["iteration"]["id"]
+
+        status, data = self.request("GET", "/api/iterations")
+        self.assertEqual(status, 200)
+        listed = next(item for item in data["iterations"] if item["id"] == iteration_id)
+        self.assertEqual(listed["version_type"], "analytics")
+
+        # A legacy iteration created without the field is exposed as the
+        # default type without rewriting the stored record.
+        status, legacy = self.request("POST", "/api/iterations", {"version_tag": "13.4.2 迭代二", "title": "13.4.2 迭代二"})
+        self.assertEqual(status, 201)
+        self.assertEqual(legacy["iteration"]["version_type"], "iteration")
+
+        source = dashboardctl.add_source_link(
+            "https://example.com/tracking-api", "埋点需求", slot="analytics_requirement",
+            scope="iteration", iteration_id=iteration_id
+        )["source"]
+        status, converted = self.request("POST", f"/api/iterations/{iteration_id}/type", {
+            "version_type": "iteration"
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(converted["changed"])
+        self.assertTrue(converted["verification"]["ok"])
+        self.assertTrue(converted["backup_path"])
+        stored = next(item for item in dashboardctl._source_store_list(dashboardctl.load_store()) if item["id"] == source["id"])
+        self.assertEqual(stored["slot"], "requirement_doc")
+
+        status, repeated = self.request("POST", f"/api/iterations/{iteration_id}/type", {
+            "version_type": "iteration"
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(repeated["changed"])
+        self.assertIsNone(repeated["backup_path"])
+
+        status, invalid = self.request("POST", f"/api/iterations/{iteration_id}/type", {
+            "version_type": "unknown"
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(invalid["error"], "invalid_iteration_version_type")
 
     def test_record_iteration_can_be_cleared(self):
         iteration = dashboardctl.create_iteration("13.4.2 迭代二", "13.4.2 迭代二")["iteration"]

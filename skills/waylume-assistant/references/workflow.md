@@ -169,6 +169,19 @@ The host maps `dev`/`auditor`/`pm` to concrete agents and its own transport. Wor
 
 ## 8. Status and history
 
+**Source notes for passwords.** When registering or archiving a CoDesign/高保真 source that needs an access password, write it into the source `note` (e.g. `访问密码：…`) and set `note_masked: true`; never invent a separate password field. Notes are shown in the source card overview and masked notes stay hidden until explicitly revealed.
+
+### Report format (audit_report / dev_response)
+
+Both outputs are **Markdown tables**, never long prose or bare lists.
+
+- Audit report: `# 审计报告` with a `## 概览` table (项目/内容: 结论, 范围与基线, 风险, 建议) and a `## 发现` table (编号, 分类, 结论, 依据/位置), one row per finding prefixed `[A]`/`[B]`/`[C]`/`[D]`.
+- Dev response: `# 开发回应` with a `## 概览` table (对应审计, 决定, 验证) and a `## 逐条回应` table (序号, 审计条目, 决定, 处理与理由).
+
+Escape `|` inside cells and use `<br>` for line breaks. Submit the Markdown body in the gate outputs. The workbench mirrors each report into the record folder as `records/<type>/<id>/audit-report.md` and `records/<type>/<id>/dev-response.md`, so every task card is a self-contained folder. Do not submit a bare file path as the report body.
+
+**One-line current status (required before finishing).** Every agent must leave a single line (≤200 chars, no newlines) describing where the task stands now, via `dashboardctl.py task-result <ID> --summary "…" --message "…"`. `--summary` is required for task-result; `progress --summary` updates it mid-task, and `summary <ID> "…"` corrects it. This line is shown on the home-page card and at the top of the detail view; detailed progress, evidence and handoff fields follow it. Do not put the detailed report in the summary.
+
 - Workflow stages are separate from record `status`; do not edit `status` directly to simulate stage progress.
 - Read `workflow show` and `task-context` before resuming. Preserve prior gates and history; append evidence instead of deleting it.
 - Use the template's allowed rework targets. A Lead may return an item for process reasons; code/requirement decisions belong to dev/PM.

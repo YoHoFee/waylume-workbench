@@ -10,6 +10,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import backend
@@ -521,6 +522,43 @@ class WorkflowHttpTests(WorkflowStoreTestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read() or b"{}")
 
+    def request_text(self, path):
+        request = Request(self.origin + path, method="GET")
+        try:
+            with urlopen(request) as response:
+                return response.status, response.headers.get_content_type(), response.read().decode("utf-8")
+        except HTTPError as error:
+            return error.code, error.headers.get_content_type(), error.read().decode("utf-8")
+
+    def test_workflow_evidence_file_endpoint_reads_only_recorded_evidence(self):
+        evidence = self.root / "audit.md"
+        evidence.write_text("ADVISORY 全文", encoding="utf-8")
+        self.start()
+        self.submit({"scope": "工作台", "decision_owner": "PM"})
+        self.advance()
+        self.submit({"requirement_brief": "简报", "acceptance_criteria": "标准", "pm_decision": "开始"},
+                    actor_role="pm", actor="pm")
+        self.advance(actor_role="pm", actor="pm")
+        self.submit({"dev_summary": "完成", "branch": "local/evidence", "self_check": "通过"},
+                    actor_role="dev", actor="gemini")
+        self.advance(actor_role="dev", actor="gemini")
+        self.submit({"audit_report": "ADVISORY 报告"}, evidence=[str(evidence)],
+                    actor_role="auditor", actor="auditor")
+        status, content_type, text = self.request_text(
+            f"/api/items/T-1/evidence-file?path={quote(str(evidence), safe='')}")
+        self.assertEqual((status, content_type, text), (200, "text/plain", "ADVISORY 全文"))
+        status, _, payload = self.request_text(
+            f"/api/items/T-1/evidence-file?path={quote(str(self.root / 'unknown.md'), safe='')}")
+        self.assertEqual((status, json.loads(payload)["error"]), (404, "evidence_not_found"))
+        big = self.root / "big.log"
+        big.write_bytes(b"x" * (dashboardctl.WORKFLOW_EVIDENCE_MAX_BYTES + 1))
+        record = self.record()
+        record["workflow"]["gates"]["audit_response"]["evidence"].append(str(big))
+        dashboardctl.atomic_write({**dashboardctl.load_store(), "records": [record]})
+        status, _, payload = self.request_text(
+            f"/api/items/T-1/evidence-file?path={quote(str(big), safe='')}")
+        self.assertEqual((status, json.loads(payload)["error"]), (415, "evidence_too_large"))
+
     def test_templates_and_detail_endpoints(self):
         status, payload = self.request("GET", "/api/workflow/templates")
         self.assertEqual(status, 200)
@@ -596,6 +634,72 @@ class WorkflowHttpTests(WorkflowStoreTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(detail["workflow"]["stage"], "requirement")
         self.assertEqual(detail["template"]["id"], "dev-standard")
+
+
+class WorkflowEvidenceFileTests(WorkflowStoreTestCase):
+    def walk_to_audit_with_evidence(self, path):
+        self.start()
+        self.submit({"scope": "工作台", "decision_owner": "PM"})
+        self.advance()
+        self.submit({"requirement_brief": "简报", "acceptance_criteria": "标准", "pm_decision": "开始"},
+                    actor_role="pm", actor="pm")
+        self.advance(actor_role="pm", actor="pm")
+        self.submit({"dev_summary": "实现完成", "branch": "local/evidence", "self_check": "通过"},
+                    actor_role="dev", actor="gemini")
+        self.advance(actor_role="dev", actor="gemini")
+        self.submit({"audit_report": "报告正文"}, evidence=[str(path)],
+                    actor_role="auditor", actor="auditor")
+
+    def test_recorded_text_evidence_is_readable(self):
+        evidence = self.root / "audit-report.md"
+        evidence.write_text("# 审计报告\n\n逐条结论。\n", encoding="utf-8")
+        self.walk_to_audit_with_evidence(evidence)
+        result = dashboardctl.read_workflow_evidence_file("T-1", str(evidence))
+        self.assertEqual(result["text"], "# 审计报告\n\n逐条结论。\n")
+        self.assertEqual(result["path"], str(evidence.resolve()))
+
+    def test_unrecorded_traversal_directory_and_missing_files_fail_closed(self):
+        evidence = self.root / "audit-report.md"
+        evidence.write_text("报告", encoding="utf-8")
+        self.walk_to_audit_with_evidence(evidence)
+        unrecorded = self.root / "other.md"
+        unrecorded.write_text("other", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "evidence_not_found"):
+            dashboardctl.read_workflow_evidence_file("T-1", str(unrecorded))
+        with self.assertRaisesRegex(ValueError, "invalid_evidence_path"):
+            dashboardctl.read_workflow_evidence_file("T-1", str(self.root / ".." / "outside.md"))
+        with self.assertRaisesRegex(ValueError, "evidence_not_found"):
+            dashboardctl.read_workflow_evidence_file("T-1", str(self.root))
+
+    def test_symlink_escape_is_rejected_even_when_recorded(self):
+        evidence = self.root / "audit-report.md"
+        evidence.write_text("报告", encoding="utf-8")
+        self.walk_to_audit_with_evidence(evidence)
+        with tempfile.TemporaryDirectory() as outside_dir:
+            secret = Path(outside_dir) / "secret.md"
+            secret.write_text("outside", encoding="utf-8")
+            link = self.root / "escape.md"
+            link.symlink_to(secret)
+            record = self.record()
+            record["workflow"]["gates"]["audit_response"]["evidence"].append(str(link))
+            dashboardctl.atomic_write({**dashboardctl.load_store(), "records": [record]})
+            with self.assertRaisesRegex(ValueError, "invalid_evidence_path"):
+                dashboardctl.read_workflow_evidence_file("T-1", str(link))
+
+    def test_oversize_and_binary_evidence_is_rejected(self):
+        big = self.root / "huge.log"
+        big.write_bytes(b"x" * (dashboardctl.WORKFLOW_EVIDENCE_MAX_BYTES + 1))
+        self.walk_to_audit_with_evidence(big)
+        with self.assertRaisesRegex(ValueError, "evidence_too_large"):
+            dashboardctl.read_workflow_evidence_file("T-1", str(big))
+
+        binary = self.root / "binary.txt"
+        binary.write_bytes(b"report\x00payload")
+        record = self.record()
+        record["workflow"]["gates"]["audit_response"]["evidence"].append(str(binary))
+        dashboardctl.atomic_write({**dashboardctl.load_store(), "records": [record]})
+        with self.assertRaisesRegex(ValueError, "evidence_not_text"):
+            dashboardctl.read_workflow_evidence_file("T-1", str(binary))
 
 
 class WorkflowCliTests(WorkflowStoreTestCase):

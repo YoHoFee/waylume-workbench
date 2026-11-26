@@ -147,5 +147,32 @@ class IterationWorkflowTests(unittest.TestCase):
             dashboard_server.PORT = old_port
 
 
+class IterationDerivedStatusTests(IterationWorkflowTests):
+    def test_new_iteration_starts_in_planning(self):
+        it = dashboardctl.create_iteration("13.5.0", "13.5.0 迭代")["iteration"]
+        self.assertEqual(it["status"], "planning")
+
+    def test_requirement_assignment_promotes_and_unassignment_returns_to_planning(self):
+        it = dashboardctl.create_iteration("13.5.1", "13.5.1 迭代")["iteration"]
+        db = dashboardctl.load_store()
+        db["records"].append(dashboardctl.normalize_record({
+            "id": "1001", "type": "work", "title": "需求 A", "status": "in_progress"}))
+        dashboardctl.atomic_write(db)
+        dashboardctl.assign_record_iteration("1001", it["id"])
+        self.assertEqual(dashboardctl._find_iteration(dashboardctl.load_store(), it["id"])["status"], "active")
+        dashboardctl.assign_record_iteration("1001", None)
+        self.assertEqual(dashboardctl._find_iteration(dashboardctl.load_store(), it["id"])["status"], "planning")
+
+    def test_manual_release_status_is_not_overwritten(self):
+        it = dashboardctl.create_iteration("13.5.2", "13.5.2 迭代")["iteration"]
+        dashboardctl.update_iteration(it["id"], {"status": "pending_release"})
+        db = dashboardctl.load_store()
+        db["records"].append(dashboardctl.normalize_record({
+            "id": "1002", "type": "work", "title": "需求 B", "status": "in_progress"}))
+        dashboardctl.atomic_write(db)
+        dashboardctl.assign_record_iteration("1002", it["id"])
+        self.assertEqual(dashboardctl._find_iteration(dashboardctl.load_store(), it["id"])["status"], "pending_release")
+
+
 if __name__ == "__main__":
     unittest.main()

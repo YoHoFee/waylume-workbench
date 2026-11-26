@@ -2,13 +2,24 @@
 // Copyright © 2026 CMIC. All rights reserved.
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { groupCompletedByDate, libraryView, librarySlots, partitionCompletedRecords, partitionTaskBatches, shortestMasonryColumn, sortTaskRecords, summarizeFollowups, workPeriodProgress, workflowView, workflowChip } = require("../assets/dashboard-model.js");
+const { archiveView, analyticsArchiveSlots, archiveSlotLabels, groupCompletedByDate, iterationVersionType, libraryView, librarySlots, masonryColumnIndex, partitionCompletedRecords, partitionIterationRecords, partitionTaskBatches, shortestMasonryColumn, sortTaskRecords, summarizeFollowups, versionSlotDefinitions, workPeriodProgress, workflowView, workflowChip } = require("../assets/dashboard-model.js");
 
-test("masonry always adds the next card to the shorter column", () => {
+test("masonry keeps the legacy shortest-column helper available", () => {
   assert.equal(shortestMasonryColumn([120, 80]), 1);
   assert.equal(shortestMasonryColumn([80, 120]), 0);
   assert.equal(shortestMasonryColumn([80, 80]), 0);
   assert.equal(shortestMasonryColumn([80]), 0);
+});
+
+test("masonry fills row-first so every new row starts on the left", () => {
+  assert.equal(masonryColumnIndex([], [true, true], 0), 0);
+  assert.equal(masonryColumnIndex([], [true, true], 1), 1);
+  assert.equal(masonryColumnIndex([], [true, true], 2), 0);
+  assert.equal(masonryColumnIndex([], [true, true], 3), 1);
+  // Column heights no longer influence placement: card 2 still starts left.
+  assert.equal(masonryColumnIndex([400, 10], [true, true], 2), 0);
+  assert.equal(masonryColumnIndex([], [true, false], 3), 0);
+  assert.equal(masonryColumnIndex([], [false, true], 2), 1);
 });
 
 test("completion grouping uses Beijing day boundaries and keeps unknown dates separate", () => {
@@ -23,6 +34,29 @@ test("completion grouping uses Beijing day boundaries and keeps unknown dates se
     ["2026-10-21", ["yesterday"], false],
     ["unknown", ["unknown"], false]
   ]);
+});
+
+test("work without a version becomes its own unassigned group, never a version member", () => {
+  const iterations = [
+    { id: "iter-current", title: "13.4.2 迭代二", status: "active", order: 2 },
+    { id: "iter-old", title: "13.4.1 历史", status: "released", order: 1 }
+  ];
+  const records = [
+    { id: "assigned", type: "work", iteration_id: "iter-current", status: "in_progress" },
+    { id: "unassigned", type: "work", iteration_id: null, status: "pending" },
+    { id: "blank", type: "work", iteration_id: "", status: "completed" },
+    { id: "unknown-version", type: "work", iteration_id: "iter-missing", status: "pending" },
+    { id: "bug", type: "bug", iteration_id: null, status: "pending" }
+  ];
+  const result = partitionIterationRecords(records, iterations);
+  assert.deepEqual(result.unassigned.records.map(row => row.id), ["unassigned", "blank"]);
+  assert.deepEqual(result.unassigned.unfinished.map(row => row.id), ["unassigned"]);
+  assert.deepEqual(result.unassigned.completed.map(row => row.id), ["blank"]);
+  assert.deepEqual(result.activeGroups.flatMap(group => group.records.map(row => row.id)), ["assigned"]);
+  assert.deepEqual(result.releasedGroups.flatMap(group => group.records.map(row => row.id)), []);
+  // A stale version id is not "unassigned" — it stays in the plain backlog.
+  assert.deepEqual(result.backlog.records.map(row => row.id), ["unknown-version"]);
+  assert.deepEqual(result.iterations.map(row => row.id), ["iter-current", "iter-old"]);
 });
 
 test("completed task in current batch stays current while previous batch is historical", () => {
@@ -189,6 +223,7 @@ test("stage 4 exposes 4a static audit and 4b dev response substeps", () => {
     ["4b", "开发回应", "active"]
   ]);
   assert.deepEqual(substeps.map(step => step.roleLabel), ["Auditor", "Dev"]);
+  assert.deepEqual(view.steps[3].outputs, { audit_report: "ADVISORY 报告" });
   assert.equal(view.current.nextLabel, "验收");
 });
 
@@ -379,4 +414,39 @@ test("library derives version numbers for legacy groups and excludes removed ver
   assert.deepEqual(view.removed.map(source => source.id), ["removed"]);
   assert.equal(view.activeCount, 2);
   assert.equal(view.slots.every(slot => slot.empty), true);
+});
+
+test("version types select their own fixed slots and keep material isolated", () => {
+  assert.equal(iterationVersionType({ id: "legacy" }), "iteration");
+  assert.equal(iterationVersionType({ id: "a", version_type: "analytics" }), "analytics");
+  assert.deepEqual(versionSlotDefinitions({ version_type: "analytics" }).map(slot => slot.id), ["analytics_requirement", "analytics_acceptance"]);
+  assert.deepEqual(versionSlotDefinitions({ version_type: "iteration" }).map(slot => slot.id), ["requirement_doc", "figma", "prototype", "testcase"]);
+  assert.equal(archiveSlotLabels.analytics_requirement, "埋点需求表");
+  assert.equal(archiveSlotLabels.analytics_acceptance, "埋点验收表");
+
+  const iterations = [
+    { id: "ITER-analytics", title: "13.4.2 埋点", version_type: "analytics", order: 1, status: "active" },
+    { id: "ITER-iter", title: "13.4.2 迭代二", version_type: "iteration", order: 0, status: "active" }
+  ];
+  const sources = [
+    { id: "a-req", active: true, scope: "iteration", iteration_id: "ITER-analytics", slot: "analytics_requirement", group_id: "a-req", added_at: "2026-11-01T09:00:00+08:00", inspection_enabled: true },
+    { id: "a-acc", active: true, scope: "iteration", iteration_id: "ITER-analytics", slot: "analytics_acceptance", group_id: "a-acc", added_at: "2026-11-02T09:00:00+08:00" },
+    { id: "a-note", active: true, scope: "iteration", iteration_id: "ITER-analytics", slot: "supplementary", group_id: "a-note", added_at: "2026-11-03T09:00:00+08:00" },
+    { id: "i-prd", active: true, scope: "iteration", iteration_id: "ITER-iter", slot: "requirement_doc", group_id: "i-prd", added_at: "2026-11-01T09:00:00+08:00" },
+    { id: "shared-api", active: true, scope: "global", slot: "api_doc", group_id: "shared-api", added_at: "2026-11-01T09:00:00+08:00" }
+  ];
+  const archive = archiveView(sources, iterations);
+  const analytics = archive.iterations.find(section => section.iteration.id === "ITER-analytics");
+  const iteration = archive.iterations.find(section => section.iteration.id === "ITER-iter");
+  assert.deepEqual(analytics.slots.map(slot => [slot.slot, slot.card && slot.card.id]), [
+    ["analytics_requirement", "a-req"], ["analytics_acceptance", "a-acc"]
+  ]);
+  assert.deepEqual(analytics.supplementaryGroups.map(group => group.group_id), ["a-note"]);
+  assert.deepEqual(iteration.slots.map(slot => slot.slot), ["requirement_doc", "figma", "prototype", "testcase"]);
+  assert.equal(iteration.slots.find(slot => slot.slot === "requirement_doc").card.id, "i-prd");
+  assert.equal(iteration.slots.some(slot => slot.slot === "analytics_requirement"), false);
+  assert.equal(archive.global.slots.find(slot => slot.slot === "api_doc").card.id, "shared-api");
+  // Analytics fixed material never leaks into the iteration or public list.
+  assert.equal(analytics.slots.every(slot => slot.card && slot.card.slot !== "requirement_doc"), true);
+  assert.equal(iteration.supplementaryGroups.some(group => group.group_id === "a-req"), false);
 });

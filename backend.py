@@ -43,6 +43,7 @@ def _context(record: dict[str, Any]) -> str:
     def add_value(label: str, value: Any) -> None:
         if value not in (None, "", [], {}): lines.extend([f"## {label}", "", str(value), ""])
 
+    add_value("当前现状（一句话）", record.get("status_line"))
     add_value("目标", record.get("initial_brief") or record.get("status_detail"))
     if record.get("iteration_id"):
         add_value("所属迭代", record["iteration_id"])
@@ -147,7 +148,8 @@ def _context(record: dict[str, Any]) -> str:
                 lines.append(f"- [{name}]({url}) ({item.get('mime_type', 'image')}, {item.get('size_bytes', '未知')} bytes)")
         lines.append("")
     rendered_fields = {
-        "id", "type", "title", "status", "status_detail", "initial_brief", "latest_brief",
+        "id", "type", "title", "status", "status_detail", "initial_brief", "latest_brief", "status_line",
+        "status_line_updated_at", "status_line_updated_by",
         "decisions", "phase", "blocked_reason", "next_step", "notes", "evidence", "history",
         "progress", "followups", "final_result", "attachments", "revision", "updated_at",
         "created_at", "source_updated_at", "observed_at", "evidence_at", "effective_status",

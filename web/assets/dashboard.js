@@ -1,11 +1,13 @@
 (() => {
-  const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), drafts: {}, sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
+  const state = { data: null, query: "", showArchived: false, selectedId: null, toastTimer: null, busy: new Set(), sources: [], sourcesBusy: false, libraryExpanded: new Set(), libraryGroup: null, libraryFile: null, contexts: new Map(), contextRequests: new Map(), scopeCatalog: null,
     workflows: new Map(), workflowRequests: new Map(), workflowStage: new Map(), workflowEntered: new Set(), workflowBusy: new Set(),
     iterations: [], currentIterationId: null, archiveScopeTab: "iteration", libraryAddContext: null, libraryHighlight: null,
     sourcesRevision: null, workReleasedOpen: false, workReleasedGroups: [], workReleasedExpanded: new Set(), archiveReleasedExpanded: new Set(),
-    iterationEditId: null, reopenTargetId: null, reopenFile: null, iterationBusy: false };
+    iterationEditId: null, iterationBusy: false, sourceEdit: null, textViewerText: "",
+    textViewerCopyText: "", textViewerCopyLabel: "复制全文", workbenchVersion: "",
+    autoName: { timer: null, controller: null, token: 0, userEdited: false, lastUrl: "" } };
   const inspectionClock = { schedule: null, serverEpoch: null, syncedAt: null, nextRunAt: null };
-  const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…" };
+  const inspectionRun = { busy: false, state: "unknown", slotId: null, eventId: null, enabled: null, windowOpen: null, nextRunAt: null, serverEpoch: null, syncedAt: null, message: "正在读取巡检状态…", announce: "" };
   const themeStorage = (() => { try { return window.localStorage; } catch (_) { return { getItem: () => null, setItem: () => {} }; } })();
   let savedTheme = window.__GEMINI_INITIAL_THEME__;
   if (!["minimal", "wood", "dark"].includes(savedTheme)) {
@@ -35,6 +37,7 @@
   ];
   let dataLocationPreview = null;
   let dataLocationRevision = null;
+  let scrollChrome = null;
 
   function txt(value, fallback = "未提供") {
     if (value === null || value === undefined || value === "") return fallback;
@@ -74,7 +77,7 @@
   function matchesSearch(record) {
     const query = state.query.trim().toLocaleLowerCase("zh-CN");
     if (!query) return true;
-    return [record.id, record.display_id, record.title, record.status, record.source_status, record.status_detail, record.owner, record.assignee,
+    return [record.id, record.display_id, recordDisplayId(record), record.title, record.status, record.source_status, record.status_detail, record.owner, record.assignee,
       record.notes, record.evidence, record.source, record.our_status, record.triage, record.latest_brief,
       record.progress?.map(item => typeof item === "string" ? item : JSON.stringify(item)), record.followups?.map(item => item.prompt)]
       .map(txt).join(" ").toLocaleLowerCase("zh-CN").includes(query);
@@ -111,6 +114,32 @@
     return pending[0] || [...all].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0] || null;
   }
   function setText(selector, text) { $(selector).textContent = text; }
+  const BUILD_ID = (() => {
+    const node = [...document.scripts].find(script => /dashboard\.js/.test(script.src || ""));
+    try { return node ? new URL(node.src).searchParams.get("v") || "" : ""; } catch (_) { return ""; }
+  })();
+
+  function setWorkbenchVersion(value, build = "") {
+    const version = String(value ?? "").trim();
+    state.workbenchVersion = /^\d+\.\d+\.\d+$/.test(version) ? version : "";
+    const target = $("#footer-version");
+    if (target) {
+      const shortBuild = build ? String(build).replace(/^\d{8}-/, "") : "";
+      target.textContent = state.workbenchVersion ? `v${state.workbenchVersion}${shortBuild ? ` · ${shortBuild}` : ""}` : "v—";
+      target.dataset.build = build || "";
+      target.title = build ? `构建 ${build}` : "";
+    }
+  }
+  async function refreshWorkbenchVersion() {
+    try {
+      const response = await fetch("/api/version", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      setWorkbenchVersion(data.version, data.build);
+    } catch (_) {
+      if (!state.workbenchVersion) setWorkbenchVersion("");
+    }
+  }
   function escClass(value) { return String(value || "unknown").replace(/[^a-z0-9_-]/gi, "_"); }
 
   function zonedParts(epoch, timezone) {
@@ -143,34 +172,66 @@
     }
     return null;
   }
-  function renderInspectionPlan() {
-    const plan = $("#inspection-plan");
+  function inspectionEffectiveState() {
     const schedule = inspectionClock.schedule;
-    const state = schedule?.state === "paused" || schedule?.enabled === false || inspectionRun.state === "paused" || inspectionRun.enabled === false
+    return schedule?.state === "paused" || schedule?.enabled === false || inspectionRun.state === "paused" || inspectionRun.enabled === false
       ? "paused" : inspectionRun.state;
-    const stateText = ({ running: "巡检正在运行", queued: "巡检已排队", awaiting_confirmation: "等待巡检结果", failed: "上次巡检失败", partial: "上次巡检部分完成", succeeded: "本时段巡检已完成", paused: "巡检已暂停" })[state] || "";
-    if (state === "paused") { plan.textContent = stateText; plan.dataset.state = state; renderInspectionRun(); return; }
+  }
+  // One short line is the whole status surface. The inspection list dialog
+  // carries the details, so the bar never repeats the same sentence twice.
+  function inspectionStateText(state) {
+    return ({ running: "正在运行", queued: "已排队", awaiting_confirmation: "等待结果", failed: "上次巡检失败", partial: "上次巡检部分完成", succeeded: "本时段已完成", paused: "已暂停" })[state] || "";
+  }
+  function inspectionNextLabel() {
+    const schedule = inspectionClock.schedule;
     const syncedEpoch = inspectionClock.serverEpoch || inspectionRun.serverEpoch;
-    if (!schedule || !schedule.available || schedule.state === "unknown" || !syncedEpoch) {
-      plan.textContent = stateText ? `${stateText} · 巡检时间未同步` : "巡检时间未同步";
-      plan.dataset.state = state === "unknown" ? "unknown" : state; renderInspectionRun(); return;
-    }
+    if (!schedule || !schedule.available || schedule.state === "unknown" || !syncedEpoch) return { synced: false, label: "" };
     const syncedAt = inspectionClock.syncedAt || inspectionRun.syncedAt;
     const now = syncedEpoch + (performance.now() - syncedAt);
     const authoritativeAt = inspectionRun.nextRunAt || inspectionClock.nextRunAt || schedule.next_run_at || schedule.nextRunAt;
-    const nextEpoch = authoritativeAt ? Date.parse(authoritativeAt) : NaN;
-    const next = Number.isNaN(nextEpoch) && Array.isArray(schedule.times) ? nextInspection(now, schedule.times, schedule.timezone, Array.isArray(schedule.weekdays) ? schedule.weekdays : []) : null;
-    const targetEpoch = Number.isNaN(nextEpoch) ? next?.epoch : nextEpoch;
-    if (!targetEpoch) { plan.textContent = stateText ? `${stateText} · 下次时间未同步` : "巡检时间未同步"; plan.dataset.state = state || "unknown"; renderInspectionRun(); return; }
-    const seconds = Math.max(0, Math.ceil((targetEpoch - now) / 1000));
-    const countdown = seconds < 60 ? "马上开始巡检" : `${Math.ceil(seconds / 60)}分钟后`;
+    let targetEpoch = authoritativeAt ? Date.parse(authoritativeAt) : NaN;
+    if (Number.isNaN(targetEpoch) && Array.isArray(schedule.times)) {
+      const next = nextInspection(now, schedule.times, schedule.timezone, Array.isArray(schedule.weekdays) ? schedule.weekdays : []);
+      targetEpoch = next?.epoch;
+    }
+    if (!targetEpoch) return { synced: true, label: "" };
     const label = new Intl.DateTimeFormat("zh-CN", { timeZone: schedule.timezone, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(targetEpoch));
-    plan.textContent = `${stateText ? `${stateText} · ` : ""}下次 ${label} · ${countdown}`;
-    plan.dataset.state = state === "unknown" ? "active" : state;
+    return { synced: true, label };
+  }
+  let lastPlanKey = "";
+  function renderInspectionPlan() {
+    if (document.hidden) return;
+    const plan = $("#inspection-plan");
+    if (!plan) return;
+    const state = inspectionEffectiveState();
+    const time = inspectionNextLabel();
+    let text;
+    if (inspectionRun.busy) text = "巡检 · 正在提交请求…";
+    else if (state === "paused") text = "巡检 · 已暂停";
+    else if (state === "unknown") text = "巡检 · 状态未同步";
+    else {
+      const label = inspectionStateText(state);
+      if (["running", "queued", "awaiting_confirmation"].includes(state)) text = `巡检 · ${label}`;
+      else text = time.label ? `巡检 · ${label} · 下次 ${time.label}` : `巡检 · ${label} · 下次时间未同步`;
+    }
+    const detail = state === "failed" && inspectionRun.message ? `${inspectionRun.message} · ` : "";
+    const title = `${detail}查看今日巡检记录`;
+    const key = `${state}|${text}|${title}|${inspectionRun.busy}|${inspectionRun.windowOpen}`;
+    if (key !== lastPlanKey) {
+      lastPlanKey = key;
+      plan.textContent = text;
+      plan.dataset.state = state || "unknown";
+      plan.title = title;
+    }
     renderInspectionRun();
   }
+  let lastWorktimeKey = "";
   function renderWorktimeProgress() {
+    if (document.hidden) return;
     const percent = model.workPeriodProgress(Date.now(), workHours.start, workHours.end);
+    const key = `${percent}|${workHours.start}|${workHours.end}`;
+    if (key === lastWorktimeKey) return;
+    lastWorktimeKey = key;
     $("#worktime-fill").style.transform = `scaleX(${percent / 100})`;
     $("#worktime-percent").textContent = `${percent}%`;
     const label = `${workHours.start}–${workHours.end}`;
@@ -399,6 +460,7 @@
       renderInspectionPlan();
       return false;
     }
+    const previousState = inspectionRun.state;
     inspectionRun.state = status;
     const serverEpoch = Date.parse(payload.server_time || payload.observed_at || "");
     if (!Number.isNaN(serverEpoch)) { inspectionRun.serverEpoch = serverEpoch; inspectionRun.syncedAt = performance.now(); }
@@ -410,19 +472,29 @@
     else inspectionRun.message = "巡检状态已同步";
     renderInspectionRun();
     renderInspectionPlan();
+    // A finished run means a new summary may exist; refresh only on the edge.
+    if (status === "succeeded" && previousState !== "succeeded" && $("#inspection-dialog")?.open) loadInspectionHistory();
     return true;
   }
   function renderInspectionRun() {
     const button = $("#inspection-run"), status = $("#inspection-run-status");
-    const busyState = ["queued", "running", "awaiting_confirmation"].includes(inspectionRun.state);
-    const succeeded = inspectionRun.state === "succeeded" && inspectionRun.slotId;
-    const paused = inspectionRun.state === "paused" || inspectionRun.enabled === false || inspectionClock.schedule?.state === "paused" || inspectionClock.schedule?.enabled === false;
-    button.textContent = paused ? "巡检已暂停" : inspectionRun.state === "running" ? "巡检中" : succeeded ? "本时段已完成" : "立即巡检";
+    if (!button || !status) return;
+    const state = inspectionEffectiveState();
+    const busyState = ["queued", "running", "awaiting_confirmation"].includes(state);
+    const succeeded = state === "succeeded" && inspectionRun.slotId;
+    const paused = state === "paused";
+    button.textContent = "立即巡检";
     button.disabled = inspectionRun.busy || busyState || !!succeeded || paused || inspectionRun.windowOpen === false;
-    const plan = $("#inspection-plan");
-    const duplicate = plan && inspectionRun.message && plan.textContent && (inspectionRun.message.trim() === plan.textContent.trim());
-    status.textContent = duplicate ? "" : inspectionRun.message;
-    status.dataset.state = inspectionRun.state;
+    button.title = paused ? "巡检已暂停"
+      : busyState ? "巡检正在进行或已排队"
+      : succeeded ? "本时段巡检已完成，下次巡检会自动开始"
+      : inspectionRun.windowOpen === false ? "当前不在巡检时段"
+      : "立即发起一轮巡检";
+    // Screen-reader announcements stay concise and never repeat the visible line.
+    // Only write on change so the 1s tick cannot re-announce the same message.
+    const announcement = inspectionRun.announce || "";
+    if (status.textContent !== announcement) status.textContent = announcement;
+    status.dataset.state = state || "unknown";
   }
   async function refreshInspectionStatus() {
     try {
@@ -433,19 +505,22 @@
       inspectionRun.message = inspectionRun.eventId
         ? "巡检状态暂不可用 · 保留最近状态"
         : "巡检状态暂不可用";
+      inspectionRun.announce = inspectionRun.message;
       renderInspectionRun();
     }
   }
   async function runInspection() {
-    if (inspectionRun.busy || ["queued", "running", "awaiting_confirmation", "succeeded", "paused"].includes(inspectionRun.state) || inspectionRun.enabled === false || inspectionRun.windowOpen === false || inspectionClock.schedule?.state === "paused" || inspectionClock.schedule?.enabled === false) return;
+    if (inspectionRun.busy || ["queued", "running", "awaiting_confirmation", "succeeded", "paused"].includes(inspectionEffectiveState()) || inspectionRun.enabled === false || inspectionRun.windowOpen === false || inspectionClock.schedule?.state === "paused" || inspectionClock.schedule?.enabled === false) return;
     inspectionRun.busy = true;
-    inspectionRun.message = "正在提交巡检请求…";
+    inspectionRun.announce = "正在提交巡检请求";
     renderInspectionRun();
+    renderInspectionPlan();
     try {
       const response = await fetch("/api/bug-inspection/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || `http_${response.status}`);
       const applied = applyInspectionStatus(payload, true);
+      inspectionRun.announce = applied ? "巡检请求已受理" : "请求已返回 · 巡检状态未同步";
       if (!applied) {
         inspectionRun.state = "unknown";
         inspectionRun.message = "请求已返回 · 巡检状态未同步";
@@ -456,11 +531,146 @@
       inspectionRun.message = inspectionRun.eventId
         ? "请求未确认 · 保留最近巡检状态"
         : "巡检请求暂不可用";
+      inspectionRun.announce = inspectionRun.message;
       renderInspectionRun();
     } finally {
       inspectionRun.busy = false;
       renderInspectionRun();
+      renderInspectionPlan();
     }
+  }
+
+  const inspectionHistory = { loading: false, token: 0 };
+  function inspectionRecordId(id) {
+    const value = String(id ?? "");
+    return /^[0-9]+$/.test(value) ? `#${value}` : value;
+  }
+  function inspectionRunStatusLabel(status) {
+    return ({ succeeded: "已完成", partial: "部分完成", blocked: "受阻", failed: "失败", paused: "已暂停", running: "进行中" })[status] || "状态未知";
+  }
+  function inspectionClockText(at) {
+    const epoch = Date.parse(at || "");
+    if (Number.isNaN(epoch)) return "时间未知";
+    return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(epoch));
+  }
+  function inspectionDateText(date) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+    return match ? `${match[1]} 年 ${Number(match[2])} 月 ${Number(match[3])} 日` : "今日";
+  }
+  function makeInspectionRunGroup(label, items) {
+    const section = document.createElement("section");
+    section.className = "inspection-run-group";
+    const head = document.createElement("h4");
+    head.className = "inspection-run-group-head";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const count = document.createElement("span");
+    count.className = "inspection-run-group-count";
+    count.textContent = `${items.length} 项`;
+    head.append(name, count);
+    section.append(head);
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "inspection-run-group-empty";
+      empty.textContent = "无新增";
+      section.append(empty);
+      return section;
+    }
+    const list = document.createElement("div");
+    list.className = "inspection-run-items";
+    for (const item of items) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "inspection-run-item";
+      button.dataset.openRecord = String(item.id);
+      const title = txt(item.title, "未命名事项");
+      button.setAttribute("aria-label", `查看事项：${inspectionRecordId(item.id)} ${title}`);
+      const id = document.createElement("span");
+      id.className = "inspection-run-item-id";
+      id.textContent = inspectionRecordId(item.id);
+      const text = document.createElement("span");
+      text.className = "inspection-run-item-title";
+      text.textContent = title;
+      button.append(id, text);
+      list.append(button);
+    }
+    section.append(list);
+    return section;
+  }
+  function makeInspectionRunCard(run = {}) {
+    const card = document.createElement("article");
+    card.className = "inspection-run-card";
+    const head = document.createElement("header");
+    head.className = "inspection-run-card-head";
+    const time = document.createElement("time");
+    time.className = "inspection-run-time";
+    time.textContent = inspectionClockText(run.at);
+    if (run.at) time.dateTime = String(run.at);
+    const status = document.createElement("span");
+    status.className = `inspection-run-status-pill is-${escClass(run.status || "unknown")}`;
+    status.textContent = inspectionRunStatusLabel(run.status);
+    head.append(time, status);
+    card.append(head);
+    const bugs = Array.isArray(run.new_bugs) ? run.new_bugs : [];
+    const requirements = Array.isArray(run.new_requirements) ? run.new_requirements : [];
+    card.append(makeInspectionRunGroup("新增 BUG", bugs), makeInspectionRunGroup("新增需求", requirements));
+    const notes = String(run.notes || "").trim();
+    if (notes) {
+      const note = document.createElement("p");
+      note.className = "inspection-run-notes";
+      const label = document.createElement("span");
+      label.className = "inspection-run-notes-label";
+      label.textContent = "备注";
+      const text = document.createElement("span");
+      text.textContent = notes;
+      note.append(label, text);
+      card.append(note);
+    }
+    return card;
+  }
+  function renderInspectionHistory(payload = {}) {
+    const runs = Array.isArray(payload.runs) ? payload.runs : [];
+    const list = $("#inspection-run-list"), empty = $("#inspection-empty");
+    const feedback = $("#inspection-feedback"), summary = $("#inspection-summary");
+    const date = $("#inspection-dialog-date");
+    if (date) date.textContent = `${inspectionDateText(payload.date)} · 按时间倒序`;
+    if (summary) summary.hidden = false;
+    $("#inspection-bug-count").textContent = String(Number(payload.new_bug_count) || 0);
+    $("#inspection-requirement-count").textContent = String(Number(payload.new_requirement_count) || 0);
+    feedback.textContent = "";
+    feedback.hidden = true;
+    empty.hidden = runs.length > 0;
+    list.replaceChildren(...runs.map(makeInspectionRunCard));
+  }
+  async function loadInspectionHistory() {
+    const feedback = $("#inspection-feedback");
+    const token = ++inspectionHistory.token;
+    inspectionHistory.loading = true;
+    feedback.hidden = false;
+    feedback.classList.remove("error");
+    feedback.textContent = "正在读取今日巡检记录…";
+    try {
+      const response = await fetch("/api/inspections/today", { cache: "no-store" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (token !== inspectionHistory.token) return;
+      renderInspectionHistory(payload);
+    } catch (_) {
+      if (token !== inspectionHistory.token) return;
+      feedback.classList.add("error");
+      feedback.textContent = "巡检记录暂不可用，请稍后重试。";
+      $("#inspection-summary").hidden = true;
+      $("#inspection-run-list").replaceChildren();
+      $("#inspection-empty").hidden = true;
+    } finally {
+      if (token === inspectionHistory.token) inspectionHistory.loading = false;
+    }
+  }
+  function openInspectionHistory() {
+    const dialog = $("#inspection-dialog");
+    if (!dialog) return;
+    if (!dialog.open) dialog.showModal();
+    loadInspectionHistory();
   }
 
   const libraryReadLabels = { success: "读取成功", succeeded: "读取成功", complete: "读取成功", partial: "部分读取", failed: "读取失败", error: "读取失败", running: "正在读取", in_progress: "正在读取", not_checked: "尚未读取", not_read: "尚未读取", unknown: "读取状态未知" };
@@ -479,12 +689,13 @@
     try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) && !url.username && !url.password ? url.href : null; }
     catch (_) { return null; }
   }
+  const logoAliases = { analytics_requirement: "requirement_doc", analytics_acceptance: "testcase", prototype: "prototype" };
   function sourceLogoKind(source) {
-    const kind = source.logo_kind || source.slot;
+    const kind = logoAliases[source.logo_kind || source.slot] || source.logo_kind || source.slot;
     return ["requirement_doc", "figma", "codesign", "api_doc", "file", "link"].includes(kind) ? kind : (source.type === "file" ? "file" : "link");
   }
   function makeSourceLogo(sourceOrKind) {
-    const kind = typeof sourceOrKind === "string" ? sourceOrKind : sourceLogoKind(sourceOrKind);
+    const kind = typeof sourceOrKind === "string" ? (logoAliases[sourceOrKind] || sourceOrKind) : sourceLogoKind(sourceOrKind);
     const safeKind = ["requirement_doc", "figma", "codesign", "prototype", "testcase", "supplementary",
       "api_doc", "architecture", "file", "link"].includes(kind) ? kind : "link";
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -572,21 +783,65 @@
     button.dataset.sourceAction = "inspection";
     button.dataset.sourceId = source.id;
     button.textContent = source.inspection_active ? "移出巡检" : "加入巡检";
-    button.title = source.slot === "requirement_doc" ? "仅影响这条资料所在的版本；需求文档只巡检最新与上一版。" : "将这条资料加入或移出巡检。";
+    button.title = ["requirement_doc", "analytics_requirement"].includes(source.slot)
+      ? "仅影响这条资料所在的版本；需求/埋点需求表只巡检最新与上一版。"
+      : "将这条资料加入或移出巡检。";
     return button;
   }
   function iterationName(iteration) { return model.iterationName(iteration); }
   function iterationStatusLabel(status) { return model.iterationStatusLabel(status); }
+  function iterationVersionType(iteration) { return model.iterationVersionType(iteration); }
+  function versionTypeLabel(iterationOrType) { return model.versionTypeLabel(iterationOrType); }
+  function recordDisplayId(record) {
+    const raw = record?.display_id || record?.id || "";
+    return /^[0-9]+$/.test(String(raw)) ? `#${raw}` : String(raw);
+  }
   function iterationStatusPill(iteration) {
     const pill = document.createElement("span");
     pill.className = `iteration-status-pill ${escClass(iteration?.status || "unknown")}`;
     pill.textContent = iterationStatusLabel(iteration?.status);
     return pill;
   }
+  const ITERATION_STATUS_CHOICES = ["planning", "active", "pending_release", "released", "archived"];
+  function iterationStatusSelect(iteration, busy) {
+    const status = iteration?.status;
+    const known = ITERATION_STATUS_CHOICES.includes(status);
+    const select = document.createElement("select");
+    select.className = `iteration-manager-status-select is-${known ? status : "unknown"}`;
+    select.dataset.iterationStatus = iteration.id;
+    select.disabled = busy;
+    select.title = "切换版本状态；规划中 / 进行中会随需求数量自动变化";
+    select.setAttribute("aria-label", `版本「${iterationName(iteration)}」的状态，当前为${iterationStatusLabel(status)}；可切换状态`);
+    select.setAttribute("aria-describedby", "iteration-manager-status-note");
+    select.append(...ITERATION_STATUS_CHOICES.map(value => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = iterationStatusLabel(value);
+      return option;
+    }));
+    if (known) select.value = status;
+    else {
+      const option = document.createElement("option");
+      option.value = status || "unknown";
+      option.textContent = iterationStatusLabel(status);
+      option.disabled = true;
+      select.prepend(option);
+      select.value = option.value;
+    }
+    return select;
+  }
+  function versionTypePill(iteration) {
+    const type = iterationVersionType(iteration);
+    const pill = document.createElement("span");
+    pill.className = `version-type-pill ${type}`;
+    pill.textContent = versionTypeLabel(type);
+    pill.title = type === "analytics" ? "埋点版本：固定资料位为埋点需求表与埋点验收表" : "迭代版本：固定资料位为需求列表、Figma、高保真与测试用例";
+    return pill;
+  }
   function orderedIterations() { return model.orderedIterations(state.iterations || []); }
   function iterationById(id) { return (state.iterations || []).find(item => item.id === id) || null; }
-  function slotDefinitions(scope) {
-    return scope === "global" ? model.globalArchiveSlots : model.iterationArchiveSlots;
+  function slotDefinitions(scope, iteration = null) {
+    return scope === "global" ? model.globalArchiveSlots : model.versionSlotDefinitions(iteration);
   }
   function slotLabel(slot) { return model.archiveSlotLabels[slot] || "补充材料"; }
   function scopeLabel(scope) { return scope === "global" ? "公共材料" : "版本资料"; }
@@ -612,6 +867,46 @@
     button.className = className;
     button.textContent = label;
     return button;
+  }
+  function maskedNoteText(note) {
+    const text = String(note || "").trim();
+    if (!text) return "";
+    return text.split(/\r?\n/).map(line => {
+      const labeled = line.match(/^([^：:\n]{1,24}[：:])/);
+      return labeled ? `${labeled[1]}••••` : "••••";
+    }).join("\n");
+  }
+  function makeSourceNote(source) {
+    const note = String(source.note || "").trim();
+    if (!note) return null;
+    const masked = source.note_masked === true;
+    const holder = document.createElement("div");
+    holder.className = "library-card-note";
+    const label = document.createElement("span");
+    label.className = "library-card-note-label";
+    label.textContent = "备注";
+    const text = document.createElement("p");
+    text.className = "library-card-note-text";
+    holder.append(label, text);
+    const render = revealed => { text.textContent = masked && !revealed ? maskedNoteText(note) : note; };
+    render(false);
+    if (masked) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "library-note-toggle";
+      toggle.textContent = "显示";
+      toggle.setAttribute("aria-label", "显示备注");
+      toggle.setAttribute("aria-pressed", "false");
+      toggle.addEventListener("click", () => {
+        const revealed = toggle.getAttribute("aria-pressed") !== "true";
+        toggle.setAttribute("aria-pressed", String(revealed));
+        toggle.setAttribute("aria-label", revealed ? "隐藏备注" : "显示备注");
+        toggle.textContent = revealed ? "隐藏" : "显示";
+        render(revealed);
+      });
+      holder.append(toggle);
+    }
+    return holder;
   }
   function groupHistoryKey(groupId, context = {}) {
     const scope = context.scope || "iteration";
@@ -695,6 +990,8 @@
     }
     const card = slot.card;
     article.dataset.groupId = card.group_id;
+    article.dataset.sourceId = card.id;
+    article.title = "点击卡片编辑名称与链接";
     const name = document.createElement("h4"); name.className = "library-card-name"; name.textContent = sourceDisplayName(card);
     const link = makeSourceOpenLink(card, sourceLinkText(card), "library-card-link");
     const historyKey = groupHistoryKey(card.group_id, context);
@@ -709,14 +1006,17 @@
     addVersion.dataset.groupId = card.group_id; addVersion.dataset.slot = slot.slot; addVersion.dataset.name = sourceDisplayName(card);
     addVersion.dataset.scope = scope; addVersion.dataset.iterationId = iterationId || "";
     const open = makeSourceOpenLink(card, "打开", "library-text-button");
-    const lifecycle = makeTextButton(card.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃");
-    lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = card.id;
     const relocate = makeTextButton("移动", "library-text-button source-relocate-btn");
     relocate.title = "把整组材料移动到另一个版本或公共材料";
     relocate.addEventListener("click", () => openRelocateDialog(card));
-    actions.append(addVersion, open, lifecycle, relocate);
+    const edit = makeTextButton("编辑");
+    edit.dataset.sourceAction = "edit"; edit.dataset.sourceId = card.id;
+    edit.setAttribute("aria-label", `编辑${sourceDisplayName(card)}的名称、链接与备注`);
+    actions.append(addVersion, open, edit, relocate);
     article.append(name, link);
     if (subtitle) article.append(subtitle);
+    const note = makeSourceNote(card);
+    if (note) article.append(note);
     article.append(inspection, actions, makeVersionHistory(slot.group, historyKey));
     return article;
   }
@@ -767,14 +1067,12 @@
     addVersion.dataset.scope = scope; addVersion.dataset.iterationId = String(iterationId || "");
     actions.append(addVersion);
     const inspectionToggle = makeInspectionToggle(source); if (inspectionToggle) actions.append(inspectionToggle);
-    const lifecycleOverride = makeTextButton(source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃");
-    lifecycleOverride.dataset.sourceAction = "nondeprecated"; lifecycleOverride.dataset.sourceId = source.id;
     const remove = makeTextButton("移出资料", "library-text-button is-muted");
     remove.title = "移出后可随时恢复"; remove.dataset.sourceAction = "remove"; remove.dataset.sourceId = source.id;
     const relocate = makeTextButton("移动", "library-text-button source-relocate-btn");
     relocate.title = "把整组材料移动到另一个版本或公共材料";
     relocate.addEventListener("click", () => openRelocateDialog(source));
-    actions.append(lifecycleOverride, remove, relocate);
+    actions.append(remove, relocate);
     row.append(logo, info, actions);
     return row;
   }
@@ -810,10 +1108,7 @@
     const actions = document.createElement("div"); actions.className = "library-row-actions";
     const restore = document.createElement("button"); restore.type = "button"; restore.className = "library-text-button";
     restore.textContent = "恢复资料"; restore.dataset.sourceAction = "restore"; restore.dataset.sourceId = source.id;
-    const lifecycle = document.createElement("button"); lifecycle.type = "button"; lifecycle.className = "library-text-button";
-    lifecycle.textContent = source.lifecycle_override === "active" ? "非废弃·已锁定" : "非废弃";
-    lifecycle.dataset.sourceAction = "nondeprecated"; lifecycle.dataset.sourceId = source.id;
-    actions.append(restore, lifecycle);
+    actions.append(restore);
     row.append(logo, info, actions);
     return row;
   }
@@ -851,14 +1146,14 @@
     title.className = "archive-block-title";
     title.textContent = scope === "global" ? "公共材料" : iterationName(iteration);
     titleLine.append(title);
-    if (iteration) titleLine.append(iterationStatusPill(iteration));
+    if (iteration) titleLine.append(versionTypePill(iteration), iterationStatusPill(iteration));
     const tag = iteration ? model.iterationSecondaryTag(iteration) : "";
     if (tag) title.title = `版本标识：${tag}`;
     const meta = document.createElement(released ? "span" : "p");
     meta.className = "archive-block-meta";
     meta.textContent = scope === "global"
       ? `接口文档 1 个固定位置 · 补充材料 ${section.supplementaryCount} 项`
-      : `4 个固定位置 · 已填 ${section.fixedCount} 个 · 补充材料 ${section.supplementaryCount} 项`;
+      : `${section.slots.length} 个固定位置（${versionTypeLabel(iteration)}）· 已填 ${section.fixedCount} 个 · 补充材料 ${section.supplementaryCount} 项`;
     copy.append(kicker, titleLine, meta);
     head.append(copy);
     if (!released) {
@@ -939,7 +1234,10 @@
     const select = $("#library-add-slot");
     if (!select) return;
     const context = state.libraryAddContext || defaultAddContext(state.archiveScopeTab);
-    const definitions = slotDefinitions(context.scope);
+    const target = context.scope === "iteration"
+      ? iterationById(state.libraryGroup?.iterationId || context.iterationId)
+      : null;
+    const definitions = slotDefinitions(context.scope, target);
     const options = definitions.map(definition => ({ value: definition.id, label: definition.label }));
     options.push({ value: "supplementary", label: "补充材料" });
     select.replaceChildren(...options.map(option => {
@@ -960,9 +1258,10 @@
     const context = state.libraryAddContext || defaultAddContext(state.archiveScopeTab);
     const slot = state.libraryGroup?.slot || $("#library-add-slot")?.value || context.slot || "supplementary";
     if (state.libraryGroup) {
+      const groupIteration = iterationById(state.libraryGroup.iterationId || context.iterationId);
       const where = context.scope === "global"
         ? "公共材料"
-        : (iterationById(state.libraryGroup.iterationId || context.iterationId)?.title ? iterationName(iterationById(state.libraryGroup.iterationId || context.iterationId)) : "未归入版本");
+        : (groupIteration ? `${iterationName(groupIteration)}（${versionTypeLabel(groupIteration)}版本）` : "未归入版本");
       node.textContent = `为「${state.libraryGroup.name}」添加新版本；归属保持为：${where} · ${slotLabel(slot)}。`;
       return;
     }
@@ -971,7 +1270,7 @@
     } else {
       const iteration = iterationById(context.iterationId);
       node.textContent = iteration
-        ? `添加到：${iterationName(iteration)} · ${slotLabel(slot)}。`
+        ? `添加到：${iterationName(iteration)}（${versionTypeLabel(iteration)}版本） · ${slotLabel(slot)}。`
         : "还没有版本可添加资料；请先在「编辑版本」中新建版本。";
     }
   }
@@ -996,9 +1295,12 @@
       const isActive = btn.dataset.scope === activeScope;
       btn.classList.toggle("active", isActive);
       btn.setAttribute("aria-selected", String(isActive));
+      btn.tabIndex = isActive ? 0 : -1;
     });
 
     const body = $("#archive-body");
+    body.setAttribute("role", "tabpanel");
+    body.setAttribute("aria-labelledby", activeScope === "global" ? "tab-archive-global" : "tab-archive-iteration");
     let blocks;
     if (activeScope === "global") {
       blocks = [makeArchiveSection(archive.global)];
@@ -1042,7 +1344,8 @@
   }
   function sourceError(payload, status) {
     const errors = {
-      source_duplicate: "这条资料已在清单中。", invalid_source_url: "链接格式无效，请使用 http 或 https 地址。",
+      source_duplicate: "这条链接已在资料馆中，请更换链接或名称。", invalid_source_url: "链接格式无效，请使用 http 或 https 地址。",
+      invalid_source_update: "没有可保存的修改，请检查名称与链接。", invalid_source_type: "文件资料不能修改链接。",
       invalid_source_category: "资料类别无效。", invalid_source_name: "请填写有效的资料名称。",
       source_file_size_invalid: "文件为空或超过 15 MiB 大小限制。", unsupported_source_file_type: "当前文件类型不受支持。",
       source_file_type_mismatch: "文件内容与扩展名不符。", invalid_source_filename: "文件名无效。",
@@ -1078,7 +1381,7 @@
   }
   function setSourcesBusy(busy, message = "") {
     state.sourcesBusy = busy;
-    ["#source-add-file", "#source-link-submit", "#library-add-cancel", "#library-file-clear", "#library-add-slot"].forEach(selector => {
+    ["#source-add-file", "#source-link-submit", "#library-add-cancel", "#library-file-clear", "#library-add-slot", "#source-link-note", "#source-link-note-masked"].forEach(selector => {
       const control = $(selector); if (control) control.disabled = busy || (selector === "#library-add-slot" && !!state.libraryGroup);
     });
     $$("[data-source-action]").forEach(button => { button.disabled = busy; });
@@ -1096,6 +1399,69 @@
     $("#library-file-name").textContent = file ? file.name : "未选择文件";
     $("#library-file-clear").hidden = !file;
   }
+  function setSourceNameHint(message, kind = "") {
+    const hint = $("#source-name-hint");
+    if (!hint) return;
+    hint.textContent = message;
+    hint.className = `library-name-hint${kind ? ` ${kind}` : ""}`;
+  }
+  function cancelSourceNamePreview() {
+    clearTimeout(state.autoName.timer);
+    state.autoName.timer = null;
+    state.autoName.controller?.abort();
+    state.autoName.controller = null;
+    state.autoName.token += 1;
+  }
+  function resetSourceNamePreview(name = "") {
+    cancelSourceNamePreview();
+    state.autoName.userEdited = Boolean(String(name || "").trim());
+    state.autoName.lastUrl = "";
+    setSourceNameHint("");
+  }
+  async function previewSourceName(url) {
+    const token = ++state.autoName.token;
+    const controller = new AbortController();
+    state.autoName.controller = controller;
+    try {
+      const response = await fetch(`/api/sources/preview?url=${encodeURIComponent(url)}`, { cache: "no-store", signal: controller.signal });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "preview_failed");
+      if (token !== state.autoName.token) return;
+      const title = typeof payload.title === "string" ? payload.title.trim() : "";
+      const nameInput = $("#source-link-name");
+      if (!title) { state.autoName.lastUrl = ""; setSourceNameHint("未能从链接取得标题，请手动填写名称。", "error"); return; }
+      if (!nameInput.value.trim() && !state.autoName.userEdited) {
+        nameInput.value = title.slice(0, 200);
+        setSourceNameHint("已按链接填入名称，可手动修改。", "success");
+      }
+    } catch (error) {
+      if (error.name === "AbortError" || token !== state.autoName.token) return;
+      state.autoName.lastUrl = "";
+      setSourceNameHint(error.message === "invalid_source_url"
+        ? "该链接不是可公开访问的地址，请手动填写名称。"
+        : "未能自动取名，请手动填写。", "error");
+    } finally {
+      if (state.autoName.controller === controller) state.autoName.controller = null;
+    }
+  }
+  function scheduleSourceNamePreview() {
+    const urlInput = $("#source-link-url");
+    const nameInput = $("#source-link-name");
+    if (!urlInput || !nameInput) return;
+    clearTimeout(state.autoName.timer);
+    state.autoName.token += 1;
+    state.autoName.controller?.abort();
+    state.autoName.controller = null;
+    if (state.libraryFile) { setSourceNameHint(""); return; }
+    const url = urlInput.value.trim();
+    if (!url) { state.autoName.lastUrl = ""; setSourceNameHint(""); return; }
+    if (!safeHttpUrl(url)) { setSourceNameHint("链接格式无效，请使用 http 或 https 地址。", "error"); return; }
+    if (state.autoName.userEdited || nameInput.value.trim()) { setSourceNameHint(""); return; }
+    if (url === state.autoName.lastUrl) return;
+    state.autoName.lastUrl = url;
+    setSourceNameHint("正在按链接取名字…", "busy");
+    state.autoName.timer = window.setTimeout(() => previewSourceName(url), 520);
+  }
   function openLibraryAdd({ slot = "", group = null, name = "", scope = null, iterationId = null } = {}) {
     const card = group?.card || null;
     const resolvedScope = scope || (card ? model.sourceScope(card) : null) || state.archiveScopeTab || "iteration";
@@ -1112,6 +1478,9 @@
     $("#source-link-name").value = displayName;
     $("#source-link-url").value = "";
     $("#library-add-version").value = "";
+    $("#source-link-note").value = "";
+    $("#source-link-note-masked").checked = false;
+    resetSourceNamePreview(displayName);
     renderLibraryAddSlotOptions();
     $("#library-add-slot").value = groupSlot;
     updateLibraryAddContext();
@@ -1122,8 +1491,10 @@
   }
   function resetLibraryAdd(close = true) {
     state.libraryGroup = null;
+    cancelSourceNamePreview();
     selectLibraryFile(null);
     $("#source-link-form").reset();
+    setSourceNameHint("");
     $("#library-add-slot").disabled = false;
     if (close) $("#library-add-fold").open = false;
     renderLibraryAddSlotOptions();
@@ -1146,23 +1517,34 @@
     if (scope === "iteration" && !iteration_id) { sourceFeedback("请先在「编辑版本」中新建版本，再添加版本资料。", "error"); return; }
     const slot = group?.slot || $("#library-add-slot").value || "supplementary";
     const versionLabel = $("#library-add-version").value.trim() || null;
+    const note = $("#source-link-note").value.trim();
+    const noteMasked = note ? $("#source-link-note-masked").checked : false;
     const category = model.archiveSlotLabels[slot] || "补充材料";
     setSourcesBusy(true, file ? `正在添加“${file.name}”…` : "正在添加资料…");
     try {
+      let noteError = null;
       if (file) {
         const content_base64 = await encodeFile(file);
-        await sourceRequest("/api/sources/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        const created = await sourceRequest("/api/sources/file", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
           filename: file.name, content_base64, category, name: name || file.name, slot, group_id: group?.group_id || null, version_label: versionLabel,
           scope, iteration_id
         }) });
+        if (note || noteMasked) {
+          try {
+            await sourceRequest(`/api/sources/${encodeURIComponent(created.source.id)}/edit`, {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note, note_masked: noteMasked })
+            });
+          } catch (error) { noteError = error; }
+        }
       } else {
         await sourceRequest("/api/sources/link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
           name, url, category, slot, group_id: group?.group_id || null, version_label: versionLabel,
-          scope, iteration_id
+          scope, iteration_id, note, note_masked: noteMasked
         }) });
       }
       await loadSources();
-      sourceFeedback(file ? `已添加文件“${file.name}”。` : "已添加资料。");
+      if (noteError) sourceFeedback(`文件已添加，但备注保存失败：${noteError.message || "请重试"}。可点击资料卡重新编辑。`, "error");
+      else sourceFeedback(file ? `已添加文件“${file.name}”。` : "已添加资料。");
       resetLibraryAdd();
     } catch (error) {
       sourceFeedback(error.message || "资料添加失败，请重试。", "error");
@@ -1193,22 +1575,13 @@
     } catch (error) { sourceFeedback(error.message || "资料状态更新失败，请重试。", "error"); }
     finally { setSourcesBusy(false); }
   }
-  async function setSourceLifecycle(sourceId) {
-    const source = state.sources.find(item => item.id === sourceId);
-    if (!source || state.sourcesBusy) return;
-    const lifecycleOverride = source.lifecycle_override === "active" ? null : "active";
-    setSourcesBusy(true, lifecycleOverride ? "正在锁定资料为非废弃…" : "正在取消资料状态锁定…");
-    try {
-      await sourceRequest(`/api/sources/${encodeURIComponent(sourceId)}/lifecycle`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lifecycle_override: lifecycleOverride }) });
-      await loadSources(); sourceFeedback(lifecycleOverride ? "资料已设为非废弃并锁定。" : "资料状态锁定已取消。");
-    } catch (error) { sourceFeedback(error.message || "资料状态更新失败。", "error"); }
-    finally { setSourcesBusy(false); }
-  }
   function handleSourceAction(button) {
     if (!button) return;
-    if (button.dataset.sourceAction === "nondeprecated") return setSourceLifecycle(button.dataset.sourceId);
     if (button.dataset.sourceAction === "inspection") return toggleSourceInspection(button.dataset.sourceId);
     if (button.dataset.sourceAction === "remove" || button.dataset.sourceAction === "restore") return changeSourceActive(button.dataset.sourceId, button.dataset.sourceAction);
+    if (button.dataset.sourceAction === "edit") {
+      return openSourceEdit(state.sources.find(item => item.id === button.dataset.sourceId));
+    }
     if (button.dataset.sourceAction === "add-context" || button.dataset.sourceAction === "add-slot") {
       return openLibraryAdd({
         slot: button.dataset.slot || "supplementary",
@@ -1245,6 +1618,67 @@
       return;
     }
     handleSourceAction(event.target.closest("[data-source-action]"));
+    if (event.target.closest("button,a,input,select,textarea,summary,details,.library-history")) return;
+    const card = event.target.closest(".library-card[data-source-id]");
+    if (!card) return;
+    openSourceEdit(state.sources.find(item => item.id === card.dataset.sourceId));
+  }
+  function sourceEditFeedback(message, kind = "") {
+    const node = $("#source-edit-feedback");
+    if (!node) return;
+    node.textContent = message;
+    node.className = `source-edit-feedback${kind ? ` ${kind}` : ""}`;
+  }
+  function openSourceEdit(source) {
+    if (!source || state.sourcesBusy) return;
+    state.sourceEdit = source;
+    const isFile = source.type === "file";
+    $("#source-edit-title").textContent = isFile ? "编辑文件资料" : "编辑资料";
+    $("#source-edit-context").textContent = `${sourceDisplayName(source)} · ${sourceLocationText(source)}`;
+    $("#source-edit-name").value = sourceDisplayName(source);
+    $("#source-edit-url").value = isFile ? "" : (source.url || "");
+    $("#source-edit-url-wrap").hidden = isFile;
+    $("#source-edit-note-input").value = source.note || "";
+    $("#source-edit-note-masked").checked = source.note_masked === true;
+    $("#source-edit-note").hidden = !isFile;
+    sourceEditFeedback("");
+    $("#source-edit-dialog").showModal();
+    $("#source-edit-name").focus({ preventScroll: true });
+    $("#source-edit-name").select();
+  }
+  function closeSourceEdit() {
+    state.sourceEdit = null;
+    if ($("#source-edit-dialog")?.open) $("#source-edit-dialog").close();
+  }
+  async function submitSourceEdit(event) {
+    event.preventDefault();
+    const source = state.sourceEdit;
+    if (!source) return;
+    const isFile = source.type === "file";
+    const name = $("#source-edit-name").value.trim();
+    const url = isFile ? "" : $("#source-edit-url").value.trim();
+    const note = $("#source-edit-note-input").value.trim();
+    const noteMasked = note ? $("#source-edit-note-masked").checked : false;
+    if (!name) { sourceEditFeedback("请填写资料名称。", "error"); $("#source-edit-name").focus(); return; }
+    if (!isFile && !url) { sourceEditFeedback("请填写资料链接。", "error"); $("#source-edit-url").focus(); return; }
+    if (!isFile && !safeHttpUrl(url)) { sourceEditFeedback("链接格式无效，请使用 http 或 https 地址。", "error"); $("#source-edit-url").focus(); return; }
+    const button = $("#source-edit-submit");
+    button.disabled = true;
+    sourceEditFeedback("正在保存…", "busy");
+    try {
+      const payload = isFile ? { name, note, note_masked: noteMasked } : { name, url, note, note_masked: noteMasked };
+      await sourceRequest(`/api/sources/${encodeURIComponent(source.id)}/edit`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+      });
+      if (state.sourceEdit?.id === source.id) closeSourceEdit();
+      await loadSources();
+      sourceFeedback("资料已更新，版本与归属保持不变。");
+      showToast("资料已更新");
+    } catch (error) {
+      sourceEditFeedback(error.message || "保存失败，请重试。", "error");
+    } finally {
+      button.disabled = false;
+    }
   }
   function updateThemeButton() {
     const theme = document.body.dataset.theme || "minimal";
@@ -1309,7 +1743,7 @@
     const pendingRelease = effectiveStatus(record) === "pending_release";
     article.className = `record-card${terminal ? " record-completed record-terminal" : ""}${cancelled ? " record-cancelled" : ""}${pendingRelease ? " record-pending-release" : ""}${record.transfer_disposition === "transfer_pending" ? " transfer-pending" : ""}${busy ? " is-busy" : ""}`;
     const head = document.createElement("div"); head.className = "record-head";
-    const idLabel = document.createElement("span"); idLabel.className = "record-id"; idLabel.textContent = record.display_id || record.id; idLabel.title = record.display_id && record.display_id !== record.id ? `原始编号：${record.id}` : record.id; head.append(idLabel);
+    const idLabel = document.createElement("span"); idLabel.className = "record-id"; idLabel.textContent = recordDisplayId(record); idLabel.title = record.display_id && record.display_id !== record.id ? `原始编号：${record.id}` : record.id; head.append(idLabel);
     const status = document.createElement("span"); status.className = `status-pill ${record.transfer_disposition === "transfer_pending" ? "transfer-pending" : escClass(record.type === "bug" ? (record.platform_status || record.status) : effectiveStatus(record))}`;
     const statusCode = effectiveStatus(record);
     status.textContent = record.transfer_disposition === "transfer_pending" ? "待转交" : record.transfer_disposition === "transferred" ? "责任转移" : ownerChanged ? "责任人变更" : cancelled ? "已取消" : done ? "已完成" : statusLabel(["in_progress", "developing", "testing", "on_hold", "pending_release"].includes(statusCode) || record.type === "task" ? statusCode : sourceStatus(record)); head.append(status);
@@ -1345,7 +1779,7 @@
     }
     const open = document.createElement("button"); open.type = "button"; open.className = "record-title-button"; open.dataset.openRecord = record.id; open.setAttribute("aria-label", `查看详情：${record.title}`);
     const title = document.createElement("span"); title.className = "record-title"; title.textContent = record.title; open.append(title);
-    const summary = document.createElement("p"); summary.className = "card-summary"; summary.textContent = record.latest_brief || cardBrief(record);
+    const summary = document.createElement("p"); summary.className = "card-summary"; summary.textContent = record.status_line || record.latest_brief || cardBrief(record);
     article.append(head, open, summary);
     if (["in_progress", "developing", "testing"].includes(effectiveStatus(record)) && record.current_agent_session_id) {
       const processing = document.createElement("p"); processing.className = "agent-processing";
@@ -1357,21 +1791,11 @@
     const complete = document.createElement("button"); complete.type = "button"; complete.className = terminal ? "complete-button is-complete" : "complete-button";
     complete.dataset.completeId = record.id; complete.textContent = cancelled ? "已取消" : done ? (hasManualCompletion(record) ? "撤销完成" : "✓ 已完成") : "完成";
     complete.disabled = busy || (terminal && (!done || !hasManualCompletion(record))); complete.setAttribute("aria-pressed", String(done));
-    const followup = document.createElement("button"); followup.type = "button"; followup.className = "mini-button"; followup.dataset.followupId = record.id; followup.textContent = "跟进"; followup.disabled = busy;
-    if (done) {
-      const it = (state.iterations || []).find(i => i.id === record.iteration_id);
-      if (!it || (it.status !== "released" && it.status !== "archived")) {
-        const reworkBtn = document.createElement("button");
-        reworkBtn.type = "button";
-        reworkBtn.className = "mini-button rework-btn";
-        reworkBtn.dataset.reopenId = record.id;
-        reworkBtn.textContent = record.reopen_count ? `修改(R${record.reopen_count + 1})` : "发起修改";
-        reworkBtn.title = "在迭代发布前发起二次修改";
-        actions.append(reworkBtn);
-      }
-    }
-    if (record.transfer_disposition === "transfer_pending") { const transfer = document.createElement("button"); transfer.type = "button"; transfer.className = "transfer-button"; transfer.dataset.transferId = record.id; transfer.textContent = "已转交"; transfer.disabled = busy; actions.append(followup, transfer); }
-    else actions.append(followup, complete);
+    // 跟进与发起修改入口已从卡片移除；历史与二次修改数据仍在详情只读展示。
+    if (record.transfer_disposition === "transfer_pending") {
+      const transfer = document.createElement("button"); transfer.type = "button"; transfer.className = "transfer-button"; transfer.dataset.transferId = record.id; transfer.textContent = "已转交"; transfer.disabled = busy;
+      actions.append(transfer);
+    } else actions.append(complete);
     article.append(actions);
     return article;
   }
@@ -1380,30 +1804,16 @@
     const columns = [document.createElement("div"), document.createElement("div")];
     columns.forEach(column => { column.className = "masonry-column"; });
     list.replaceChildren(...columns);
-    const canMeasure = list.clientWidth > 0;
-    // At <=339px CSS hides the second column. Never balance cards into a
+    // At narrow widths CSS hides the second column. Never place cards into a
     // column that has no layout box, otherwise they disappear visually.
     const visibleColumns = columns.map(column => getComputedStyle(column).display !== "none");
-    if (!canMeasure) {
-      cards.forEach((card, index) => {
-        card.dataset.masonryOrder = String(index);
-        columns[model.masonryColumnIndex([], visibleColumns, index)].append(card);
-      });
-      return;
-    }
-    // Measure in one pass instead of interleaving append/offsetHeight, which
-    // forced a synchronous layout per card on long lists.
+    // Row-first: 0→left, 1→right, 2→left… No height measurement is needed, so
+    // rebuilding long lists stays free of layout reads. Inline order also keeps
+    // the single-column reading order correct beyond the CSS 0–47 fallback.
     cards.forEach((card, index) => {
       card.dataset.masonryOrder = String(index);
-      columns[0].append(card);
-    });
-    const gap = parseFloat(getComputedStyle(columns[0]).rowGap) || 0;
-    const heights = [0, 0];
-    const measured = cards.map(card => card.offsetHeight);
-    cards.forEach((card, index) => {
-      const columnIndex = model.masonryColumnIndex(heights, visibleColumns, index);
-      columns[columnIndex].append(card);
-      if (visibleColumns[columnIndex]) heights[columnIndex] += measured[index] + gap;
+      card.style.order = String(index);
+      columns[model.masonryColumnIndex([], visibleColumns, index)].append(card);
     });
   }
   function relayoutMasonryList(list) {
@@ -1427,6 +1837,613 @@
     for (const list of masonryLists) if (!list.isConnected) { masonryObserver.unobserve(list); masonryLists.delete(list); masonryWidths.delete(list); }
   }
   document.fonts?.ready?.then(() => $$(".record-list").forEach(relayoutMasonryList));
+
+  // Topbar road (2026-11-20 redo): four long, soft lane curves that run the
+  // full height of the header — from below the bottom edge to above the top
+  // edge — and share one continuous geometry for every header height. Near
+  // lanes spread wide, far lanes keep a visible gap, so the fan reads as a
+  // road receding into the distance rather than a closed crescent. Solid and
+  // short-dashed lanes are combined. Each lane keeps its own gentle bow and
+  // sway phase so the four curves never collapse onto one trajectory.
+  // Idle flow never stops; scroll nudges the phase; compression bends the
+  // same curves in place instead of switching to another band. Canvas, rAF,
+  // hidden-page pause and reduced-motion static frame are kept.
+  function setupTopbarWaves(topbar) {
+    const host = $(".topbar-waves", topbar);
+    const canvas = host ? $("canvas", host) : null;
+    const noop = { pulse() {}, nudge() {} };
+    if (!canvas || typeof canvas.getContext !== "function") return noop;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return noop;
+    const reduceMotion = window.matchMedia
+      ? window.matchMedia("(prefers-reduced-motion: reduce)")
+      : { matches: false };
+    const PULSE_MS = 2100;
+    const clamp01 = value => Math.min(1, Math.max(0, value));
+    let width = 1, height = 1, dpr = 1;
+    let road = null;
+    let frame = 0;
+    let running = false;
+    let resizeFrame = 0;
+    let lastPaint = 0;
+    let surgeAt = -1;
+    let surgeStrength = 1;
+    let scrollPhase = 0;
+
+    function measureRoad() {
+      const styles = window.getComputedStyle ? getComputedStyle(topbar) : null;
+      const rawP = styles ? parseFloat(styles.getPropertyValue("--topbar-p")) : NaN;
+      if (Number.isFinite(rawP)) return { compressed: clamp01(rawP) };
+      // 兜底：按顶栏实际高度估算压缩进度（窄屏换行时高度会大于展开值）。
+      const rect = topbar.getBoundingClientRect();
+      const expanded = styles ? parseFloat(styles.getPropertyValue("--topbar-expanded")) || 118 : 118;
+      const compact = styles ? parseFloat(styles.getPropertyValue("--topbar-compact")) || 64 : 64;
+      return { compressed: compact < expanded ? clamp01((expanded - rect.height) / (expanded - compact)) : 0 };
+    }
+    function resize() {
+      const rect = topbar.getBoundingClientRect();
+      const nextWidth = Math.max(1, Math.round(rect.width));
+      const nextHeight = Math.max(1, Math.round(rect.height));
+      const nextDpr = Math.min(window.devicePixelRatio || 1, 2);
+      const changed = nextWidth !== width || nextHeight !== height || nextDpr !== dpr;
+      width = nextWidth; height = nextHeight; dpr = nextDpr;
+      if (changed) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      road = measureRoad();
+      draw(reduceMotion.matches ? 0 : performance.now(), reduceMotion.matches ? 0 : surgeLevel(performance.now()));
+    }
+    // One slow hump: 0 → peak → 0 with zero velocity at both ends.
+    function surgeLevel(now) {
+      if (surgeAt < 0) return 0;
+      const progress = (now - surgeAt) / PULSE_MS;
+      if (progress >= 1) { surgeAt = -1; return 0; }
+      return (0.5 - 0.5 * Math.cos(progress * Math.PI * 2)) * surgeStrength;
+    }
+    function draw(now, surge) {
+      ctx.clearRect(0, 0, width, height);
+      if (!road) road = measureRoad();
+      const w = width, h = height;
+      if (w < 80 || h < 24) return;
+      const dark = document.body.dataset.theme === "dark";
+      // 低饱和蓝/墨：只作为玻璃底色里的纹理，不抢品牌与按钮。
+      const blue = dark ? { r: 138, g: 168, b: 198 } : { r: 66, g: 99, b: 132 };
+      const ink = dark ? { r: 150, g: 164, b: 184 } : { r: 70, g: 82, b: 98 };
+      const time = now * 0.001;
+      // 静止时仍持续推进：形状相位、呼吸与虚线偏移共用同一时间源。
+      const phase = time * 0.3 + scrollPhase + surge * 0.55;
+      const breathe = 0.86 + 0.14 * Math.sin(time * 0.9 + 0.6);
+      const compressed = road.compressed || 0;
+      // 窄屏上线条会经过标题与按钮，整体再压暗一档，保持品牌优先。
+      const narrowFade = w < 480 ? 0.72 : 1;
+      // 透视：底边（近处）相邻车道间距约 0.20w，顶边（远处）保留约 0.05w，
+      // 四条线收向地平线但不会并成一点，整体读作“远处的路”而非香蕉。
+      const spreadAt = t => {
+        const near = w * (0.205 - compressed * 0.010);
+        const far = w * (0.052 - compressed * 0.003);
+        // 远端不过度收拢；底边略微外扩，让路在近处张开。
+        return far + (near - far) * Math.pow(Math.max(0, 1 - t), 0.92);
+      };
+      // 中线只做很轻的右移加速弯（二次项），曲率舒展，避免和车道一起卷成月牙。
+      const centerAt = t => w * (0.405 + 0.17 * t + 0.06 * t * t);
+      const laneX = (t, lane) => {
+        // 端点归零的包络：上下边缘的开口与间距由 spreadAt 精确控制。
+        const envelope = Math.sin(Math.PI * t);
+        // 每条线独立的相位/幅度，共用中线但不共用同一条弯曲线。
+        const sway = w * lane.sway * envelope * Math.sin(phase * 1.3 + lane.phase + t * 2.4);
+        // 压缩不换组：沿同一条曲线把中段轻轻推弯，高度变化时连续变形。
+        const bend = w * (0.020 * compressed + 0.016 * surge) * envelope * lane.bend;
+        const bow = w * lane.bow * envelope;
+        return centerAt(t) + sway + bend + bow + lane.offset * spreadAt(t);
+      };
+      const startT = -0.05, endT = 1.05, segments = 64;
+      const lanes = [
+        { offset: -1.55, bend: 1.05, bow: -0.010, sway: 0.010, phase: 0, rgb: blue, alpha: 0.26, width: 1.35, dash: null },
+        { offset: -0.5, bend: 0.9, bow: 0.006, sway: 0.012, phase: 0.9, rgb: ink, alpha: 0.19, width: 1.1, dash: null },
+        { offset: 0.5, bend: 1.14, bow: -0.005, sway: 0.011, phase: 1.9, rgb: blue, alpha: 0.24, width: 1.25, dash: [14, 22] },
+        { offset: 1.55, bend: 0.86, bow: 0.012, sway: 0.013, phase: 2.7, rgb: ink, alpha: 0.18, width: 1.5, dash: null }
+      ];
+      // 上下边缘渐隐，让线像从玻璃外延伸进来，而不是在边框处硬截断。
+      if (!draw._gradCache || draw._gradH !== h || draw._gradDark !== dark) {
+        const color = (rgb, alpha) => `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`;
+        const makeFade = rgb => {
+          const fade = ctx.createLinearGradient(0, h, 0, 0);
+          fade.addColorStop(0, color(rgb, 0));
+          fade.addColorStop(0.08, color(rgb, 1));
+          fade.addColorStop(0.92, color(rgb, 1));
+          fade.addColorStop(1, color(rgb, 0));
+          return fade;
+        };
+        draw._gradCache = { blue: makeFade(blue), ink: makeFade(ink) };
+        draw._gradH = h;
+        draw._gradDark = dark;
+      }
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      for (const lane of lanes) {
+        ctx.strokeStyle = lane.rgb === blue ? draw._gradCache.blue : draw._gradCache.ink;
+        ctx.lineWidth = lane.width;
+        ctx.globalAlpha = Math.min(0.34, lane.alpha * breathe * (1 + surge * 0.4)) * narrowFade;
+        ctx.setLineDash(lane.dash || []);
+        // 虚线沿道路缓慢行进，是静止状态里最容易被看到的持续运动。
+        ctx.lineDashOffset = lane.dash ? -(time * 16 + scrollPhase * 4) : 0;
+        ctx.beginPath();
+        for (let index = 0; index <= segments; index += 1) {
+          const t = startT + (endT - startT) * (index / segments);
+          const x = laneX(t, lane), y = h * (1 - t);
+          if (index) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+    function tick(now) {
+      if (document.hidden) { stop(); return; }
+      if (reduceMotion.matches) { stop(); draw(0, 0); return; }
+      const surge = surgeLevel(now);
+      if (now - lastPaint >= (surge > 0.01 ? 22 : 50)) {
+        lastPaint = now;
+        draw(now, surge);
+      }
+      frame = requestAnimationFrame(tick);
+    }
+    function start() {
+      if (running || document.hidden || reduceMotion.matches) return;
+      running = true;
+      lastPaint = 0;
+      frame = requestAnimationFrame(tick);
+    }
+    function stop() {
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      running = false;
+    }
+    function pulse(strength = 1) {
+      if (reduceMotion.matches) return;
+      const now = performance.now();
+      if (surgeAt >= 0 && now - surgeAt < PULSE_MS * 0.6) return;
+      surgeAt = now;
+      surgeStrength = Math.max(0.55, Math.min(1, strength));
+      start();
+    }
+    // 滚动本身推动道路相位：只要页面在动，线条就跟着连续流动、不冻结。
+    function nudge(dy) {
+      if (reduceMotion.matches || !Number.isFinite(dy) || Math.abs(dy) < 0.5) return;
+      scrollPhase = Math.max(-8, Math.min(8, scrollPhase + dy * 0.0018));
+      if (!running) start();
+    }
+    function scheduleResize() {
+      if (resizeFrame) return;
+      resizeFrame = requestAnimationFrame(() => { resizeFrame = 0; resize(); });
+    }
+
+    if (window.ResizeObserver) new ResizeObserver(scheduleResize).observe(topbar);
+    if (window.MutationObserver) new MutationObserver(() => {
+      if (!running) draw(reduceMotion.matches ? 0 : performance.now(), 0);
+    }).observe(document.body, { attributes: true, attributeFilter: ["data-theme"] });
+    document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); else start(); });
+    reduceMotion.addEventListener?.("change", () => {
+      if (reduceMotion.matches) { stop(); draw(0, 0); }
+      else start();
+    });
+    document.fonts?.ready?.then(scheduleResize);
+    resize();
+    if (!reduceMotion.matches && !document.hidden) start();
+    return { pulse, nudge, resize: scheduleResize };
+  }
+
+  // Scroll chrome: a fixed header that compresses on downward scrolling and
+  // restores on upward scrolling, plus one shared overlay scrollbar for the
+  // page and every dialog scroll surface. Everything is driven by cached
+  // geometry so scroll frames only read scrollTop and write CSS
+  // variables/classes; no layout is read inside the scroll handler.
+  function setupScrollChrome() {
+    const topbar = $(".topbar");
+    const pageRail = $("#page-scroll-rail");
+    const detailRail = $("#detail-scroll-rail");
+    const detail = $("#detail");
+    const dialog = $("#record-dialog");
+    if (!topbar || !pageRail) return null;
+    const waves = setupTopbarWaves(topbar);
+
+    const reduceMotion = window.matchMedia
+      ? window.matchMedia("(prefers-reduced-motion: reduce)")
+      : { matches: false };
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+    const setVar = (node, name, value) => { if (node) node.style.setProperty(name, value); };
+    // 光束长度不按内容比例缩短：它是一束投在右缘的光，光晕至少覆盖轨道一半。
+    const beamSize = track => track > 1 ? Math.max(0, Math.min(track - 12, Math.max(72, track * 0.56))) : 0;
+    const paintFlow = (rail, flow) => {
+      const wave = Math.sin(flow.value * Math.PI * 2);
+      setVar(rail, "--rail-flow", flow.value.toFixed(3));
+      setVar(rail, "--rail-core-shift", wave.toFixed(3));
+      setVar(rail, "--rail-energy", (0.55 + 0.45 * Math.abs(wave)).toFixed(3));
+    };
+    const pageGeo = { max: 0, thumb: 0, travel: 0 };
+    const detailGeo = { max: 0, thumb: 0, travel: 0 };
+    const observers = [];
+    const dialogRails = [];
+    // Continuous light-flow phase for the edge beam: scroll delta advances it,
+    // and the core offset / halo energy follow so the beam keeps changing
+    // strength and position while the page moves.
+    const pageFlow = { value: 0.5 };
+    const detailFlow = { value: 0.5 };
+
+    let lastScrollY = window.scrollY;
+    let lastDetailTop = detail ? detail.scrollTop : 0;
+    let downRun = 0;
+    let upRun = 0;
+    let topbarP = window.scrollY > 24 ? 1 : 0;
+    let topbarTarget = topbarP;
+    let topbarFrame = 0;
+    let scrollFrame = 0;
+    let measureFrame = 0;
+    let detailFrame = 0;
+    let detailMeasureFrame = 0;
+
+    function nudgeFlow(flow, delta, rail) {
+      if (!rail || !Number.isFinite(delta) || Math.abs(delta) < 0.01) return;
+      // The gradient phase keeps moving with the content: scrolling shifts the
+      // bright band inside the thumb instead of only translating the thumb.
+      flow.value = (flow.value + delta / 260) % 1;
+      if (flow.value < 0) flow.value += 1;
+      paintFlow(rail, flow);
+    }
+
+    function paintTopbar(value) {
+      topbarP = clamp(value, 0, 1);
+      topbar.style.setProperty("--topbar-p", topbarP.toFixed(3));
+      const scrolled = topbarP > 0.02;
+      if (topbar.classList.contains("is-scrolled") !== scrolled) topbar.classList.toggle("is-scrolled", scrolled);
+    }
+
+    function aimTopbar(value) {
+      const changed = Math.abs(value - topbarTarget) >= 0.5;
+      topbarTarget = value;
+      if (changed) waves.pulse(1);
+      if (reduceMotion.matches) { paintTopbar(value); return; }
+      if (topbarFrame || Math.abs(topbarTarget - topbarP) < 0.003) return;
+      const step = () => {
+        if (reduceMotion.matches) { paintTopbar(topbarTarget); topbarFrame = 0; return; }
+        const diff = topbarTarget - topbarP;
+        if (Math.abs(diff) < 0.004) { paintTopbar(topbarTarget); topbarFrame = 0; return; }
+        paintTopbar(topbarP + diff * 0.24);
+        topbarFrame = requestAnimationFrame(step);
+      };
+      topbarFrame = requestAnimationFrame(step);
+    }
+
+    function measurePageRail() {
+      const doc = document.scrollingElement || document.documentElement;
+      const viewport = Math.max(1, window.innerHeight);
+      const scrollHeight = Math.max(doc.scrollHeight, viewport);
+      const max = Math.max(0, scrollHeight - viewport);
+      const railHeight = pageRail.getBoundingClientRect().height || viewport;
+      const track = Math.max(0, railHeight - 24);
+      const thumb = max > 1 ? beamSize(track) : 0;
+      pageGeo.max = max;
+      pageGeo.thumb = thumb;
+      pageGeo.travel = Math.max(0, track - thumb);
+      setVar(pageRail, "--rail-size", `${thumb}px`);
+      setVar(pageRail, "--rail-travel", `${pageGeo.travel}px`);
+      paintFlow(pageRail, pageFlow);
+      const active = max > 1 && thumb > 0;
+      pageRail.classList.toggle("is-hidden", !active);
+      pageRail.classList.toggle("is-active", active);
+      updatePageChrome(true);
+    }
+
+    function updatePageChrome(measureOnly = false) {
+      const y = Math.max(0, window.scrollY);
+      if (!measureOnly) {
+        const dy = y - lastScrollY;
+        lastScrollY = y;
+        nudgeFlow(pageFlow, dy, pageRail);
+        waves.nudge(dy);
+        if (y <= 8) {
+          downRun = 0;
+          upRun = 0;
+          aimTopbar(0);
+        } else if (dy > 0.5) {
+          downRun += dy;
+          upRun = 0;
+          if (downRun >= 18) aimTopbar(1);
+        } else if (dy < -0.5) {
+          upRun -= dy;
+          downRun = 0;
+          if (upRun >= 18) aimTopbar(0);
+        }
+      }
+      const progress = pageGeo.max > 1 ? clamp(y / pageGeo.max, 0, 1) : 0;
+      setVar(pageRail, "--rail-progress", progress.toFixed(4));
+    }
+
+    function measureDetailRail() {
+      if (!detailRail || !detail || !dialog?.open) {
+        detailRail?.classList.add("is-hidden");
+        detailRail?.classList.remove("is-active");
+        return;
+      }
+      const shell = $(".record-dialog .dialog-shell");
+      if (!shell) return;
+      const shellRect = shell.getBoundingClientRect();
+      const rect = detail.getBoundingClientRect();
+      if (rect.height < 1 || rect.width < 1) {
+        detailRail.classList.add("is-hidden");
+        detailRail.classList.remove("is-active");
+        return;
+      }
+      const track = Math.max(0, rect.height - 16);
+      const scrollHeight = Math.max(detail.scrollHeight, detail.clientHeight, 1);
+      const max = Math.max(0, scrollHeight - detail.clientHeight);
+      const thumb = max > 1 ? beamSize(track) : 0;
+      detailGeo.max = max;
+      detailGeo.thumb = thumb;
+      detailGeo.travel = Math.max(0, track - thumb);
+      detailRail.style.top = `${Math.max(0, rect.top - shellRect.top)}px`;
+      detailRail.style.height = `${rect.height}px`;
+      setVar(detailRail, "--rail-size", `${thumb}px`);
+      setVar(detailRail, "--rail-travel", `${detailGeo.travel}px`);
+      paintFlow(detailRail, detailFlow);
+      const active = max > 1 && thumb > 0;
+      detailRail.classList.toggle("is-hidden", !active);
+      detailRail.classList.toggle("is-active", active);
+      lastDetailTop = detail.scrollTop;
+      updateDetailRail();
+    }
+
+    function updateDetailRail() {
+      if (!detailRail || !dialog?.open) return;
+      const top = detail.scrollTop;
+      nudgeFlow(detailFlow, top - lastDetailTop, detailRail);
+      lastDetailTop = top;
+      const progress = detailGeo.max > 1 ? clamp(top / detailGeo.max, 0, 1) : 0;
+      setVar(detailRail, "--rail-progress", progress.toFixed(4));
+    }
+
+    function scheduleScrollFrame() {
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => { scrollFrame = 0; updatePageChrome(); });
+    }
+
+    function scheduleMeasure() {
+      if (measureFrame) return;
+      measureFrame = requestAnimationFrame(() => {
+        measureFrame = 0;
+        measurePageRail();
+        measureDetailRail();
+        for (const rail of dialogRails) rail.measure();
+      });
+    }
+
+    function scheduleDetailMeasure() {
+      if (detailMeasureFrame) return;
+      detailMeasureFrame = requestAnimationFrame(() => {
+        detailMeasureFrame = 0;
+        measureDetailRail();
+      });
+    }
+
+    function bindRail(rail, geo, options) {
+      if (!rail) return;
+      let drag = null;
+      let pendingFrame = 0;
+      let pendingTop = 0;
+      const apply = () => {
+        pendingFrame = 0;
+        const top = clamp(pendingTop, 0, geo.max);
+        options.setScroll(top);
+        const progress = geo.max > 1 ? top / geo.max : 0;
+        setVar(rail, "--rail-progress", progress.toFixed(4));
+      };
+      rail.addEventListener("pointerdown", event => {
+        if (rail.classList.contains("is-hidden") || geo.max <= 1) return;
+        if (event.button !== undefined && event.button !== 0) return;
+        const rect = rail.getBoundingClientRect();
+        const trackTop = rect.top + options.pad;
+        const thumbHeight = Math.max(1, geo.thumb);
+        const trackHeight = Math.max(thumbHeight, rect.height - options.pad * 2);
+        const travel = Math.max(1, trackHeight - thumbHeight);
+        const current = clamp(options.getScroll(), 0, geo.max);
+        const thumbTop = trackTop + (current / geo.max) * travel;
+        const inThumb = event.clientY >= thumbTop && event.clientY <= thumbTop + thumbHeight;
+        let startScroll = current;
+        if (!inThumb) {
+          const ratio = clamp((event.clientY - trackTop - thumbHeight / 2) / travel, 0, 1);
+          startScroll = ratio * geo.max;
+          pendingTop = startScroll;
+          apply();
+        }
+        drag = { startY: event.clientY, startScroll, travel };
+        rail.classList.add("is-dragging");
+        try { rail.setPointerCapture(event.pointerId); } catch (_) {}
+        event.preventDefault();
+      }, { passive: false });
+      rail.addEventListener("pointermove", event => {
+        if (!drag) return;
+        pendingTop = drag.startScroll + ((event.clientY - drag.startY) / drag.travel) * geo.max;
+        if (!pendingFrame) pendingFrame = requestAnimationFrame(apply);
+        event.preventDefault();
+      }, { passive: false });
+      const end = event => {
+        if (!drag) return;
+        drag = null;
+        rail.classList.remove("is-dragging");
+        try { if (rail.hasPointerCapture?.(event.pointerId)) rail.releasePointerCapture(event.pointerId); } catch (_) {}
+      };
+      rail.addEventListener("pointerup", end);
+      rail.addEventListener("pointercancel", end);
+      rail.addEventListener("lostpointercapture", end);
+    }
+
+    // Every dialog scroll surface shares the same 3px gradient rail. The rail
+    // is created lazily inside its dialog, aligned to the scroll box, and
+    // re-measured on dialog toggle, resize and content mutations. Native
+    // scrollbars on these boxes are hidden in CSS so there is never a double
+    // scrollbar; wheel, touch and keyboard scrolling keep their native paths.
+    function setupDialogRail(dialogSelector, containerSelector) {
+      const dialog = $(dialogSelector);
+      const container = dialog ? $(containerSelector, dialog) : null;
+      if (!dialog || !container) return null;
+      const rail = document.createElement("div");
+      rail.className = "scroll-rail dialog-scroll-rail";
+      rail.setAttribute("aria-hidden", "true");
+      const thumb = document.createElement("span");
+      thumb.className = "scroll-rail-thumb";
+      rail.append(thumb);
+      dialog.append(rail);
+      const geo = { max: 0, thumb: 0, travel: 0 };
+      const flow = { value: 0.5 };
+      let lastTop = container.scrollTop;
+      let measureFrame = 0;
+      let updateFrame = 0;
+      function update() {
+        if (updateFrame) return;
+        updateFrame = requestAnimationFrame(() => {
+          updateFrame = 0;
+          const top = container.scrollTop;
+          nudgeFlow(flow, top - lastTop, rail);
+          lastTop = top;
+          const progress = geo.max > 1 ? clamp(top / geo.max, 0, 1) : 0;
+          setVar(rail, "--rail-progress", progress.toFixed(4));
+        });
+      }
+      function measure() {
+        if (!dialog.open) {
+          rail.classList.add("is-hidden");
+          rail.classList.remove("is-active");
+          return;
+        }
+        const hostRect = dialog.getBoundingClientRect();
+        const rect = container.getBoundingClientRect();
+        if (rect.height < 1 || rect.width < 1) {
+          rail.classList.add("is-hidden");
+          rail.classList.remove("is-active");
+          return;
+        }
+        const track = Math.max(0, rect.height - 16);
+        const scrollHeight = Math.max(container.scrollHeight, container.clientHeight, 1);
+        const max = Math.max(0, container.scrollHeight - container.clientHeight);
+        const thumbSize = max > 1 ? beamSize(track) : 0;
+        geo.max = max;
+        geo.thumb = thumbSize;
+        geo.travel = Math.max(0, track - thumbSize);
+        rail.style.top = `${Math.max(0, rect.top - hostRect.top)}px`;
+        rail.style.height = `${rect.height}px`;
+        rail.style.right = `${Math.max(0, hostRect.right - rect.right)}px`;
+        setVar(rail, "--rail-size", `${thumbSize}px`);
+        setVar(rail, "--rail-travel", `${geo.travel}px`);
+        paintFlow(rail, flow);
+        const active = max > 1 && thumbSize > 0;
+        rail.classList.toggle("is-hidden", !active);
+        rail.classList.toggle("is-active", active);
+        lastTop = container.scrollTop;
+        update();
+      }
+      function scheduleMeasure() {
+        if (measureFrame) return;
+        measureFrame = requestAnimationFrame(() => { measureFrame = 0; measure(); });
+      }
+      container.addEventListener("scroll", update, { passive: true });
+      dialog.addEventListener("toggle", () => {
+        scheduleMeasure();
+        window.setTimeout(scheduleMeasure, 260);
+      });
+      if (window.ResizeObserver) {
+        const observer = new ResizeObserver(scheduleMeasure);
+        observer.observe(dialog);
+        observer.observe(container);
+        observers.push(observer);
+      }
+      if (window.MutationObserver) {
+        const observer = new MutationObserver(scheduleMeasure);
+        observer.observe(container, { childList: true, subtree: true, characterData: true });
+        observers.push(observer);
+      }
+      bindRail(rail, geo, {
+        pad: 8,
+        getScroll: () => container.scrollTop,
+        setScroll: value => { container.scrollTop = value; }
+      });
+      dialogRails.push({ measure: scheduleMeasure, rail, container });
+      return rail;
+    }
+
+    [
+      ["#sources-dialog", ".library-shell"],
+      ["#inspection-dialog", ".inspection-dialog-shell"],
+      ["#settings-dialog", ".sources-shell"],
+      ["#scopes-dialog", ".sources-shell"],
+      ["#text-viewer-dialog", ".text-viewer-content"],
+      ["#iteration-manager-dialog", ".iteration-manager-list"],
+      ["#iteration-dialog", ".dialog-shell"],
+      ["#iteration-edit-dialog", ".dialog-shell"],
+      ["#source-edit-dialog", ".source-edit-form"],
+      ["#source-relocate-dialog", ".dialog-shell"],
+      ["#work-hours-dialog", ".work-hours-form"]
+    ].forEach(([dialog, container]) => setupDialogRail(dialog, container));
+
+    paintTopbar(topbarP);
+
+    window.addEventListener("scroll", scheduleScrollFrame, { passive: true });
+    window.addEventListener("resize", scheduleMeasure, { passive: true });
+    detail?.addEventListener("scroll", () => {
+      if (detailFrame) return;
+      detailFrame = requestAnimationFrame(() => { detailFrame = 0; updateDetailRail(); });
+    }, { passive: true });
+    dialog?.addEventListener("toggle", () => {
+      scheduleMeasure();
+      window.setTimeout(scheduleMeasure, 240);
+    });
+    dialog?.addEventListener("close", () => {
+      detailRail?.classList.add("is-hidden");
+      detailRail?.classList.remove("is-active");
+    });
+
+    if (window.ResizeObserver) {
+      const observer = new ResizeObserver(scheduleMeasure);
+      observer.observe(document.body);
+      const shell = $(".shell");
+      if (shell) observer.observe(shell);
+      observers.push(observer);
+      if (detail) {
+        const detailObserver = new ResizeObserver(scheduleDetailMeasure);
+        detailObserver.observe(detail);
+        observers.push(detailObserver);
+      }
+    }
+    if (detail && window.MutationObserver) {
+      const mutationObserver = new MutationObserver(scheduleDetailMeasure);
+      mutationObserver.observe(detail, { childList: true, subtree: true, attributes: true, characterData: true });
+      observers.push(mutationObserver);
+    }
+    document.fonts?.ready?.then(scheduleMeasure);
+
+    bindRail(pageRail, pageGeo, {
+      pad: 12,
+      getScroll: () => window.scrollY,
+      setScroll: value => window.scrollTo(0, value)
+    });
+    bindRail(detailRail, detailGeo, {
+      pad: 8,
+      getScroll: () => detail?.scrollTop || 0,
+      setScroll: value => { if (detail) detail.scrollTop = value; }
+    });
+
+    scrollChrome = {
+      refresh: scheduleMeasure,
+      refreshDetail: () => {
+        scheduleDetailMeasure();
+        window.setTimeout(scheduleDetailMeasure, 240);
+      },
+      observers
+    };
+    scheduleMeasure();
+    return scrollChrome;
+  }
 
   function renderCompletedGroups(group, completion) {
     const fold = $(group.done);
@@ -1467,7 +2484,7 @@
     title.textContent = iterationName(iteration);
     const tag = model.iterationSecondaryTag(iteration);
     if (tag) title.title = `版本标识：${tag}`;
-    copy.append(title, iterationStatusPill(iteration));
+    copy.append(title, versionTypePill(iteration), iterationStatusPill(iteration));
     const meta = document.createElement("span");
     meta.className = "iteration-work-meta";
     const date = iteration.target_release_date ? ` · 计划发布 ${iteration.target_release_date}` : "";
@@ -1497,6 +2514,33 @@
       fold.append(summary, doneList);
       section.append(fold);
     }
+    return section;
+  }
+  // Patrol-created requirements have no version yet. They keep the exact
+  // version block/card language but are not attached to any version object.
+  function makeUnassignedWorkBlock(item) {
+    const section = document.createElement("section");
+    section.className = "iteration-work-block is-unassigned";
+    section.dataset.unassigned = "true";
+    const titleId = "iteration-work-title-unassigned";
+    section.setAttribute("aria-labelledby", titleId);
+    const head = document.createElement("header");
+    head.className = "iteration-work-head";
+    const copy = document.createElement("div");
+    copy.className = "iteration-work-copy";
+    const title = document.createElement("h3");
+    title.className = "iteration-work-title";
+    title.id = titleId;
+    title.textContent = "未指定版本";
+    copy.append(title);
+    const meta = document.createElement("span");
+    meta.className = "iteration-work-meta";
+    meta.textContent = `${item.records.length} 项 · 已完成 ${item.completed.length}`;
+    head.append(copy, meta);
+    const blockList = document.createElement("div");
+    blockList.className = "record-list iteration-work-list";
+    populateMasonryList(blockList, item.records.map(makeCard));
+    section.append(head, blockList);
     return section;
   }
   function makeReleasedVersionBody(item) {
@@ -1540,7 +2584,7 @@
       const meta = document.createElement("span");
       meta.className = "released-version-meta";
       meta.textContent = `${item.records.length} 项`;
-      summary.append(name, iterationStatusPill(item.iteration), meta);
+      summary.append(name, versionTypePill(item.iteration), iterationStatusPill(item.iteration), meta);
       details._releasedGroup = item;
       // Build cards only when the version is actually open. Closed versions
       // keep just their summary until first expansion.
@@ -1566,11 +2610,14 @@
       const iterContainer = $("#work-iteration-container");
       const iterations = orderedIterations();
 
-      if (iterations.length && model.partitionIterationRecords) {
+      if (model.partitionIterationRecords) {
         const partition = model.partitionIterationRecords(records, iterations);
         const blocks = partition.activeGroups
           .filter(item => item.records.length)
           .map(item => makeWorkIterationBlock(item));
+        // The unassigned group is intentionally not a version: it never enters
+        // the active/released groups and disappears once every record is filed.
+        if (partition.unassigned?.records.length) blocks.push(makeUnassignedWorkBlock(partition.unassigned));
         if (iterContainer) {
           iterContainer.replaceChildren(...blocks);
           iterContainer.hidden = blocks.length === 0;
@@ -1657,7 +2704,7 @@
     if (summary) {
       summary.classList.add("task-brief");
       summary.tabIndex = 0;
-      summary.setAttribute("aria-label", `最新简报：${record.latest_brief ? txt(record.latest_brief) : cardBrief(record)}`);
+      summary.setAttribute("aria-label", `当前现状：${record.status_line ? txt(record.status_line) : record.latest_brief ? txt(record.latest_brief) : cardBrief(record)}`);
     }
     return card;
   }
@@ -1685,7 +2732,12 @@
     const selected = findRecord(state.selectedId);
     if (selected && $("#record-dialog").open) {
       const cachedWorkflow = state.workflows.get(selected.id);
-      if (cachedWorkflow && !cachedWorkflow.unavailable && cachedWorkflow.record_revision !== undefined && String(cachedWorkflow.record_revision) !== String(selected.revision)) state.workflows.delete(selected.id);
+      // 详情打开时若流程接口曾返回 unavailable，或记录 revision 已变化，必须丢弃缓存重取；
+      // 否则外部 CLI 启动/推进流水线后，已打开的详情会一直显示“未启用标准流程”。
+      if (cachedWorkflow && (cachedWorkflow.unavailable || cachedWorkflow.record_revision === undefined ||
+          String(cachedWorkflow.record_revision) !== String(selected.revision))) {
+        state.workflows.delete(selected.id);
+      }
       renderDetail(selected); detail.scrollTop = detailScroll;
       if (detailFocus) $(`[data-dialog-focus="${CSS.escape(detailFocus)}"]`, detail)?.focus({ preventScroll: true });
       loadItemWorkflow(selected);
@@ -1708,7 +2760,7 @@
     const active = document.activeElement;
     const scrollX = window.scrollX, scrollY = window.scrollY;
     let selector = null;
-    for (const attribute of ["data-open-record", "data-followup-id", "data-complete-id"]) {
+    for (const attribute of ["data-open-record", "data-complete-id"]) {
       const value = active?.getAttribute?.(attribute);
       if (value) { selector = `[${attribute}="${CSS.escape(value)}"]`; break; }
     }
@@ -1907,6 +2959,291 @@
   const cssSafe = value => String(value || "").replace(/[^a-z0-9_-]/gi, "_");
   const workflowPanelId = (recordId, stageId) => `workflow-panel-${cssSafe(recordId)}-${cssSafe(stageId)}`;
   function workflowGlyph(status) { return ({ done: "✓", active: "●", pending: "○", blocked: "⚠", rework: "↺" })[status] || "○"; }
+  const evidenceTextFile = /\.(?:md|markdown|txt|log|json|jsonl|diff|patch|py|js|mjs|ts|tsx|jsx|css|html|htm|sh|csv|ya?ml|xml|ini|toml)$/i;
+  function evidenceIsUrl(value) { return /^https?:\/\//i.test(String(value || "").trim()); }
+  function evidenceIsLocalPath(value) {
+    const text = String(value || "").trim();
+    if (!text || evidenceIsUrl(text) || text.includes("\n")) return false;
+    if (/^file:\/\//i.test(text)) return true;
+    if (/^(?:~\/|\/|\.{1,2}\/)/.test(text)) return true;
+    if (/^[A-Za-z]:[\\/]/.test(text)) return true;
+    return evidenceTextFile.test(text);
+  }
+  function makeWorkflowEvidenceList(recordId, entries) {
+    if (!Array.isArray(entries) || !entries.length) return null;
+    const list = document.createElement("ul");
+    list.className = "workflow-evidence";
+    list.setAttribute("aria-label", "证据");
+    entries.forEach(value => {
+      const text = String(value);
+      const item = document.createElement("li");
+      if (evidenceIsUrl(text)) {
+        item.classList.add("is-link");
+        const link = document.createElement("a");
+        link.href = text; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = text;
+        item.append(link);
+      } else if (evidenceIsLocalPath(text)) {
+        item.classList.add("is-file");
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "workflow-evidence-file";
+        button.dataset.evidenceRecord = recordId; button.dataset.evidencePath = text;
+        button.title = "查看证据全文";
+        const label = document.createElement("span"); label.className = "workflow-evidence-path"; label.textContent = text;
+        const open = document.createElement("span"); open.className = "workflow-evidence-open"; open.textContent = "查看全文";
+        button.append(label, open); item.append(button);
+      } else {
+        item.textContent = text;
+      }
+      list.append(item);
+    });
+    return list;
+  }
+  function workflowOutputText(value) {
+    if (value === undefined || value === null) return "";
+    if (typeof value === "string") return value.trim();
+    if (Array.isArray(value)) return value.map(workflowOutputText).filter(Boolean).join("\n");
+    if (typeof value === "object") {
+      try { return JSON.stringify(value, null, 2); } catch (_) { return ""; }
+    }
+    return String(value);
+  }
+  // 宽表格沿用自绘滚动条的语言：一条横向光束跟随表格的横向滚动。
+  function enhanceTableScrollers(root) {
+    if (!root?.querySelectorAll) return;
+    root.querySelectorAll(".markdown-table-frame").forEach(frame => {
+      if (frame.dataset.tableRailReady) return;
+      const wrap = frame.querySelector(".markdown-table-wrap");
+      if (!wrap) return;
+      frame.dataset.tableRailReady = "true";
+      const rail = document.createElement("div");
+      rail.className = "table-scroll-rail";
+      rail.setAttribute("aria-hidden", "true");
+      const thumb = document.createElement("span");
+      thumb.className = "table-scroll-thumb";
+      rail.append(thumb);
+      frame.append(rail);
+      let max = 0, size = 0, travel = 0, paintFrame = 0;
+      const paint = () => {
+        const progress = max > 1 ? Math.min(1, Math.max(0, wrap.scrollLeft / max)) : 0;
+        rail.style.setProperty("--table-progress", progress.toFixed(4));
+      };
+      const measure = () => {
+        if (wrap.clientWidth < 1) { max = 0; rail.classList.remove("is-active"); return; }
+        const track = Math.max(1, wrap.clientWidth);
+        max = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+        size = max > 1 ? Math.max(0, Math.min(track - 10, Math.max(72, track * 0.56))) : 0;
+        travel = Math.max(0, track - size);
+        rail.style.setProperty("--table-size", `${size}px`);
+        rail.style.setProperty("--table-travel", `${travel}px`);
+        rail.classList.toggle("is-active", max > 1);
+        paint();
+      };
+      const schedulePaint = () => {
+        if (paintFrame) return;
+        paintFrame = requestAnimationFrame(() => { paintFrame = 0; paint(); });
+      };
+      let drag = null, dragFrame = 0, pendingLeft = 0;
+      const applyDrag = () => {
+        dragFrame = 0;
+        wrap.scrollLeft = pendingLeft;
+        paint();
+      };
+      rail.addEventListener("pointerdown", event => {
+        if (max <= 1 || (event.button !== undefined && event.button !== 0)) return;
+        const rect = rail.getBoundingClientRect();
+        const thumbLeft = rect.left + (max > 1 ? (wrap.scrollLeft / max) * travel : 0);
+        const inThumb = event.clientX >= thumbLeft && event.clientX <= thumbLeft + size;
+        let startScroll = wrap.scrollLeft;
+        if (!inThumb) {
+          const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - size / 2) / Math.max(1, travel)));
+          startScroll = ratio * max;
+          wrap.scrollLeft = startScroll;
+          paint();
+        }
+        drag = { startX: event.clientX, startScroll };
+        rail.classList.add("is-dragging");
+        try { rail.setPointerCapture(event.pointerId); } catch (_) {}
+        event.preventDefault();
+      }, { passive: false });
+      rail.addEventListener("pointermove", event => {
+        if (!drag) return;
+        pendingLeft = drag.startScroll + ((event.clientX - drag.startX) / Math.max(1, travel)) * max;
+        if (!dragFrame) dragFrame = requestAnimationFrame(applyDrag);
+        event.preventDefault();
+      }, { passive: false });
+      const end = event => {
+        if (!drag) return;
+        drag = null;
+        rail.classList.remove("is-dragging");
+        try { if (rail.hasPointerCapture?.(event.pointerId)) rail.releasePointerCapture(event.pointerId); } catch (_) {}
+      };
+      rail.addEventListener("pointerup", end);
+      rail.addEventListener("pointercancel", end);
+      rail.addEventListener("lostpointercapture", end);
+      wrap.addEventListener("scroll", schedulePaint, { passive: true });
+      if (window.ResizeObserver) new ResizeObserver(measure).observe(wrap);
+      measure();
+    });
+  }
+  function openTextViewer({ kicker = "全文", title = "查看全文", meta = "", text = "", note = "", copyText = null, copyLabel = "复制全文", markdown = false } = {}) {
+    state.textViewerText = String(text ?? "");
+    state.textViewerCopyText = copyText === null ? state.textViewerText : String(copyText ?? "");
+    state.textViewerCopyLabel = copyLabel || "复制全文";
+    $("#text-viewer-kicker").textContent = kicker;
+    $("#text-viewer-title").textContent = title;
+    $("#text-viewer-meta").textContent = meta;
+    const content = $("#text-viewer-content");
+    const renderMarkdown = markdown || (typeof window.markdownHasTable === "function" && window.markdownHasTable(state.textViewerText));
+    content.classList.toggle("is-markdown", renderMarkdown);
+    content.classList.toggle("is-plain", !renderMarkdown);
+    if (renderMarkdown && typeof window.renderSafeMarkdown === "function") {
+      content.replaceChildren();
+      window.renderSafeMarkdown(content, state.textViewerText);
+      enhanceTableScrollers(content);
+    } else {
+      content.textContent = state.textViewerText;
+    }
+    $("#text-viewer-state").textContent = note;
+    const copy = $("#text-viewer-copy");
+    if (copy) copy.textContent = state.textViewerCopyLabel;
+    if (!$("#text-viewer-dialog").open) $("#text-viewer-dialog").showModal();
+    $("#text-viewer-content").focus({ preventScroll: true });
+  }
+  async function fetchEvidenceText(recordId, evidencePath) {
+    const response = await fetch(`/api/items/${encodeURIComponent(recordId)}/evidence-file?path=${encodeURIComponent(evidencePath)}`, { cache: "no-store" });
+    if (response.status === 404) {
+      const error = new Error("evidence_not_found");
+      error.code = "missing";
+      throw error;
+    }
+    const contentType = response.headers.get("Content-Type") || "";
+    if (!response.ok || !contentType.startsWith("text/plain")) {
+      const error = new Error(`HTTP ${response.status}`);
+      error.code = "unreadable";
+      throw error;
+    }
+    return response.text();
+  }
+  async function openLocalFileViewer(recordId, evidencePath, options = {}) {
+    const path = String(evidencePath || "");
+    const name = path.split(/[\\/]/).filter(Boolean).pop() || "本地文件";
+    const kicker = options.kicker || "证据全文";
+    const title = options.title || name;
+    const meta = options.meta || path;
+    openTextViewer({
+      kicker, title, meta, text: "正在读取…", note: "正在读取本地报告文件…",
+      copyText: path, copyLabel: "复制路径"
+    });
+    try {
+      const text = await fetchEvidenceText(recordId, path);
+      openTextViewer({
+        kicker, title, meta: `${meta} · ${text.length} 字符`, text,
+        note: "只读 · 已读取本地报告文件。",
+        markdown: /\.(?:md|markdown)$/i.test(path)
+      });
+    } catch (error) {
+      const missing = error.code === "missing";
+      const message = missing
+        ? `报告文件已不存在（原路径：${path}）`
+        : `暂时无法读取报告文件（${error.message || "读取失败"}）。\n原路径：${path}`;
+      openTextViewer({
+        kicker, title, meta, text: message, markdown: false,
+        note: missing ? "报告文件已不存在；可复制原路径后人工查找。" : "读取失败；可复制原路径后重试。",
+        copyText: path, copyLabel: "复制路径"
+      });
+    }
+  }
+  function legacyCopyText(text) {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    Object.assign(area.style, { position: "fixed", top: "0", left: "0", width: "1px", height: "1px", opacity: "0" });
+    document.body.append(area);
+    area.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (_) {}
+    area.remove();
+    return copied;
+  }
+  async function copyTextViewerText() {
+    const button = $("#text-viewer-copy");
+    const label = state.textViewerCopyLabel || "复制全文";
+    try {
+      const copyText = state.textViewerCopyText || state.textViewerText;
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try { await navigator.clipboard.writeText(copyText); copied = true; } catch (_) {}
+      }
+      if (!copied) copied = legacyCopyText(copyText);
+      if (!copied) throw new Error("copy_failed");
+      button.textContent = "已复制";
+      window.setTimeout(() => { button.textContent = label; }, 1600);
+    } catch (_) {
+      $("#text-viewer-state").textContent = "复制失败，请手动选择文本复制。";
+    }
+  }
+  // 审计阶段只保留一组行：状态、名称、负责角色与「查看全文」在同一行，
+  // 取代原先重复的子步骤清单、阶段输出清单与报告/回应清单。
+  const workflowAuditOutputKeys = ["audit_report", "dev_response"];
+  const workflowAuditSubstepIds = { audit_report: "audit", dev_response: "response" };
+  const workflowAuditRoleFallbacks = { audit_report: "Auditor", dev_response: "Dev" };
+  function makeWorkflowAuditRows(record, step) {
+    const gateByKey = new Map((step.checklist || []).map(gate => [gate.key, gate]));
+    const box = document.createElement("div");
+    box.className = "workflow-audit-box";
+    const title = document.createElement("h4"); title.textContent = "审计报告与开发回应";
+    const list = document.createElement("ul");
+    list.className = "workflow-audit-list";
+    list.setAttribute("aria-label", "审计报告与开发回应");
+    box.append(title, list);
+    workflowAuditOutputKeys.forEach(key => {
+      const gate = gateByKey.get(key) || null;
+      const sub = (step.substeps || []).find(item => item.id === workflowAuditSubstepIds[key]) || null;
+      const name = gate?.label || model.workflowOutputLabel(key);
+      // 子步骤视图不携带 output 字段，按固定 4a/4b 语义取角色；缺失时用门禁角色。
+      const role = sub?.roleLabel || workflowAuditRoleFallbacks[key] || step.roleLabel || step.actor || "未指定";
+      const text = workflowOutputText(step.outputs?.[key]);
+      const done = gate ? gate.done : sub ? sub.status === "done" : text ? true : null;
+      const state = done === null ? "未取得" : done ? "已完成" : "缺失";
+      const mark = done === null ? "·" : done ? "✓" : "✗";
+      const row = document.createElement("li");
+      row.className = "workflow-audit-row";
+      row.dataset.output = key;
+      row.dataset.done = done === null ? "unknown" : String(!!done);
+      const open = document.createElement("button");
+      open.type = "button"; open.className = "workflow-audit-open"; open.disabled = !text;
+      open.setAttribute("aria-label", text ? `查看${name}全文（${role}，${state}）` : `${name}（${role}，${state}），暂无全文`);
+      const markEl = document.createElement("span"); markEl.className = "workflow-audit-mark"; markEl.setAttribute("aria-hidden", "true"); markEl.textContent = mark;
+      const copy = document.createElement("span"); copy.className = "workflow-audit-copy";
+      const nameEl = document.createElement("span"); nameEl.className = "workflow-audit-name"; nameEl.textContent = name;
+      const roleEl = document.createElement("span"); roleEl.className = "workflow-audit-role"; roleEl.textContent = role;
+      copy.append(nameEl, roleEl);
+      const stateEl = document.createElement("span"); stateEl.className = "workflow-audit-state"; stateEl.textContent = state;
+      const linkEl = document.createElement("span"); linkEl.className = "workflow-audit-link"; linkEl.textContent = "查看全文";
+      open.append(markEl, copy, stateEl, linkEl);
+      if (text) {
+        const isLocalPath = evidenceIsLocalPath(text) && !/[\r\n]/.test(text);
+        open.addEventListener("click", () => {
+          if (isLocalPath) {
+            openLocalFileViewer(record.id, text, {
+              kicker: "阶段输出", title: name,
+              meta: `${recordDisplayId(record)} · ${step.label}`
+            });
+            return;
+          }
+          openTextViewer({
+            kicker: "阶段输出", title: name, meta: `${recordDisplayId(record)} · ${step.label}`,
+            text, note: "只读 · 阶段输出全文", markdown: true
+          });
+        });
+      } else {
+        open.title = `暂无${name}全文`;
+      }
+      row.append(open);
+      list.append(row);
+    });
+    return box;
+  }
 
   function makeWorkflowSection(record) {
     const section = document.createElement("section");
@@ -2030,39 +3367,45 @@
       }
       lockRow.append(label, detail); panel.append(lockRow);
     }
-    if (step.substeps.length) {
-      const subBox = document.createElement("div"); subBox.className = "workflow-stage-substeps-box";
-      const subTitle = document.createElement("h4"); subTitle.textContent = "子步骤";
-      const subList = document.createElement("ul"); subList.className = "workflow-stage-substeps";
-      subList.setAttribute("aria-label", `${step.label}子步骤`);
-      step.substeps.forEach(sub => {
-        const subItem = document.createElement("li"); subItem.dataset.status = sub.status;
-        const subIndex = document.createElement("span"); subIndex.className = "workflow-substep-index"; subIndex.textContent = sub.indexLabel;
-        const subLabel = document.createElement("span"); subLabel.className = "workflow-substep-label"; subLabel.textContent = sub.label;
-        const subRole = document.createElement("span"); subRole.className = "workflow-substep-role"; subRole.textContent = sub.roleLabel;
-        const subState = document.createElement("span"); subState.className = "workflow-substep-state"; subState.textContent = sub.statusLabel;
-        subItem.append(subIndex, subLabel, subRole, subState);
-        subList.append(subItem);
+    // 审计阶段把子步骤、阶段输出与报告/回应并入同一组行；其余阶段保持原样。
+    if (step.id === "audit_response") {
+      const auditRows = makeWorkflowAuditRows(record, step);
+      if (auditRows) panel.append(auditRows);
+    } else {
+      if (step.substeps.length) {
+        const subBox = document.createElement("div"); subBox.className = "workflow-stage-substeps-box";
+        const subTitle = document.createElement("h4"); subTitle.textContent = "子步骤";
+        const subList = document.createElement("ul"); subList.className = "workflow-stage-substeps";
+        subList.setAttribute("aria-label", `${step.label}子步骤`);
+        step.substeps.forEach(sub => {
+          const subItem = document.createElement("li"); subItem.dataset.status = sub.status;
+          const subIndex = document.createElement("span"); subIndex.className = "workflow-substep-index"; subIndex.textContent = sub.indexLabel;
+          const subLabel = document.createElement("span"); subLabel.className = "workflow-substep-label"; subLabel.textContent = sub.label;
+          const subRole = document.createElement("span"); subRole.className = "workflow-substep-role"; subRole.textContent = sub.roleLabel;
+          const subState = document.createElement("span"); subState.className = "workflow-substep-state"; subState.textContent = sub.statusLabel;
+          subItem.append(subIndex, subLabel, subRole, subState);
+          subList.append(subItem);
+        });
+        subBox.append(subTitle, subList); panel.append(subBox);
+      }
+      const gates = document.createElement("div"); gates.className = "workflow-gates-box";
+      const gatesTitle = document.createElement("h4"); gatesTitle.textContent = "阶段输出";
+      const gateList = document.createElement("ul"); gateList.className = "workflow-gates"; gateList.setAttribute("aria-label", `${step.label}阶段输出检查`);
+      if (!step.checklist.length) {
+        const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = "unknown";
+        const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = "·";
+        const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = "该阶段未定义输出要求";
+        item.append(mark, name); gateList.append(item);
+      }
+      step.checklist.forEach(gate => {
+        const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = gate.done === null ? "unknown" : String(gate.done);
+        const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = gate.done === null ? "·" : gate.done ? "✓" : "✗";
+        const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = gate.label;
+        const stateText = document.createElement("span"); stateText.className = "workflow-gate-state"; stateText.textContent = gate.done === null ? "未取得" : gate.done ? "已完成" : "缺失";
+        item.append(mark, name, stateText); gateList.append(item);
       });
-      subBox.append(subTitle, subList); panel.append(subBox);
+      gates.append(gatesTitle, gateList); panel.append(gates);
     }
-    const gates = document.createElement("div"); gates.className = "workflow-gates-box";
-    const gatesTitle = document.createElement("h4"); gatesTitle.textContent = "阶段输出";
-    const gateList = document.createElement("ul"); gateList.className = "workflow-gates"; gateList.setAttribute("aria-label", `${step.label}阶段输出检查`);
-    if (!step.checklist.length) {
-      const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = "unknown";
-      const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = "·";
-      const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = "该阶段未定义输出要求";
-      item.append(mark, name); gateList.append(item);
-    }
-    step.checklist.forEach(gate => {
-      const item = document.createElement("li"); item.className = "workflow-gate"; item.dataset.done = gate.done === null ? "unknown" : String(gate.done);
-      const mark = document.createElement("span"); mark.className = "workflow-gate-mark"; mark.setAttribute("aria-hidden", "true"); mark.textContent = gate.done === null ? "·" : gate.done ? "✓" : "✗";
-      const name = document.createElement("span"); name.className = "workflow-gate-label"; name.textContent = gate.label;
-      const stateText = document.createElement("span"); stateText.className = "workflow-gate-state"; stateText.textContent = gate.done === null ? "未取得" : gate.done ? "已完成" : "缺失";
-      item.append(mark, name, stateText); gateList.append(item);
-    });
-    gates.append(gatesTitle, gateList); panel.append(gates);
     const note = document.createElement("div"); note.className = "workflow-note";
     const noteLabel = document.createElement("span"); noteLabel.className = "workflow-note-label"; noteLabel.textContent = "最近记录";
     const noteText = document.createElement("p"); noteText.className = "workflow-note-text";
@@ -2073,11 +3416,8 @@
       who.textContent = [step.actor, step.roleLabel, step.at ? dateLabel(step.at) : ""].filter(Boolean).join(" · ");
       note.append(who);
     }
-    if (step.evidence.length) {
-      const evidence = document.createElement("ul"); evidence.className = "workflow-evidence"; evidence.setAttribute("aria-label", "证据");
-      step.evidence.forEach(value => { const item = document.createElement("li"); item.textContent = value; evidence.append(item); });
-      note.append(evidence);
-    }
+    const evidence = makeWorkflowEvidenceList(record.id, step.evidence);
+    if (evidence) note.append(evidence);
     panel.append(note);
     return panel;
   }
@@ -2094,11 +3434,8 @@
       const who = document.createElement("span"); who.className = "workflow-history-who"; who.textContent = [item.actor, item.roleLabel, item.stageLabel].filter(Boolean).join(" · ");
       head.append(time, action, who); row.append(head);
       if (item.note) { const note = document.createElement("p"); note.className = "workflow-history-note"; note.textContent = item.note; row.append(note); }
-      if (item.evidence.length) {
-        const evidence = document.createElement("ul"); evidence.className = "workflow-evidence"; evidence.setAttribute("aria-label", "证据");
-        item.evidence.forEach(value => { const li = document.createElement("li"); li.textContent = value; evidence.append(li); });
-        row.append(evidence);
-      }
+      const evidence = makeWorkflowEvidenceList(record.id, item.evidence);
+      if (evidence) row.append(evidence);
       list.append(row);
     });
     body.append(list); fold.append(summary, body);
@@ -2175,15 +3512,12 @@
 
   function renderDetail(record) {
     const detail = $("#detail"); detail.replaceChildren();
-    // Kept in this scope for the reopen decision below; previously this was
-    // accidentally inherited from makeCard and threw before showModal().
-    const it = iterationById(record.iteration_id);
     const head = document.createElement("div"); head.className = "detail-head";
     const title = document.createElement("h2"); title.id = "dialog-title"; title.textContent = record.title;
     if (isCancelled(record)) title.classList.add("record-cancelled-title");
     const pill = document.createElement("span"); pill.className = `status-pill ${escClass(effectiveStatus(record))}`; pill.textContent = statusLabel(effectiveStatus(record));
-    const idButton = document.createElement("button"); idButton.type = "button"; idButton.className = "detail-id-copy"; idButton.textContent = record.display_id || record.id; idButton.title = "点击复制事项 ID";
-    idButton.addEventListener("click", async () => { try { await navigator.clipboard.writeText(record.display_id || record.id); showToast("ID 已复制"); } catch (_) { showToast("复制失败，请手动复制", "error"); } });
+    const idButton = document.createElement("button"); idButton.type = "button"; idButton.className = "detail-id-copy"; idButton.textContent = recordDisplayId(record); idButton.title = "点击复制事项 ID";
+    idButton.addEventListener("click", async () => { try { await navigator.clipboard.writeText(record.id); showToast("ID 已复制"); } catch (_) { showToast("复制失败，请手动复制", "error"); } });
     head.append(title, pill); detail.append(idButton, head);
     if (record.type !== "task") {
       const iterAssignWrap = document.createElement("div");
@@ -2200,7 +3534,7 @@
       orderedIterations().forEach(item => {
         const opt = document.createElement("option");
         opt.value = item.id;
-        opt.textContent = `${iterationName(item)} · ${iterationStatusLabel(item.status)}`;
+        opt.textContent = `${iterationName(item)} · ${versionTypeLabel(item)}版本 · ${iterationStatusLabel(item.status)}`;
         if (item.id === record.iteration_id) opt.selected = true;
         iterSelect.append(opt);
       });
@@ -2229,10 +3563,16 @@
     statusLine.textContent = record.type === "bug" && record.platform_status
       ? `平台上次读取：${statusLabel(record.platform_status)} · ${dateLabel(record.observed_at, "读取时间未记录")}`
       : `更新于 ${dateLabel(record.updated_at, "时间未记录")}`;
+    const currentStatus = document.createElement("section"); currentStatus.className = "detail-current-status";
+    const currentStatusLabel = document.createElement("span"); currentStatusLabel.className = "detail-current-status-label"; currentStatusLabel.textContent = "当前现状";
+    const currentStatusText = document.createElement("p"); currentStatusText.className = "detail-current-status-text";
+    currentStatusText.textContent = txt(record.status_line || record.latest_brief || record.status_detail, "暂未记录当前现状");
+    currentStatus.append(currentStatusLabel, currentStatusText);
     const overview = document.createElement("section"); overview.className = "detail-overview";
-    const overviewTitle = document.createElement("h3"); overviewTitle.textContent = "目前进展";
+    const overviewTitle = document.createElement("h3"); overviewTitle.textContent = "交接信息";
     const conclusion = document.createElement("p"); conclusion.className = "detail-overview-conclusion";
-    conclusion.textContent = txt(record.latest_brief || record.status_detail, "暂未记录进展");
+    const progressText = txt(record.latest_brief || record.status_detail, "");
+    conclusion.textContent = progressText;
     const overviewGrid = document.createElement("div"); overviewGrid.className = "detail-overview-grid";
     const handoff = record.handoff && typeof record.handoff === "object" && !Array.isArray(record.handoff) ? record.handoff : {};
     const fields = [
@@ -2255,21 +3595,11 @@
       const gap = document.createElement("p"); gap.className = "handoff-gap";
       gap.textContent = "交接信息还不完整，详情及历史记录中可能有更多依据。"; overviewGrid.append(gap);
     }
-    overview.append(overviewTitle, conclusion, overviewGrid);
-    detail.append(head, statusLine, makeWorkflowSection(record), overview);
-    if (isCompleted(record) && (!it || (it.status !== "released" && it.status !== "archived"))) {
-      const reworkBar = document.createElement("div");
-      reworkBar.className = "detail-rework-bar";
-      const reworkNotice = document.createElement("span");
-      reworkNotice.textContent = "当前迭代尚未发布，支持针对本任务发起二次修改与再审计。";
-      const reworkBtn = document.createElement("button");
-      reworkBtn.type = "button";
-      reworkBtn.className = "source-action rework-action-btn";
-      reworkBtn.dataset.reopenId = record.id;
-      reworkBtn.textContent = record.reopen_count ? `发起第 ${record.reopen_count + 1} 轮修改` : "发起二次修改 (Reopen)";
-      reworkBar.append(reworkNotice, reworkBtn);
-      detail.append(reworkBar);
-    }
+    overview.append(overviewTitle);
+    // 顶部「当前现状」已经展示同一句时不再重复；交接字段始终保留。
+    if (conclusion.textContent && conclusion.textContent.trim() !== currentStatusText.textContent.trim()) overview.append(conclusion);
+    overview.append(overviewGrid);
+    detail.append(head, statusLine, currentStatus, makeWorkflowSection(record), overview);
     const followupSummary = model.summarizeFollowups(followups(record));
     if (followupSummary.activeCount) {
       const activeBox = document.createElement("section"); activeBox.className = "active-followup-summary";
@@ -2280,7 +3610,7 @@
     }
     const meta = document.createElement("div"); meta.className = "detail-meta";
     const terminalDate = record.completed_at ? dateLabel(record.completed_at) : "未取得执行记录";
-    const metaFields = [["事项编号", record.id], [isCancelled(record) ? "取消日期" : "完成日期", isTerminal(record) ? terminalDate : "未终结"], ["负责人", record.owner || record.assignee || "未注明"], ["更新时间", dateLabel(record.updated_at, "未提供")],
+    const metaFields = [["事项编号", recordDisplayId(record)], [isCancelled(record) ? "取消日期" : "完成日期", isTerminal(record) ? terminalDate : "未终结"], ["负责人", record.owner || record.assignee || "未注明"], ["更新时间", dateLabel(record.updated_at, "未提供")],
       ["当前执行代理", record.current_agent_name || "未提供"], ["当前 agent 会话", record.current_agent_session_id || "未关联"], ["最近执行代理", record.last_agent_name || "未提供"], ["最近 agent 会话", record.last_agent_session_id || "未关联"],
       ["源系统更新时间", record.source_updated_at ? dateLabel(record.source_updated_at) : "平台未提供更新时间"],
       ["读取 / 观察时间", dateLabel(record.observed_at)], ["验证发生时间", dateLabel(record.evidence_at)]];
@@ -2301,6 +3631,7 @@
     const cachedContext = model.contextPlaceholder(state.contexts.get(record.id), record.revision);
     if (cachedContext) {
       window.renderSafeMarkdown(contextBody, cachedContext.markdown);
+      enhanceTableScrollers(contextBody);
       contextBody.dataset.contextRevision = String(state.contexts.get(record.id).revision);
       contextBody.dataset.contextStale = String(!cachedContext.isCurrent);
     } else contextBody.textContent = "展开后读取完整事项上下文。";
@@ -2407,9 +3738,30 @@
     attachFold.append(attachSummary, attachBody);
     detail.append(attachFold);
   }
+  let detailCloseTimer = 0;
+  const detailReduceMotion = window.matchMedia
+    ? window.matchMedia("(prefers-reduced-motion: reduce)")
+    : { matches: false };
+  // 详情统一走收起动画；重复点击、ESC、点遮罩都复用同一个关闭入口。
+  function closeDetailDialog() {
+    const dialog = $("#record-dialog");
+    if (!dialog?.open || dialog.classList.contains("is-closing")) return;
+    if (detailReduceMotion.matches) { dialog.close(); return; }
+    dialog.classList.add("is-closing");
+    detailCloseTimer = window.setTimeout(() => {
+      detailCloseTimer = 0;
+      dialog.classList.remove("is-closing");
+      if (dialog.open) dialog.close();
+    }, 200);
+  }
   function openDetail(id) {
     const record = findRecord(id); if (!record) return;
-    state.selectedId = id; renderDetail(record); $("#record-dialog").showModal(); loadItemWorkflow(record);
+    const dialog = $("#record-dialog");
+    if (detailCloseTimer) { clearTimeout(detailCloseTimer); detailCloseTimer = 0; }
+    dialog.classList.remove("is-closing");
+    state.selectedId = id; renderDetail(record);
+    if (!dialog.open) dialog.showModal();
+    scrollChrome?.refreshDetail(); loadItemWorkflow(record);
   }
   async function loadItemContext(record) {
     const id = record.id, expectedRevision = String(record.revision ?? "unversioned");
@@ -2432,6 +3784,7 @@
           state.contexts.set(id, { revision, markdown });
           if (state.selectedId === id && $("#record-dialog").open && target.isConnected) {
             model.replaceContextPreservingScroll($("#detail"), target, markdown || "暂无事项上下文内容。", window.renderSafeMarkdown);
+            enhanceTableScrollers(target);
           }
         } else if (state.selectedId === id && target.isConnected) {
           target.textContent = "事项在读取期间已更新，请刷新后重新打开上下文。";
@@ -2502,42 +3855,43 @@
     catch (error) { showToast(error.message || "转交状态未更新", "error"); }
     finally { state.busy.delete(id); setRecordBusy(id, false); }
   }
-  function openFollowup(id) {
-    const record = findRecord(id); if (!record) return;
-    state.followupId = id;
-    $("#followup-dialog-title").textContent = record.title;
-    const input = $("#followup-input"); input.value = state.drafts[id] || "";
-    $("#followup-dialog").showModal(); input.focus();
-  }
-  function closeFollowup() { $("#followup-dialog").close(); state.followupId = null; }
-  async function submitFollowup(event) {
-    event.preventDefault();
-    const id = state.followupId, input = $("#followup-input"), prompt = input.value.trim();
-    if (!id) return;
-    if (!prompt) { showToast("先写下要跟进的提示词", "error"); input.focus(); return; }
-    if (state.busy.has(id)) return;
-    state.drafts[id] = input.value; state.busy.add(id); setRecordBusy(id, true);
-    try {
-      await postAction(`/api/items/${encodeURIComponent(id)}/followups`, { prompt });
-      delete state.drafts[id]; closeFollowup(); showToast("跟进提示词已提交"); await refresh();
-    } catch (error) { showToast(error.message || "提交失败，请重试", "error"); }
-    finally { state.busy.delete(id); setRecordBusy(id, false); }
-  }
-
   async function refresh() {
     const freshness = $("#freshness");
     try {
-      const response = await fetch("/api/dashboard", { cache: "no-store" });
+      const sinceToken = state.data
+        ? `${state.data.revision ?? 0}:${state.scopeCatalog?.revision || 0}:${BUILD_ID || ""}`
+        : "";
+      const url = sinceToken ? `/api/dashboard?since_revision=${encodeURIComponent(sinceToken)}` : "/api/dashboard";
+      const response = await fetch(url, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
+      if (data.build && BUILD_ID && data.build !== BUILD_ID) {
+        const key = `waylume-build:${data.build}`;
+        try {
+          if (!sessionStorage.getItem(key)) { sessionStorage.setItem(key, "1"); location.reload(); return; }
+        } catch (_) { location.reload(); return; }
+      }
+      if (data.unchanged) {
+        const when = new Date(data.generated_at);
+        const time = Number.isNaN(when.getTime()) ? data.generated_at : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(when);
+        const sync = data.sync?.bugs, stale = !!(sync?.stale || sync?.error);
+        freshness.classList.toggle("stale", stale); freshness.lastElementChild.textContent = stale ? `数据可能过期 · ${time}` : `已更新 ${time}`;
+        const banner = $("#state-banner"); banner.hidden = !stale;
+        if (stale) banner.textContent = `BUG 快照读取失败或已标旧；保留最近成功快照（${txt(sync?.last_successful_snapshot_at)}）。`;
+        return;
+      }
       const scopeChanged = Number(state.scopeCatalog?.revision || 0) !== Number(data.scope_catalog?.revision || 0);
       state.scopeCatalog = data.scope_catalog || state.scopeCatalog;
       if ($("#scopes-dialog")?.open) renderScopeCatalog();
+      // A newer asset bundle is deployed: reload once so an already-open tab
+      // never keeps showing an older UI after an update.
       const changed = !state.data || Number(state.data.revision) !== Number(data.revision) || scopeChanged;
       state.data = data;
+      if (data.version) setWorkbenchVersion(data.version, data.build);
+      else if (!state.workbenchVersion) refreshWorkbenchVersion();
       state.iterations = model.orderedIterations(Array.isArray(data.iterations) ? data.iterations : []);
       state.currentIterationId = data.current_iteration_id || null;
-      if (changed || !$("#iteration-manager-dialog")?.open) renderIterationManager();
+      if (changed) renderIterationManager();
       const hours = data.preferences?.work_hours;
       if (hours?.start && hours?.end) workHours = { start: hours.start, end: hours.end, timezone: "Asia/Shanghai" };
       renderWorktimeProgress();
@@ -2598,7 +3952,7 @@
       const name = document.createElement("strong");
       name.className = "iteration-manager-name";
       name.textContent = versionLabel;
-      titleLine.append(name, iterationStatusPill(iteration));
+      titleLine.append(name, versionTypePill(iteration), iterationStatusSelect(iteration, busy));
       const tag = model.iterationSecondaryTag(iteration);
       if (tag) name.title = `版本标识：${tag}`;
       const meta = document.createElement("span");
@@ -2611,7 +3965,15 @@
       actions.append(
         makeManagerAction("上移", "up", iteration.id, { disabled: busy || index === 0, title: "上移版本（更靠前、更新）", ariaLabel: `上移 ${versionLabel}` }),
         makeManagerAction("下移", "down", iteration.id, { disabled: busy || index === iterations.length - 1, title: "下移版本（更靠后、更旧）", ariaLabel: `下移 ${versionLabel}` }),
-        makeManagerAction("编辑", "edit", iteration.id, { disabled: busy, title: "修改版本名、日期或描述", ariaLabel: `编辑 ${versionLabel}` })
+        makeManagerAction("编辑", "edit", iteration.id, { disabled: busy, title: "修改版本名、日期或描述", ariaLabel: `编辑 ${versionLabel}` }),
+        makeManagerAction(iterationVersionType(iteration) === "analytics" ? "转为迭代" : "转为埋点",
+          "set-type", iteration.id, {
+            disabled: busy,
+            title: iterationVersionType(iteration) === "analytics"
+              ? "切换为迭代类型；埋点资料会映射回需求列表/测试用例，并先备份数据"
+              : "切换为埋点类型；需求列表/测试用例会映射为埋点需求表/验收表，并先备份数据",
+            ariaLabel: `切换类型 ${versionLabel}`
+          })
       );
       if (!released) {
         actions.append(makeManagerAction("标记发布", "release", iteration.id, { className: "is-release", disabled: busy, title: "发布后该版本需求不再支持直接二次修改", ariaLabel: `标记发布 ${versionLabel}` }));
@@ -2648,6 +4010,10 @@
       iteration_not_found: "找不到这个版本，请刷新后重试。",
       invalid_iteration_title: "请填写有效的版本名。",
       invalid_iteration_version_tag: "请填写有效的版本名。",
+      invalid_iteration_version_type: "版本类型无效，请刷新后重试。",
+      invalid_iteration_patch: "版本类型只能通过「转为埋点/转为迭代」调整。",
+      invalid_iteration_status: "版本状态无效，请刷新后重试。",
+      iteration_type_verification_failed: "类型转换后的资料核对未通过，请用备份回滚并联系维护者。",
       invalid_iteration_order: "版本顺序无效，请刷新后重试。",
       iteration_order_mismatch: "版本列表已变化，请刷新后重试。",
       missing_iteration_id: "请选择目标版本。"
@@ -2666,6 +4032,8 @@
     state.iterationEditId = iteration.id;
     $("#iteration-edit-id").value = iteration.id;
     $("#iteration-edit-title-input").value = iterationName(iteration);
+    const editType = $("#iteration-edit-type");
+    if (editType) editType.textContent = `${versionTypeLabel(iteration)}版本 · 类型切换请在版本列表使用「转为埋点/转为迭代」`;
     $("#iteration-edit-date-input").value = iteration.target_release_date || "";
     $("#iteration-edit-desc-input").value = iteration.description || "";
     $("#iteration-edit-feedback").textContent = "";
@@ -2707,6 +4075,8 @@
     $("#iteration-feedback").textContent = "";
     $("#iteration-feedback").className = "source-feedback";
     $("#iteration-form").reset();
+    const typeSelect = $("#iteration-type-input");
+    if (typeSelect) typeSelect.value = "iteration";
     const select = $("#iteration-order-select");
     const count = iterations.length;
     // UI positions are display positions (0 = newest). The backend `order`
@@ -2729,6 +4099,7 @@
     event.preventDefault();
     const title = $("#iteration-title-input").value.trim();
     const order = Number($("#iteration-order-select").value || 0);
+    const version_type = $("#iteration-type-input").value === "analytics" ? "analytics" : "iteration";
     const target_release_date = $("#iteration-date-input").value || null;
     const description = $("#iteration-desc-input").value.trim() || null;
     const feedback = $("#iteration-feedback");
@@ -2738,12 +4109,13 @@
     feedback.textContent = "正在创建版本…";
     feedback.className = "source-feedback busy";
     try {
-      await iterationRequest("/api/iterations", {
-        version_tag: title, title, target_release_date, description, order
+      const result = await iterationRequest("/api/iterations", {
+        version_tag: title, title, target_release_date, description, order, version_type
       });
+      const createdName = iterationName(result.iteration || { title });
       $("#iteration-dialog").close();
       $("#iteration-form").reset();
-      showToast(`已创建版本：${title}`);
+      showToast(`已创建${versionTypeLabel(version_type)}版本：${createdName}`);
       await refresh();
       if ($("#sources-dialog").open) await loadSources();
     } catch (error) {
@@ -2769,8 +4141,64 @@
       setIterationManagerBusy(false);
     }
   }
-  function relocateSlotOptions(scope) {
-    const definitions = slotDefinitions(scope).map(definition => ({ value: definition.id, label: definition.label }));
+  function iterationStatusErrorMessage(error) {
+    if (!error || error.name === "TypeError" || /Failed to fetch|NetworkError|Load failed/i.test(error.message || "")) {
+      return "无法连接本地服务，版本状态未修改，请确认服务正在运行。";
+    }
+    return error.message || "版本状态更新失败，请重试。";
+  }
+  async function changeIterationStatus(iterationId, status) {
+    if (state.iterationBusy) return;
+    const iteration = iterationById(iterationId);
+    if (!iteration || iteration.status === status) return;
+    if (status === "released" && !window.confirm(`确认将版本「${iterationName(iteration)}」标记为已发布？\n发布后该版本需求不再支持直接二次修改。`)) {
+      renderIterationManager();
+      return;
+    }
+    state.iterationBusy = true;
+    renderIterationManager();
+    try {
+      const payload = await iterationRequest(`/api/iterations/${encodeURIComponent(iterationId)}/update`, { status });
+      if (payload.iteration?.id) {
+        const index = state.iterations.findIndex(item => item.id === payload.iteration.id);
+        if (index >= 0) state.iterations[index] = { ...state.iterations[index], ...payload.iteration };
+      }
+      const derived = status === "planning" || status === "active";
+      showToast(`版本「${iterationName(iteration)}」已切换为${iterationStatusLabel(status)}${derived ? "；该状态会随需求数量自动变化" : ""}`);
+      await refresh();
+    } catch (error) {
+      showToast(iterationStatusErrorMessage(error), "error");
+    } finally {
+      state.iterationBusy = false;
+      renderIterationManager();
+    }
+  }
+  async function convertIterationType(iterationId) {
+    if (state.iterationBusy) return;
+    const iteration = iterationById(iterationId);
+    if (!iteration) return;
+    const targetType = iterationVersionType(iteration) === "analytics" ? "iteration" : "analytics";
+    const targetLabel = versionTypeLabel(targetType);
+    const detail = targetType === "analytics"
+      ? "需求列表会映射为埋点需求表，测试用例映射为埋点验收表；Figma/高保真等迭代固定资料会保留为补充材料。"
+      : "埋点需求表会映射回需求列表，埋点验收表映射回测试用例；补充材料保持不变。";
+    if (!window.confirm(`确认把版本「${iterationName(iteration)}」切换为${targetLabel}类型？\n${detail}\n\n转换前会自动备份 store，版本 ID 与版本名不变。`)) return;
+    setIterationManagerBusy(true);
+    try {
+      const result = await iterationRequest(`/api/iterations/${encodeURIComponent(iteration.id)}/type`, { version_type: targetType });
+      if (result.backup_path) console.info("版本类型转换备份：", result.backup_path);
+      showToast(`已切换为${targetLabel}类型，转换前已备份`, "success");
+      await refresh();
+      if ($("#sources-dialog").open) await loadSources();
+    } catch (error) {
+      showToast(error.message || "版本类型切换失败", "error");
+    } finally {
+      setIterationManagerBusy(false);
+    }
+  }
+
+  function relocateSlotOptions(scope, iteration = null) {
+    const definitions = slotDefinitions(scope, iteration).map(definition => ({ value: definition.id, label: definition.label }));
     definitions.push({ value: "supplementary", label: "补充材料" });
     return definitions;
   }
@@ -2797,7 +4225,7 @@
     iterSelect.replaceChildren(...orderedIterations().map(iteration => {
       const option = document.createElement("option");
       option.value = iteration.id;
-      option.textContent = iterationName(iteration);
+      option.textContent = `${iterationName(iteration)} · ${versionTypeLabel(iteration)}版本`;
       return option;
     }));
     if (source.iteration_id && iterationById(source.iteration_id)) iterSelect.value = source.iteration_id;
@@ -2805,7 +4233,8 @@
     function syncSlots() {
       const isGlobal = scopeSelect.value === "global";
       iterWrap.hidden = isGlobal;
-      const options = relocateSlotOptions(isGlobal ? "global" : "iteration");
+      const targetIteration = isGlobal ? null : iterationById(iterSelect.value);
+      const options = relocateSlotOptions(isGlobal ? "global" : "iteration", targetIteration);
       slotSelect.replaceChildren(...options.map(option => {
         const node = document.createElement("option");
         node.value = option.value;
@@ -2816,6 +4245,7 @@
       slotSelect.value = options.some(option => option.value === preferred) ? preferred : "supplementary";
     }
     scopeSelect.onchange = syncSlots;
+    iterSelect.onchange = syncSlots;
     syncSlots();
     $("#relocate-feedback").textContent = "";
     $("#relocate-feedback").className = "source-feedback";
@@ -2872,57 +4302,6 @@
     }
   }
 
-  function openReopenDialog(id) {
-    const record = findRecord(id);
-    if (!record) return;
-    state.reopenTargetId = id;
-    state.reopenFile = null;
-    $("#reopen-dialog-title").textContent = `发起二次修改 · ${record.display_id || record.id}`;
-    $("#reopen-reason-input").value = "";
-    $("#reopen-audit-mode").value = "lightweight";
-    $("#reopen-file-input").value = "";
-    $("#reopen-file-name").textContent = "未选择图片";
-    $("#reopen-feedback").textContent = "";
-    $("#reopen-feedback").className = "source-feedback";
-    $("#reopen-dialog").showModal();
-    $("#reopen-reason-input").focus();
-  }
-
-  async function submitReopenForm(event) {
-    event.preventDefault();
-    const id = state.reopenTargetId;
-    if (!id) return;
-    const reason = $("#reopen-reason-input").value.trim();
-    const audit_mode = $("#reopen-audit-mode").value;
-    const feedback = $("#reopen-feedback");
-    const submitBtn = $("#reopen-submit");
-    if (!reason) { feedback.textContent = "请填写修改原因。"; feedback.className = "source-feedback error"; return; }
-    submitBtn.disabled = true;
-    feedback.textContent = "正在发起二次修改…";
-    feedback.className = "source-feedback busy";
-    try {
-      await postAction(`/api/items/${encodeURIComponent(id)}/reopen`, { reason, audit_mode });
-      if (state.reopenFile) {
-        feedback.textContent = "正在上传变更截图…";
-        const content_base64 = await encodeFile(state.reopenFile);
-        await postAction(`/api/items/${encodeURIComponent(id)}/attachments`, {
-          filename: state.reopenFile.name,
-          content_base64,
-          summary: reason
-        });
-      }
-      $("#reopen-dialog").close();
-      showToast("已发起二次修改并重新激活流水线");
-      await refresh();
-      if ($("#record-dialog").open) openDetail(id);
-    } catch (error) {
-      feedback.textContent = error.message || "发起修改失败，请重试。";
-      feedback.className = "source-feedback error";
-    } finally {
-      submitBtn.disabled = false;
-    }
-  }
-
   async function openUploadTaskAttachment(recordId) {
     const input = document.createElement("input");
     input.type = "file";
@@ -2949,9 +4328,15 @@
     input.click();
   }
 
-  $("#search").addEventListener("input", event => { state.query = event.target.value; render(); });
+  let searchTimer = 0;
+  $("#search").addEventListener("input", event => {
+    state.query = event.target.value;
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = 0; }
+    if (!state.query) { render(); return; }
+    searchTimer = setTimeout(() => { searchTimer = 0; render(); }, 100);
+  });
   $("#show-archived").addEventListener("change", event => { state.showArchived = event.target.checked; render(); });
-  $("#refresh").addEventListener("click", refresh);
+  $("#refresh").addEventListener("click", () => { refresh(); refreshWorkbenchVersion(); });
   $("#work-released-toggle").addEventListener("click", toggleWorkReleased);
   $("#worktime-open").addEventListener("click", openWorkHours);
   $("#settings-open").addEventListener("click", openSettings);
@@ -3017,31 +4402,48 @@
   $("#sources-close").addEventListener("click", () => $("#sources-dialog").close());
   $("#sources-dialog").addEventListener("click", event => { if (event.target === $("#sources-dialog")) $("#sources-dialog").close(); });
   $("#source-add-file").addEventListener("click", () => $("#source-file-input").click());
-  $("#source-file-input").addEventListener("change", event => selectLibraryFile(event.target.files?.[0]));
-  $("#library-file-clear").addEventListener("click", () => { $("#source-file-input").value = ""; selectLibraryFile(null); });
+  $("#source-file-input").addEventListener("change", event => { selectLibraryFile(event.target.files?.[0]); scheduleSourceNamePreview(); });
+  $("#library-file-clear").addEventListener("click", () => { $("#source-file-input").value = ""; selectLibraryFile(null); scheduleSourceNamePreview(); });
   $("#library-add-cancel").addEventListener("click", () => resetLibraryAdd(true));
   $("#source-link-form").addEventListener("submit", submitLibraryEntry);
-  $("#source-link-form").addEventListener("reset", () => { selectLibraryFile(null); });
+  $("#source-link-form").addEventListener("reset", () => { cancelSourceNamePreview(); selectLibraryFile(null); setSourceNameHint(""); });
+  $("#source-link-url").addEventListener("input", scheduleSourceNamePreview);
+  $("#source-link-name").addEventListener("input", () => {
+    state.autoName.userEdited = true;
+    cancelSourceNamePreview();
+    setSourceNameHint("");
+  });
+  $("#source-edit-close").addEventListener("click", closeSourceEdit);
+  $("#source-edit-cancel").addEventListener("click", closeSourceEdit);
+  $("#source-edit-dialog").addEventListener("click", event => { if (event.target === $("#source-edit-dialog")) closeSourceEdit(); });
+  $("#source-edit-form").addEventListener("submit", submitSourceEdit);
   $("#archive-body").addEventListener("click", handleLibraryClick);
   $("#library-add-slot").addEventListener("change", updateLibraryAddContext);
-  $("#dialog-close").addEventListener("click", () => $("#record-dialog").close());
-  $("#followup-close").addEventListener("click", closeFollowup);
-  $("#followup-cancel").addEventListener("click", closeFollowup);
-  $("#followup-input").addEventListener("input", event => { if (state.followupId) state.drafts[state.followupId] = event.target.value; });
-  $("#followup-dialog-form").addEventListener("submit", submitFollowup);
-  $("#followup-dialog").addEventListener("click", event => { if (event.target === $("#followup-dialog")) closeFollowup(); });
-  $("#record-dialog").addEventListener("click", event => { if (event.target === $("#record-dialog")) $("#record-dialog").close(); });
-  $("#record-dialog").addEventListener("close", () => { if (state.selectedId) state.workflowEntered.delete(state.selectedId); });
+  $("#dialog-close").addEventListener("click", closeDetailDialog);
+  $("#record-dialog").addEventListener("click", event => { if (event.target === $("#record-dialog")) closeDetailDialog(); });
+  $("#record-dialog").addEventListener("cancel", event => {
+    if (!$("#record-dialog").open) return;
+    event.preventDefault();
+    closeDetailDialog();
+  });
+  $("#text-viewer-close").addEventListener("click", () => $("#text-viewer-dialog").close());
+  $("#text-viewer-copy").addEventListener("click", copyTextViewerText);
+  $("#text-viewer-dialog").addEventListener("click", event => { if (event.target === $("#text-viewer-dialog")) $("#text-viewer-dialog").close(); });
+  $("#record-dialog").addEventListener("close", () => {
+    if (detailCloseTimer) { clearTimeout(detailCloseTimer); detailCloseTimer = 0; }
+    $("#record-dialog").classList.remove("is-closing");
+    if (state.selectedId) state.workflowEntered.delete(state.selectedId);
+  });
   document.addEventListener("click", event => {
     const open = event.target.closest("[data-open-record]"); if (open) openDetail(open.dataset.openRecord);
     if (!event.target.closest("button,a,input,select,textarea,summary")) { const card = event.target.closest(".record-card"); if (card) openDetail(card.dataset.recordId); }
     const workflowStage = event.target.closest("[data-workflow-stage]"); if (workflowStage) selectWorkflowStage(workflowStage);
     const workflowStart = event.target.closest("[data-workflow-start]"); if (workflowStart) startWorkflow(workflowStart);
     const workflowRetry = event.target.closest("[data-workflow-retry]"); if (workflowRetry) retryWorkflow(workflowRetry.dataset.workflowRetry);
+    const evidenceFile = event.target.closest("[data-evidence-record]");
+    if (evidenceFile) openLocalFileViewer(evidenceFile.dataset.evidenceRecord, evidenceFile.dataset.evidencePath, { kicker: "证据全文" });
     const transfer = event.target.closest("[data-transfer-id]"); if (transfer) submitTransfer(transfer);
     const complete = event.target.closest("[data-complete-id]"); if (complete) submitCompletion(complete);
-    const followup = event.target.closest("[data-followup-id]"); if (followup) openFollowup(followup.dataset.followupId);
-    const reopen = event.target.closest("[data-reopen-id]"); if (reopen) openReopenDialog(reopen.dataset.reopenId);
     const uploadTaskAtt = event.target.closest("[data-upload-task-attachment]"); if (uploadTaskAtt) openUploadTaskAttachment(uploadTaskAtt.dataset.uploadTaskAttachment);
   });
   $("#iteration-manager-open").addEventListener("click", () => {
@@ -3060,6 +4462,12 @@
     if (action === "up" || action === "down") return reorderIteration(iterationId, action);
     if (action === "edit") return openIterationEditDialog(iterationId);
     if (action === "release") return handleReleaseIteration(iterationId);
+    if (action === "set-type") return convertIterationType(iterationId);
+  });
+  $("#iteration-manager-list").addEventListener("change", event => {
+    const select = event.target.closest("[data-iteration-status]");
+    if (!select || select.disabled) return;
+    changeIterationStatus(select.dataset.iterationStatus, select.value);
   });
   const iterCreateBtn = $("#iteration-create-open");
   if (iterCreateBtn) iterCreateBtn.addEventListener("click", openIterationCreateDialog);
@@ -3085,29 +4493,31 @@
   if (relocateForm) relocateForm.addEventListener("submit", submitRelocateForm);
   const relocateDialog = $("#source-relocate-dialog");
   if (relocateDialog) relocateDialog.addEventListener("click", event => { if (event.target === relocateDialog) relocateDialog.close(); });
-  const reopenCloseBtn = $("#reopen-dialog-close");
-  if (reopenCloseBtn) reopenCloseBtn.addEventListener("click", () => $("#reopen-dialog").close());
-  const reopenCancelBtn = $("#reopen-cancel");
-  if (reopenCancelBtn) reopenCancelBtn.addEventListener("click", () => $("#reopen-dialog").close());
-  const reopenAddFileBtn = $("#reopen-add-file");
-  if (reopenAddFileBtn) reopenAddFileBtn.addEventListener("click", () => $("#reopen-file-input").click());
-  const reopenFileInput = $("#reopen-file-input");
-  if (reopenFileInput) {
-    reopenFileInput.addEventListener("change", event => {
-      state.reopenFile = event.target.files?.[0] || null;
-      $("#reopen-file-name").textContent = state.reopenFile ? state.reopenFile.name : "未选择图片";
-    });
-  }
-  const reopenForm = $("#reopen-form");
-  if (reopenForm) reopenForm.addEventListener("submit", submitReopenForm);
   const archiveTabs = $("#archive-scope-tabs");
   if (archiveTabs) {
+    const activateTab = btn => {
+      if (!btn) return;
+      state.archiveScopeTab = btn.dataset.scope;
+      renderSources();
+      $(`#${btn.id}`)?.focus({ preventScroll: true });
+    };
     archiveTabs.addEventListener("click", event => {
       const btn = event.target.closest(".archive-tab-btn");
-      if (btn) {
-        state.archiveScopeTab = btn.dataset.scope;
-        renderSources();
-      }
+      if (btn) activateTab(btn);
+    });
+    archiveTabs.addEventListener("keydown", event => {
+      const tabs = $$(".archive-tab-btn", archiveTabs);
+      if (!tabs.length) return;
+      const current = tabs.indexOf(event.target.closest(".archive-tab-btn"));
+      if (current < 0) return;
+      let next = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = tabs[(current + 1) % tabs.length];
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = tabs[(current - 1 + tabs.length) % tabs.length];
+      else if (event.key === "Home") next = tabs[0];
+      else if (event.key === "End") next = tabs[tabs.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      activateTab(next);
     });
   }
   document.addEventListener("toggle", event => {
@@ -3132,12 +4542,38 @@
       requestAnimationFrame(() => $$(".record-list", target).forEach(relayoutMasonryList));
     }
   }, true);
-  document.addEventListener("submit", event => {
-    if (event.target.matches(".followup-form")) event.preventDefault();
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    if ($("#text-viewer-dialog")?.open || $("#source-edit-dialog")?.open) return;
+    if ($("#record-dialog").open) closeDetailDialog();
   });
-  document.addEventListener("keydown", event => { if (event.key === "Escape" && $("#record-dialog").open) $("#record-dialog").close(); });
+  document.addEventListener("pointerdown", () => { document.body.dataset.inputMode = "pointer"; }, true);
+  document.addEventListener("keydown", event => {
+    if (event.key === "Tab") document.body.dataset.inputMode = "keyboard";
+  }, true);
   $("#inspection-run").addEventListener("click", runInspection);
+  $("#inspection-plan").addEventListener("click", openInspectionHistory);
+  $("#inspection-dialog-close").addEventListener("click", () => $("#inspection-dialog").close());
+  $("#inspection-dialog").addEventListener("click", event => {
+    if (event.target === $("#inspection-dialog")) $("#inspection-dialog").close();
+  });
+  setupScrollChrome();
+  refreshWorkbenchVersion();
   refresh(); refreshInspectionSchedule(); refreshInspectionStatus();
+  let realtimeSource = null;
+  function connectRealtime() {
+    if (typeof EventSource === "undefined") return;
+    try {
+      if (realtimeSource) realtimeSource.close();
+      realtimeSource = new EventSource("/api/events");
+      realtimeSource.onmessage = event => {
+        let payload = null; try { payload = JSON.parse(event.data || "{}"); } catch (_) { return; }
+        if (payload && Number(payload.revision || 0) !== Number(state.data?.revision || 0)) refresh();
+      };
+      realtimeSource.onerror = () => { try { realtimeSource.close(); } catch (_) {} realtimeSource = null; window.setTimeout(connectRealtime, 3000); };
+    } catch (_) { window.setTimeout(connectRealtime, 3000); }
+  }
+  connectRealtime();
   window.setInterval(() => { if (!document.hidden) refresh(); }, 3000);
   window.setInterval(() => { if (!document.hidden) refreshInspectionSchedule(); }, 30000);
   window.setInterval(() => { if (!document.hidden) refreshInspectionStatus(); }, 3000);
